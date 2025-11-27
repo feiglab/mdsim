@@ -7,7 +7,10 @@ from typing import Optional
 import numpy as np
 from openmm import (
     CMMotionRemover,
+    CustomBondForce,
+    CustomNonbondedForce,
     LangevinIntegrator,
+    NonbondedForce,
     Platform,
     State,
     System,
@@ -25,6 +28,7 @@ from openmm.app import (
     PDBFile,
     Simulation,
     StateDataReporter,
+    Topology,
     element,
 )
 from openmm.app import (
@@ -40,6 +44,7 @@ from openmm.unit import (
 )
 
 from .__version__ import __version__
+from .molecule_data import Model, PDBReader, Structure
 
 # --- Data containers ---------------------------------------------------------
 
@@ -77,7 +82,7 @@ class MDSim:
     def __init__(
         self,
         *,
-        structure=None,  # Structure/Model object read via PDBReader
+        model=None,  # Structure/Model object or file name read via PDBReader
         pdb=None,  # PDB file
         crd=None,  # CHARMM CRD file
         psf=None,  # CHARMM PSF file
@@ -105,14 +110,18 @@ class MDSim:
 
         self.topology = None
         self.positions = None
+        self.restart = None
+        self.stype = None
 
-        self.set_pdb(pdb)
         self.set_psf(psf)
-        self.set_crd(crd)
-        self.set_charmmpar(par)
-        self.set_gro(gro)
         self.set_gmxtop(gmx)
+        self.set_pdb(pdb)
+        self.set_model(model)
+        self.set_crd(crd)
+        self.set_gro(gro)
+        self.set_charmmpar(par)
         self.set_xmlff(ff)
+        self.set_restart(restart)
 
         if box:
             self.set_box(box)
@@ -199,37 +208,57 @@ class MDSim:
             else:
                 self.switching = sw
 
+    def set_model(self, model):
+        self.model = None
+        if isinstance(model, Structure):
+            self.model = model[0]
+        elif isinstance(model, Model):
+            self.model = model
+        elif isinstance(model, str):
+            self.model = PDBReader(model)[0]
+        if self.model:
+            if not self.positions:
+                self.positions = self.model.positions()
+            if not self.topology:
+                self.topology = self.model.topology()
+
     def set_pdb(self, fname):
         self.pdb = None
         if _is_readable_file(fname):
             self.pdb = PDBFile(fname)
-            self.topology = self.pdb.topology
-            self.positions = self.pdb.positions
+            if not self.positions:
+                self.positions = self.pdb.positions
+            if not self.topology:
+                self.topology = self.pdb.topology
 
     def set_psf(self, fname):
         self.psf = None
         if _is_readable_file(fname):
             self.psf = CharmmPsfFile(fname)
-            self.topology = self.psf.topology
+            if not self.topology:
+                self.topology = self.psf.topology
 
     def set_crd(self, fname):
         self.crd = None
         if _is_readable_file(fname):
             self.crd = CharmmCrdFile(fname)
-            self.positions = self.crd.positions
+            if not self.positions:
+                self.positions = self.crd.positions
 
     def set_gro(self, fname):
         self.gro = None
         if _is_readable_file(fname):
             self.gro = GromacsGroFile(fname)
-            self.positions = self.gro.positions
+            if not self.positions:
+                self.positions = self.gro.positions
             # box size?
 
     def set_gmxtop(self, fname):
         self.gmx = None
         if _is_readable_file(fname):
             self.gmx = GromacsTopFile(fname)
-            self.topology = self.gmx.topology
+            if not self.topology:
+                self.topology = self.gmx.topology
 
     def set_xmlff(self, fname):
         self.ff = None
@@ -261,6 +290,10 @@ class MDSim:
             if plist:
                 self.cpar = CharmmParameterSet(*plist)
 
+    def set_restart(self, fname):
+        if _is_readable_file(fname):
+            self.restart = fname
+
     def fix_topology(self):
         if self.topology:
             for atom in self.topology.atoms():
@@ -286,7 +319,7 @@ class MDSim:
                 removeCMMotion=self.removecmmotion,
                 hydrogenMass=self.hydrogenmass,
             )
-            print("created system from CHARMM PSF")
+            self.stype = "charmm"
         elif self.topology and self.ff:
             self.system = self.ff.createSystem(
                 self.topology,
@@ -300,7 +333,7 @@ class MDSim:
                 removeCMMotion=self.removecmmotion,
                 hydrogenMass=self.hydrogenmass,
             )
-            print("created system from XML ForceField")
+            self.stype = "xmlff"
         elif self.gmx:
             self.system = self.gmx.createSystem(
                 nonbondedMethod=self.nonbonded,
@@ -313,12 +346,114 @@ class MDSim:
                 removeCMMotion=self.removecmmotion,
                 hydrogenMass=self.hydrogenmass,
             )
-            print("created system from Gromacs topology")
+            self.stype = "gmx"
+        if self.system:
+            self.set_switching_function()
+            self.set_force_groups()
+        else:
+            self.system = System()
+
+    def set_switching_function(self):
+        if self.switching and self.cuton < self.cutoff and self.cuton > 0 * nanometer:
+            if self.switching == "openmm":
+                flist = []
+                for i, force in enumerate(self.system.getForces()):
+                    if isinstance(force, NonbondedForce):
+                        flist.append(force)
+                    if isinstance(force, CustomNonbondedForce):
+                        flist.append(force)
+                if flist:
+                    for f in flist:
+                        f.setUseSwitchingFunction(True)
+                        f.setSwitchingDistance(self.cuton)
+                        f.setCutoffDistance(self.cutoff)
+            if self.switching == "charmm":
+                for i, force in enumerate(self.system.getForces()):
+                    name = force.getName() or force.__class__.__name__
+                    if self.stype and self.stype == "xmlff" and name == "LennardJones":
+                        ljswitch = "step(Ron-r)*(ba*tr6*tr6-bb*tr6+bb*oo3-ba*oo6) \
+                          +step(r-Ron)*step(Roff-r)*(cr12*rj6-cr6*rj3) \
+                          -step(r-Ron)*step(Ron-r)*(cr12*rj6-cr6*rj3); \
+                          cr6=bb*od3*rj3; cr12=ba*od6*rj6; \
+                          rj3=r3-rc3; rj6=tr6-rc6; r3=r1*tr2; r1=sqrt(tr2); \
+                          tr6=tr2*tr2*tr2; tr2=1.0/s2; s2=r*r; \
+                          bb = bcoef(type1,type2); ba = acoef(type1,type2); \
+                          oo3=rc3/on3; oo6=rc6/on6; od3=off3/(off3-on3); od6=off6/(off6-on6); \
+                          rc3=1.0/off3; on6=on3*on3; on3=c2onnb*Ron; \
+                          rc6=1.0/off6; off6=off3*off3; off3=c2ofnb*Roff; \
+                          c2ofnb=Roff*Roff; c2onnb=Ron*Ron"
+                        force.addGlobalParameter("Ron", self.cuton)
+                        force.addGlobalParameter("Roff", self.cutoff)
+                        force.setEnergyFunction(ljswitch)
+
+                    if self.stype and (
+                        (self.stype == "xmlff" and name == "LennardJones14")
+                        or (self.stype == "charmm" and name == "NonbondedForce")
+                        or (self.stype == "gmx" and name == "NonbondedForce")
+                    ):
+                        ljswitch = "step(Ron-r)*(ba*tr6*tr6-bb*tr6+bb*oo3-ba*oo6) \
+                          +step(r-Ron)*step(Roff-r)*(cr12*rj6-cr6*rj3) \
+                          -step(r-Ron)*step(Ron-r)*(cr12*rj6-cr6*rj3); \
+                          cr6=bb*od3*rj3; cr12=ba*od6*rj6; \
+                          rj3=r3-rc3; rj6=tr6-rc6; r3=r1*tr2; r1=sqrt(tr2); \
+                          tr6=tr2*tr2*tr2; tr2=1.0/s2; s2=r*r; \
+                          bb=4.0*epsilon*sigma^6; ba=4.0*epsilon*sigma^12; \
+                          oo3=rc3/on3; oo6=rc6/on6; od3=off3/(off3-on3); od6=off6/(off6-on6); \
+                          rc3=1.0/off3; on6=on3*on3; on3=c2onnb*Ron; \
+                          rc6=1.0/off6; off6=off3*off3; off3=c2ofnb*Roff; \
+                          c2ofnb=Roff*Roff; c2onnb=Ron*Ron"
+
+                        if self.stype == "charmm" or self.stype == "gmx":
+                            f = CustomBondForce(ljswitch)
+                            f.addGlobalParameter("Ron", self.cuton)
+                            f.addGlobalParameter("Roff", self.cutoff)
+                            f.addPerBondParameter("sigma")
+                            f.addPerBondParameter("epsilon")
+                            for j in range(force.getNumExceptions()):
+                                a1, a2, chg, sig, eps = force.getExceptionParameters(j)
+                                force.setExceptionParameters(
+                                    j, a1, a2, chg, 0.0, 0.0
+                                )  # zero sig/eps
+                                f.addBond(a1, a2, [sig, eps])
+                            self.system.addForce(f)
+                        else:
+                            force.addGlobalParameter("Ron", self.cuton)
+                            force.addGlobalParameter("Roff", self.cutoff)
+                            force.setEnergyFunction(ljswitch)
+
+                    if self.stype and (
+                        (self.stype == "gmx" and name == "LennardJonesForce")
+                        or (self.stype == "charmm" and name == "CustomNonbondedForce")
+                    ):
+                        ljswitch = "step(Ron-r)*(ba*tr6*tr6-bb*tr6+bb*oo3-ba*oo6) \
+                          +step(r-Ron)*step(Roff-r)*(cr12*rj6-cr6*rj3) \
+                          -step(r-Ron)*step(Ron-r)*(cr12*rj6-cr6*rj3); \
+                          cr6=bb*od3*rj3; cr12=ba*od6*rj6; \
+                          rj3=r3-rc3; rj6=tr6-rc6; r3=r1*tr2; r1=sqrt(tr2); \
+                          tr6=tr2*tr2*tr2; tr2=1.0/s2; s2=r*r; \
+                          bb = bcoef(type1,type2); ba=baa*baa; baa=acoef(type1,type2); \
+                          oo3=rc3/on3; oo6=rc6/on6; od3=off3/(off3-on3); od6=off6/(off6-on6); \
+                          rc3=1.0/off3; on6=on3*on3; on3=c2onnb*Ron; \
+                          rc6=1.0/off6; off6=off3*off3; off3=c2ofnb*Roff; \
+                          c2ofnb=Roff*Roff; c2onnb=Ron*Ron"
+                        force.addGlobalParameter("Ron", self.cuton)
+                        force.addGlobalParameter("Roff", self.cutoff)
+                        force.setEnergyFunction(ljswitch)
+
+    def set_force_groups(self):
         if self.system:
             for i, force in enumerate(self.system.getForces()):
                 force.setForceGroup(i)
-        else:
-            self.system = System()
+
+    def set_dummy_topology(self):
+        if not self.topology and self.system:
+            n_atoms = self.system.getNumParticles()
+            top = Topology()
+            chain = top.addChain()
+            res = top.addResidue("DUM", chain)
+            for i in range(n_atoms):
+                top.addAtom("C", element.carbon, res)
+            self.topology = top
 
     def describe(self) -> str:
         return f"This is MDSim version {__version__}"
@@ -464,8 +599,12 @@ class MDSim:
         # gamma: in 1/ps
         # resources: 'CPU' or 'CUDA'
 
-        assert self.topology is not None, "need topology to be defined"
         assert self.system is not None, "need openMM system object to be defined"
+
+        self.set_restart(restart)
+
+        if self.restart and not self.topology:
+            self.set_dummy_topology()
 
         self.temperature = temperature * kelvin
         self.tstep = tstep * picoseconds
@@ -482,13 +621,14 @@ class MDSim:
             )
         if self.resources == "CPU":
             self.simulation = Simulation(self.topology, self.system, self.integrator, self.platform)
-        if restart is not None:
-            self.read_state(restart)
+        if self.restart is not None:
+            self.read_state(self.restart)
         else:
             if positions is not None:
                 self.positions = positions
             if self.positions is not None:
                 self.simulation.context.setPositions(self.positions)
+                self.set_velocities()
 
     def set_box(self, box) -> None:
         ax_nm, by_nm, cz_nm = self._normalize_box(box)

@@ -6,6 +6,7 @@ from .molecule_data import (
     PDBReader,
     #    SelectionError,
     Structure,
+    summarize_topology,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "PDBReader",
     #    "SelectionError",
     "Structure",
+    "summarize_topology",
 ]

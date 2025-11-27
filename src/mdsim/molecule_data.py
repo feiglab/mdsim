@@ -551,7 +551,7 @@ def _parse_atom_line(line: str) -> Atom:
     name = line[12:16].strip()
     resname = line[17:21].strip()
     chain = (line[21] if len(line) >= 22 else " ").strip()
-    resnum = _safe_int(line[22:26], required=True)
+    resnum = _safe_int(line[22:27], required=True)
     x = _safe_float(line[30:38], required=True)
     y = _safe_float(line[38:46], required=True)
     z = _safe_float(line[46:54], required=True)
@@ -917,3 +917,78 @@ def _union_resnums_for_chain(ch: Chain, alias_to_resnums: dict[str, set[int]]) -
     for alias in _all_chain_aliases(ch):
         resnums |= alias_to_resnums.get(alias, set())
     return resnums
+
+
+def summarize_topology(
+    topology: Topology,
+    max_residues_per_chain: int = 5,
+    max_bonds: int = 20,
+) -> str:
+    """
+    Summarize an OpenMM Topology:
+      - all chains
+      - up to `max_residues_per_chain` residues from the start of each chain
+        (with all atoms), plus the last residue in each chain
+      - up to `max_bonds` bonds
+
+    Returns a human-readable multi-line string.
+    """
+    lines = []
+    lines.append(
+        f"Topology: {topology.getNumChains()} chains, "
+        f"{topology.getNumResidues()} residues, "
+        f"{topology.getNumAtoms()} atoms, "
+        f"{topology.getNumBonds()} bonds"
+    )
+
+    for chain_index, chain in enumerate(topology.chains()):
+        chain_id: Optional[str] = getattr(chain, "id", None)
+        chain_label = chain_id if chain_id is not None else str(chain_index)
+        lines.append(f"\nChain {chain_index} (id={chain_label}):")
+
+        residues = list(chain.residues())
+        n_res = len(residues)
+
+        # Indices we will show: first N, and always the last one
+        show_indices = list(range(min(max_residues_per_chain, n_res)))
+        if n_res > 0 and (n_res - 1) not in show_indices:
+            show_indices.append(n_res - 1)
+
+        shown_set = set(show_indices)
+
+        for idx in show_indices:
+            residue = residues[idx]
+            res_id: Optional[str] = getattr(residue, "id", None)
+            res_id_str = res_id if res_id is not None else ""
+            lines.append(f"  Residue {idx} (name={residue.name}, id={res_id_str}):")
+
+            for atom in residue.atoms():
+                elem = atom.element.symbol if atom.element is not None else "?"
+                lines.append(f"    Atom {atom.index}: {atom.name} ({elem})")
+
+        # If we skipped any residues between first batch and last
+        skipped = n_res - len(shown_set)
+        if skipped > 0:
+            lines.append(f"  ... ({skipped} residues not shown in this chain)")
+
+    # Bonds
+    bonds = list(topology.bonds())
+    if bonds:
+        lines.append(f"\nBonds (showing up to {max_bonds}):")
+
+        for i, bond in enumerate(bonds[:max_bonds]):
+            atom1, atom2 = bond
+
+            def atom_label(a):
+                res = a.residue
+                chain = res.chain
+                chain_id = getattr(chain, "id", None) or ""
+                res_id = getattr(res, "id", None) or ""
+                return f"{a.index}:{a.name}" f"({res.name}{res_id}, chain={chain_id})"
+
+            lines.append(f"  {i}: {atom_label(atom1)} -- {atom_label(atom2)}")
+
+        if len(bonds) > max_bonds:
+            lines.append(f"  ... ({len(bonds) - max_bonds} more bonds not shown)")
+
+    return "\n".join(lines)
