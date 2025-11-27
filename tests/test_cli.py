@@ -12,4 +12,5 @@ def run_cli(cmd: str) -> str:
 def test_info():
     out = run_cli("info")
     d = json.loads(out)
+    print(d["model"])
     assert "version" in d["model"]

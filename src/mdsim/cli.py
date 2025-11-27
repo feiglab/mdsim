@@ -4,11 +4,11 @@ import argparse
 import json
 
 from .__version__ import __version__
-from .mdsim_model import COCOMO
+from .allatom_simulation import MDSim
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="cocomo", description="COCOMO coarse-grained model")
+    p = argparse.ArgumentParser(prog="cocomo", description="All-atom simulator")
     p.add_argument("--version", action="version", version=__version__)
     sp = p.add_subparsers(dest="cmd")
 
@@ -19,8 +19,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_info(args: argparse.Namespace) -> None:
-    c = COCOMO()
-    print(json.dumps({"model": c.describe()}, indent=2))
+    m = MDSim()
+    print(json.dumps({"model": m.describe()}, indent=2))
 
 
 def main() -> None:

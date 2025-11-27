@@ -39,6 +39,8 @@ from openmm.unit import (
     picoseconds,
 )
 
+from .__version__ import __version__
+
 # --- Data containers ---------------------------------------------------------
 
 aminoacids = [
@@ -319,7 +321,7 @@ class MDSim:
             self.system = System()
 
     def describe(self) -> str:
-        return f"This is MDSim version {self.version}"
+        return f"This is MDSim version {__version__}"
 
     def write_system(self, fname="system.xml"):
         with open(fname, "w") as file:
