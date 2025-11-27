@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-import warnings
+from collections.abc import Sequence
 from typing import Optional
 
 import numpy as np
-
 from openmm import (
     CMMotionRemover,
     LangevinIntegrator,
@@ -20,27 +19,24 @@ from openmm.app import (
     CharmmParameterSet,
     CharmmPsfFile,
     DCDReporter,
-    element,
     ForceField,
-    forcefield as ff,
     GromacsGroFile,
     GromacsTopFile,
     PDBFile,
     Simulation,
     StateDataReporter,
-    Topology,
+    element,
+)
+from openmm.app import (
+    forcefield as ff,
 )
 from openmm.unit import (
     Quantity,
-    amu,
-    degrees,
     kelvin,
     kilojoule,
     mole,
     nanometer,
-    norm,
     picoseconds,
-    radian,
 )
 
 # --- Data containers ---------------------------------------------------------
@@ -74,32 +70,33 @@ nucleicacids = ["ADE", "CYT", "GUA", "URA", "THY"]
 
 # --- Main class for COCOMO system --------------------------------------------
 
+
 class MDSim:
     def __init__(
         self,
         *,
-        structure=None,       # Structure/Model object read via PDBReader
-        pdb=None,             # PDB file
-        crd=None,             # CHARMM CRD file
-        psf=None,             # CHARMM PSF file
-        gro=None,             # GROMACS gro file
-        ff=None,              # one or more XML force field files
-        par=None,             # one or more CHARMM parameter files
-        gmx=None,             # GROMACS topology file
-        xml=None,             # System XML file    
-        positions=None,       # directly provide positions
-        topology=None,        # directly provide topology
-        restart=None,         # Restart XML with coordinates/velocities
-        box=100,              # 100 or (50,20,40), nm
-        nonbonded='PME',      # 'PME', 'LJPME', 'NoCutoff', 'CutoffPeriodic', 'CutoffNonPeriodic'
-        cuton=1.0,            # nm
-        cutoff=1.2,           # nm
-        switching=True,       # 'openmm' (default), 'charmmm', True, False
-        constraints=True,     # 'HBonds'  (default), 'AllBonds', 'HAngles'
-        rigidwater=True,      # True, Fals
-        dispcorr=False,       # 
-        hmass=None,           # hydrogen mass repartioning, True (3 amu) or give value
-        removecmmotion=False, # remove center of mass motion
+        structure=None,  # Structure/Model object read via PDBReader
+        pdb=None,  # PDB file
+        crd=None,  # CHARMM CRD file
+        psf=None,  # CHARMM PSF file
+        gro=None,  # GROMACS gro file
+        ff=None,  # one or more XML force field files
+        par=None,  # one or more CHARMM parameter files
+        gmx=None,  # GROMACS topology file
+        xml=None,  # System XML file
+        positions=None,  # directly provide positions
+        topology=None,  # directly provide topology
+        restart=None,  # Restart XML with coordinates/velocities
+        box=100,  # 100 or (50,20,40), nm
+        nonbonded="PME",  # 'PME', 'LJPME', 'NoCutoff', 'CutoffPeriodic', 'CutoffNonPeriodic'
+        cuton=1.0,  # nm
+        cutoff=1.2,  # nm
+        switching=True,  # 'openmm' (default), 'charmmm', True, False
+        constraints=True,  # 'HBonds'  (default), 'AllBonds', 'HAngles'
+        rigidwater=True,  # True, Fals
+        dispcorr=False,  #
+        hmass=None,  # hydrogen mass repartioning, True (3 amu) or give value
+        removecmmotion=False,  # remove center of mass motion
     ):
 
         self.simulation = None
@@ -116,20 +113,20 @@ class MDSim:
         self.set_xmlff(ff)
 
         if box:
-           self.set_box(box)
+            self.set_box(box)
         if positions:
-            self.positions=positions
+            self.positions = positions
         if topology:
-            self.topology=topology
+            self.topology = topology
 
         self.cuton = cuton * nanometer
         self.cutoff = cutoff * nanometer
         self.set_nonbonded(nonbonded)
         self.set_switching(switching)
-        self.ewaldtol = 1E-05
-        self.dispcorr=dispcorr
+        self.ewaldtol = 1e-05
+        self.dispcorr = dispcorr
 
-        self.rigidwater=rigidwater
+        self.rigidwater = rigidwater
 
         self.set_constraints(constraints)
         self.set_hydrogenmass(hmass)
@@ -141,143 +138,145 @@ class MDSim:
             return
 
         self.fix_topology()
-        
+
         self.setup_system()
 
-    def set_nonbonded(self,nb):
-        self.nonbonded=ff.PME
-        if nb.lower()=='pme':
-            self.nonbonded=ff.PME
-        elif nb.lower()=='ljpme':
-            self.nonbonded=ff.LJPME
-        elif nb.lower()=='nocutoff':
-            self.nonbonded=ff.NoCutoff
-        elif nb.lower()=='cutoff':
-            if self.box: 
-                self.nonbonded=ff.CutoffPeriodic
+    def set_nonbonded(self, nb):
+        self.nonbonded = ff.PME
+        if nb.lower() == "pme":
+            self.nonbonded = ff.PME
+        elif nb.lower() == "ljpme":
+            self.nonbonded = ff.LJPME
+        elif nb.lower() == "nocutoff":
+            self.nonbonded = ff.NoCutoff
+        elif nb.lower() == "cutoff":
+            if self.box:
+                self.nonbonded = ff.CutoffPeriodic
             else:
-                self.nonbonded=ff.CutoffNonPeriodic
-        elif nb.lower()=='cutoffperiodic':
-            self.nonbonded=ff.CutoffPeriodic
-        elif nb.lower()=='cutoffnonperiodic':
-            self.nonbonded=ff.CutoffNonPeriodic
+                self.nonbonded = ff.CutoffNonPeriodic
+        elif nb.lower() == "cutoffperiodic":
+            self.nonbonded = ff.CutoffPeriodic
+        elif nb.lower() == "cutoffnonperiodic":
+            self.nonbonded = ff.CutoffNonPeriodic
 
-    def set_constraints(self,c):
-        self.constraints=None
-        self.flexcons=True
-        if isinstance(c,bool) and c:
-            self.constraints=ff.HBonds
-            self.flexcons=False
-        elif isinstance(c,str):
-            if c.lower() == 'hbonds':
-                self.constraints=ff.HBonds
-                self.flexcons=False
-            elif c.lower() == 'allbonds':
-                self.constraints=ff.AllBonds
-                self.flexcons=False
-            elif c.lower() == 'hangles':
-                self.constraints=ff.HAngles
-                self.flexcons=False
+    def set_constraints(self, c):
+        self.constraints = None
+        self.flexcons = True
+        if isinstance(c, bool) and c:
+            self.constraints = ff.HBonds
+            self.flexcons = False
+        elif isinstance(c, str):
+            if c.lower() == "hbonds":
+                self.constraints = ff.HBonds
+                self.flexcons = False
+            elif c.lower() == "allbonds":
+                self.constraints = ff.AllBonds
+                self.flexcons = False
+            elif c.lower() == "hangles":
+                self.constraints = ff.HAngles
+                self.flexcons = False
 
-    def set_hydrogenmass(self,hm):
-        self.hydrogenmass=None
-        if isinstance(hm,bool) and hm:
-            self.hydrogenmass=3.0
-        elif isinstance(hm,str):
-            hmassval=float(hm)
-            if hmassval>1.0:
-                self.hydrogenmass=hmassval
+    def set_hydrogenmass(self, hm):
+        self.hydrogenmass = None
+        if isinstance(hm, bool) and hm:
+            self.hydrogenmass = 3.0
+        elif isinstance(hm, str):
+            hmassval = float(hm)
+            if hmassval > 1.0:
+                self.hydrogenmass = hmassval
 
-    def set_switching(self,sw):
-        self.switching=None
-        if isinstance(sw,bool) and sw:
-            self.switching='openmm'
-        elif isinstance(sw,str): 
-            if sw.lower() == 'openmm':
-                self.switching='openmm'
-            elif sw.lower() == 'charmm':
-                self.switching='charmm'
+    def set_switching(self, sw):
+        self.switching = None
+        if isinstance(sw, bool) and sw:
+            self.switching = "openmm"
+        elif isinstance(sw, str):
+            if sw.lower() == "openmm":
+                self.switching = "openmm"
+            elif sw.lower() == "charmm":
+                self.switching = "charmm"
             else:
-                self.switching=sw
+                self.switching = sw
 
-    def set_pdb(self,fname):
-        self.pdb=None
+    def set_pdb(self, fname):
+        self.pdb = None
         if _is_readable_file(fname):
-            self.pdb=PDBFile(fname)
-            self.topology=self.pdb.topology
-            self.positions=self.pdb.positions
+            self.pdb = PDBFile(fname)
+            self.topology = self.pdb.topology
+            self.positions = self.pdb.positions
 
-    def set_psf(self,fname):
-        self.psf=None
+    def set_psf(self, fname):
+        self.psf = None
         if _is_readable_file(fname):
-            self.psf=CharmmPsfFile(fname)
-            self.topology=self.psf.topology
-    
-    def set_crd(self,fname):
-        self.crd=None
-        if _is_readable_file(fname):
-            self.crd=CharmmCrdFile(fname)
-            self.positions=self.crd.positions
-    
-    def set_gro(self,fname):
-        self.gro=None
-        if _is_readable_file(fname):
-            self.gro=GromacsGroFile(fname)
-            self.positions=self.gro.positions
-            #box size?
+            self.psf = CharmmPsfFile(fname)
+            self.topology = self.psf.topology
 
-    def set_gmxtop(self,fname):
-        self.gmx=None
+    def set_crd(self, fname):
+        self.crd = None
         if _is_readable_file(fname):
-            self.gmx=GromacsTopFile(fname)
-            self.topology=self.gmx.topology
+            self.crd = CharmmCrdFile(fname)
+            self.positions = self.crd.positions
 
-    def set_xmlff(self,fname):
-        self.ff=None
+    def set_gro(self, fname):
+        self.gro = None
+        if _is_readable_file(fname):
+            self.gro = GromacsGroFile(fname)
+            self.positions = self.gro.positions
+            # box size?
+
+    def set_gmxtop(self, fname):
+        self.gmx = None
+        if _is_readable_file(fname):
+            self.gmx = GromacsTopFile(fname)
+            self.topology = self.gmx.topology
+
+    def set_xmlff(self, fname):
+        self.ff = None
         if fname:
-            if isinstance(fname,str):
-                flist=[fname]
+            if isinstance(fname, str):
+                flist = [fname]
             else:
-                flist=list(fname)
+                flist = list(fname)
 
-            plist=[]
+            plist = []
             for f in flist:
                 if _is_readable_file(f):
                     plist.append(f)
             if plist:
-                self.ff=ForceField(*plist)
+                self.ff = ForceField(*plist)
 
-    def set_charmmpar(self,fname):
-        self.cpar=None
+    def set_charmmpar(self, fname):
+        self.cpar = None
         if fname:
-            if isinstance(fname,str):
-                flist=[fname]
+            if isinstance(fname, str):
+                flist = [fname]
             else:
-                flist=list(fname)
+                flist = list(fname)
 
-            plist=[]
+            plist = []
             for f in flist:
                 if _is_readable_file(f):
                     plist.append(f)
             if plist:
-                self.cpar=CharmmParameterSet(*plist)
+                self.cpar = CharmmParameterSet(*plist)
 
     def fix_topology(self):
         if self.topology:
             for atom in self.topology.atoms():
-                if atom.name == 'SOD':
-                    atom.element=element.sodium
+                if atom.name == "SOD":
+                    atom.element = element.sodium
 
     def setup_system(self):
-        self.system=None
+        self.system = None
         if self.psf and self.cpar:
             if self.box:
-                self.psf.setBox(self.box[0]*nanometer,self.box[1]*nanometer,self.box[2]*nanometer)
-            self.system=self.psf.createSystem(
+                self.psf.setBox(
+                    self.box[0] * nanometer, self.box[1] * nanometer, self.box[2] * nanometer
+                )
+            self.system = self.psf.createSystem(
                 self.cpar,
                 nonbondedMethod=self.nonbonded,
                 nonbondedCutoff=self.cutoff,
-                ewaldErrorTolerance=self.ewaldtol, 
+                ewaldErrorTolerance=self.ewaldtol,
                 switchDistance=None,
                 constraints=self.constraints,
                 flexibleConstraints=self.flexcons,
@@ -285,13 +284,13 @@ class MDSim:
                 removeCMMotion=self.removecmmotion,
                 hydrogenMass=self.hydrogenmass,
             )
-            print('created system from CHARMM PSF')
+            print("created system from CHARMM PSF")
         elif self.topology and self.ff:
-            self.system=self.ff.createSystem(
+            self.system = self.ff.createSystem(
                 self.topology,
                 nonbondedMethod=self.nonbonded,
                 nonbondedCutoff=self.cutoff,
-                ewaldErrorTolerance=self.ewaldtol, 
+                ewaldErrorTolerance=self.ewaldtol,
                 switchDistance=None,
                 constraints=self.constraints,
                 rigidWater=self.rigidwater,
@@ -299,12 +298,12 @@ class MDSim:
                 removeCMMotion=self.removecmmotion,
                 hydrogenMass=self.hydrogenmass,
             )
-            print('created system from XML ForceField')
+            print("created system from XML ForceField")
         elif self.gmx:
-            self.system=self.gmx.createSystem(
+            self.system = self.gmx.createSystem(
                 nonbondedMethod=self.nonbonded,
                 nonbondedCutoff=self.cutoff,
-                ewaldErrorTolerance=self.ewaldtol, 
+                ewaldErrorTolerance=self.ewaldtol,
                 switchDistance=None,
                 constraints=self.constraints,
                 rigidWater=self.rigidwater,
@@ -312,12 +311,12 @@ class MDSim:
                 removeCMMotion=self.removecmmotion,
                 hydrogenMass=self.hydrogenmass,
             )
-            print('created system from Gromacs topology')
-        if self.system: 
-            for i, force in enumerate(self.system.getForces()): 
+            print("created system from Gromacs topology")
+        if self.system:
+            for i, force in enumerate(self.system.getForces()):
                 force.setForceGroup(i)
         else:
-            self.system=System()
+            self.system = System()
 
     def describe(self) -> str:
         return f"This is MDSim version {self.version}"
@@ -485,7 +484,7 @@ class MDSim:
             self.read_state(restart)
         else:
             if positions is not None:
-                self.positions=positions
+                self.positions = positions
             if self.positions is not None:
                 self.simulation.context.setPositions(self.positions)
 
@@ -507,7 +506,8 @@ class MDSim:
 
         if self.topology is not None:
             self.topology.setPeriodicBoxVectors((a_top, b_top, c_top))
-#        self.system.setDefaultPeriodicBoxVectors(a_sys, b_sys, c_sys)
+
+    #        self.system.setDefaultPeriodicBoxVectors(a_sys, b_sys, c_sys)
 
     def setup_forces(self) -> None:
         self.forces = {}
@@ -573,7 +573,7 @@ class MDSim:
 
         # Plain numeric
         if isinstance(box, (int, float)):
-            val = float(box)/10.0
+            val = float(box) / 10.0
             return (val, val, val)
 
         # Plain sequence
@@ -581,7 +581,7 @@ class MDSim:
             ax, by, cz = box
             if not all(isinstance(v, (int, float)) for v in (ax, by, cz)):
                 raise TypeError("Box tuple must contain numbers.")
-            return (float(ax)/10.0, float(by)/10.0, float(cz)/10.0)
+            return (float(ax) / 10.0, float(by) / 10.0, float(cz) / 10.0)
 
         raise TypeError("box must be a number, a length-3 tuple, or a Quantity.")
 
@@ -591,4 +591,3 @@ def _is_readable_file(path: Optional[str]) -> bool:
     if not isinstance(path, str):
         return False
     return os.path.isfile(path) and os.access(path, os.R_OK)
-
