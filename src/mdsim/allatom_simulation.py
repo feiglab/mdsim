@@ -4,10 +4,12 @@ import os
 from collections.abc import Sequence
 from typing import Optional
 
+import mdtraj as md
 import numpy as np
 from openmm import (
     CMMotionRemover,
     CustomBondForce,
+    CustomExternalForce,
     CustomNonbondedForce,
     LangevinIntegrator,
     MonteCarloBarostat,
@@ -100,7 +102,7 @@ class MDSim:
         pressure=None,  # pressure in bar
         gamma=0.01,  # gamma in 1/ps
         tstep=0.001,  # time step in ps
-        box=100,  # 100 or (50,20,40), nm
+        box=None,  # 100 or (50,20,40), Angstroms
         nonbonded="PME",  # 'PME', 'LJPME', 'NoCutoff', 'CutoffPeriodic', 'CutoffNonPeriodic'
         cuton=1.0,  # nm
         cutoff=1.2,  # nm
@@ -116,6 +118,8 @@ class MDSim:
         self.topology = None
         self.positions = None
         self.restart = None
+        self.box = None
+        self.box_vectors = None
         self.stype = None
 
         self.set_psf(psf)
@@ -169,6 +173,8 @@ class MDSim:
         *,
         restart=None,
         positions=None,
+        velocities=None,
+        box=None,
         resources="CPU",
         device=0,
         tstep=None,
@@ -177,10 +183,14 @@ class MDSim:
     ):
         self.resources = resources
 
-        if positions:
-            self.positions = positions
         if restart:
             self.set_restart(restart)
+        if positions:
+            self.positions = positions
+        if velocities:
+            self.velocities = velocities
+        if box:
+            self.set_box(box)
         if tstep:
             self.tstep = tstep * picoseconds
         if gamma:
@@ -188,7 +198,7 @@ class MDSim:
         if temperature:
             self.temperature = temperature * kelvin
 
-        if self.restart and not self.topology:
+        if not self.topology:
             self.set_dummy_topology()
 
         self.integrator = LangevinIntegrator(self.temperature, self.gamma, self.tstep)
@@ -207,7 +217,21 @@ class MDSim:
         else:
             if self.positions:
                 self.simulation.context.setPositions(self.positions)
+            if self.velocities:
+                self.simulation.context.setVelocities(self.velocities)
+            if self.box_vectors:
+                a, b, c = self.box_vectors
+                self.simulation.context.setPeriodicBoxVectors(a, b, c)
+            else:
                 self.set_velocities()
+
+    def get_positions(self):
+        if self.simulation:
+            return self.simulation.context.getState(getPositions=True).getPositions()
+
+    def get_velocities(self):
+        if self.simulation:
+            return self.simulation.context.getState(getVelocities=True).getVelocities()
 
     def set_nonbonded(self, nb):
         self.nonbonded = ff.PME
@@ -218,7 +242,7 @@ class MDSim:
         elif nb.lower() == "nocutoff":
             self.nonbonded = ff.NoCutoff
         elif nb.lower() == "cutoff":
-            if self.box:
+            if self.box_vectors:
                 self.nonbonded = ff.CutoffPeriodic
             else:
                 self.nonbonded = ff.CutoffNonPeriodic
@@ -308,7 +332,14 @@ class MDSim:
             self.gro = GromacsGroFile(fname)
             if not self.positions:
                 self.positions = self.gro.positions
-            # box size?
+            # set box from GRO if present
+            try:
+                box_vec = self.gro.getUnitCellDimensions()  # Vec3 * unit
+            except AttributeError:
+                box_vec = None
+            if box_vec is not None:
+                # convert to Quantity in nm and feed _normalize_box
+                self.set_box(box_vec)
 
     def set_gmxtop(self, fname):
         self.gmx = None
@@ -350,6 +381,11 @@ class MDSim:
     def set_restart(self, fname):
         if _is_readable_file(fname):
             self.restart = fname
+            with open(self.restart) as f:
+                state = XmlSerializer.deserialize(f.read())
+            self.positions = state.getPositions()
+            self.velocities = state.getVelocities()
+            self.box_vectors = state.getPeriodicBoxVectors()
 
     def fix_topology(self):
         if self.topology:
@@ -498,6 +534,71 @@ class MDSim:
                         force.addGlobalParameter("Roff", self.cutoff)
                         force.setEnergyFunction(ljswitch)
 
+    def set_position_restraint(
+        self, *, selection="name CA", atomlist=None, k=100.0, positions=None
+    ):
+        """
+        Apply PBC-aware positional restraints to a set of atoms.
+
+        Parameters
+        ----------
+        selection : str
+            MDTraj selection string (ignored if `atomlist` is provided).
+        atomlist : sequence of int or openmm.app.Atom
+            Atoms to restrain, given as indices or Atom objects.
+        k : float
+            Force constant in kJ/mol/nm^2.
+        positions : reference positions
+        """
+        if self.system is None:
+            raise RuntimeError("System has not been created yet.")
+
+        # Determine atom indices
+        if atomlist is not None:
+            # Accept list of ints or list of Atom objects
+            if len(atomlist) == 0:
+                return
+            first = atomlist[0]
+            if isinstance(first, int):
+                indices = list(atomlist)
+            else:
+                # assume OpenMM Atom objects
+                indices = [a.index for a in atomlist]
+        else:
+            if self.topology is None:
+                raise RuntimeError("Topology is required for selection-based restraints.")
+            md_top = md.Topology.from_openmm(self.topology)
+            indices = md_top.select(selection).tolist()
+
+        if not indices:
+            return  # nothing to restrain
+
+        # Get reference positions (in nm)
+        if positions is not None:
+            pos = positions
+        elif self.positions is not None:
+            pos = self.positions
+        elif self.simulation is not None:
+            pos = self.simulation.context.getState(getPositions=True).getPositions()
+        else:
+            raise RuntimeError("No positions available to define restraint reference points.")
+
+        force = CustomExternalForce("0.5 * k * periodicdistance(x, y, z, x0, y0, z0)^2")
+        force.addGlobalParameter("k", k * kilojoule / (nanometer**2 * mole))
+        force.addPerParticleParameter("x0")
+        force.addPerParticleParameter("y0")
+        force.addPerParticleParameter("z0")
+
+        for idx in indices:
+            p = pos[idx]
+            x0 = p.x.value_in_unit(nanometer)
+            y0 = p.y.value_in_unit(nanometer)
+            z0 = p.z.value_in_unit(nanometer)
+            force.addParticle(idx, [x0, y0, z0])
+
+        force.setName("PositionalRestraints")
+        self.system.addForce(force)
+
     def set_force_groups(self):
         if self.system:
             for i, force in enumerate(self.system.getForces()):
@@ -543,7 +644,7 @@ class MDSim:
             self.simulation.loadState(fname)
 
     def write_pdb(self, fname="state.pdb"):
-        positions = self.simulation.context.getState(getPositions=True).getPositions()
+        positions = self.get_positions()
         with open(fname, "w") as f:
             PDBFile.writeFile(self.simulation.topology, positions, f)
 
@@ -672,8 +773,6 @@ class MDSim:
         if self.topology is not None:
             self.topology.setPeriodicBoxVectors((a_top, b_top, c_top))
 
-    #        self.system.setDefaultPeriodicBoxVectors(a_sys, b_sys, c_sys)
-
     def setup_forces(self) -> None:
         self.forces = {}
         if self.topology is not None:
@@ -717,7 +816,7 @@ class MDSim:
     @staticmethod
     def _normalize_box(box) -> tuple[float, float, float]:
         """
-        Normalize user input to a 3-tuple of floats in Angstroms
+        Normalize user input to a 3-tuple of floats in nm
         Accepts:
           - scalar number (int/float)
           - 3-sequence of numbers
