@@ -734,7 +734,7 @@ class MDSim:
             tolerance = tol * kilojoule / (nanometer * mole)
             self.simulation.minimizeEnergy(tolerance=tolerance, maxIterations=nstep)
 
-    def simulate(self, *, nstep=1000, nout=100, logfile=None, dcdfile=None):
+    def simulate(self, *, nstep=1000, nout=1000, logfile=None, dcdfile=None):
         if self.simulation is not None:
             if dcdfile:
                 dcd = DCDReporter(dcdfile, nout)
