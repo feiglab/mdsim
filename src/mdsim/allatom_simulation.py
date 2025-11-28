@@ -117,7 +117,6 @@ class MDSim:
         self.simulation = None
         self.topology = None
         self.positions = None
-        self.restart = None
         self.box = None
         self.box_vectors = None
         self.stype = None
@@ -130,7 +129,7 @@ class MDSim:
         self.set_gro(gro)
         self.set_charmmpar(par)
         self.set_xmlff(ff)
-        self.set_restart(restart)
+        self.read_restart(restart)
 
         if box:
             self.set_box(box)
@@ -184,7 +183,7 @@ class MDSim:
         self.resources = resources
 
         if restart:
-            self.set_restart(restart)
+            self.read_restart(restart)
         if positions:
             self.positions = positions
         if velocities:
@@ -212,18 +211,15 @@ class MDSim:
         if self.resources == "CPU":
             self.simulation = Simulation(self.topology, self.system, self.integrator, self.platform)
 
-        if self.restart:
-            self.read_state(self.restart)
+        if self.positions:
+            self.simulation.context.setPositions(self.positions)
+        if self.velocities:
+            self.simulation.context.setVelocities(self.velocities)
         else:
-            if self.positions:
-                self.simulation.context.setPositions(self.positions)
-            if self.velocities:
-                self.simulation.context.setVelocities(self.velocities)
-            if self.box_vectors:
-                a, b, c = self.box_vectors
-                self.simulation.context.setPeriodicBoxVectors(a, b, c)
-            else:
-                self.set_velocities()
+            self.set_velocities()
+        if self.box_vectors:
+            a, b, c = self.box_vectors
+            self.simulation.context.setPeriodicBoxVectors(a, b, c)
 
     def get_positions(self):
         if self.simulation:
@@ -378,10 +374,9 @@ class MDSim:
             if plist:
                 self.cpar = CharmmParameterSet(*plist)
 
-    def set_restart(self, fname):
+    def read_restart(self, fname):
         if _is_readable_file(fname):
-            self.restart = fname
-            with open(self.restart) as f:
+            with open(fname) as f:
                 state = XmlSerializer.deserialize(f.read())
             self.positions = state.getPositions()
             self.velocities = state.getVelocities()
