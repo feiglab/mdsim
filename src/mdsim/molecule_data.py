@@ -547,7 +547,12 @@ def _deduce_element(atomname: str, resname: str, element_hint: str = "") -> str:
 
 def _parse_atom_line(line: str) -> Atom:
     # PDB v3.3 column mapping, simplified
-    serial = _safe_int(line[4:11], required=True)  # left as in your version
+    raw_serial = line[4:11]
+    s_serial = raw_serial.strip()
+    if s_serial and all(ch == "*" for ch in s_serial):
+        serial = 0
+    else:
+        serial = _safe_int(raw_serial, required=True)
     name = line[12:16].strip()
     resname = line[17:21].strip()
     chain = (line[21] if len(line) >= 22 else " ").strip()
