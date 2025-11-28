@@ -37,6 +37,7 @@ from openmm.app import (
 )
 from openmm.unit import (
     Quantity,
+    bar,
     kelvin,
     kilojoule,
     mole,
@@ -95,10 +96,10 @@ class MDSim:
         positions=None,  # directly provide positions
         topology=None,  # directly provide topology
         restart=None,  # Restart XML with coordinates/velocities
-        temperature=298, # temperature: in K
-        pressure=None, # pressure in bar
-        gamma=0.01, # gamma in 1/ps
-        tstep=0.001, # time step in ps
+        temperature=298,  # temperature: in K
+        pressure=None,  # pressure in bar
+        gamma=0.01,  # gamma in 1/ps
+        tstep=0.001,  # time step in ps
         box=100,  # 100 or (50,20,40), nm
         nonbonded="PME",  # 'PME', 'LJPME', 'NoCutoff', 'CutoffPeriodic', 'CutoffNonPeriodic'
         cuton=1.0,  # nm
@@ -109,7 +110,6 @@ class MDSim:
         dispcorr=False,  #
         hmass=None,  # hydrogen mass repartioning, True (3 amu) or give value
         removecmmotion=False,  # remove center of mass motion
-        device=0,
     ):
 
         self.simulation = None
@@ -164,12 +164,13 @@ class MDSim:
             self.fix_topology()
             self.setup_system()
 
-
-    def setup_simulation(self,*,restart=None, positions=None, resources='CPU', tstep=None, gamma=None):
+    def setup_simulation(
+        self, *, restart=None, positions=None, resources="CPU", device=0, tstep=None, gamma=None
+    ):
         self.resources = resources
 
         if positions:
-            self.positions=positions
+            self.positions = positions
         if restart:
             self.set_restart(restart)
         if tstep:
@@ -197,7 +198,6 @@ class MDSim:
             if self.positions:
                 self.simulation.context.setPositions(self.positions)
                 self.set_velocities()
-
 
     def set_nonbonded(self, nb):
         self.nonbonded = ff.PME
@@ -495,7 +495,7 @@ class MDSim:
 
     def set_barostat(self):
         if self.system and self.temperature and self.pressure:
-            barostat=MonteCarloBarostat(self.pressure,self.temperature)
+            barostat = MonteCarloBarostat(self.pressure, self.temperature)
             self.system.addForce(barostat)
 
     def set_dummy_topology(self):
