@@ -10,6 +10,7 @@ from openmm import (
     CustomBondForce,
     CustomNonbondedForce,
     LangevinIntegrator,
+    MonteCarloBarostat,
     NonbondedForce,
     Platform,
     State,
@@ -94,6 +95,10 @@ class MDSim:
         positions=None,  # directly provide positions
         topology=None,  # directly provide topology
         restart=None,  # Restart XML with coordinates/velocities
+        temperature=298, # temperature: in K
+        pressure=None, # pressure in bar
+        gamma=0.01, # gamma in 1/ps
+        tstep=0.001, # time step in ps
         box=100,  # 100 or (50,20,40), nm
         nonbonded="PME",  # 'PME', 'LJPME', 'NoCutoff', 'CutoffPeriodic', 'CutoffNonPeriodic'
         cuton=1.0,  # nm
@@ -104,10 +109,10 @@ class MDSim:
         dispcorr=False,  #
         hmass=None,  # hydrogen mass repartioning, True (3 amu) or give value
         removecmmotion=False,  # remove center of mass motion
+        device=0,
     ):
 
         self.simulation = None
-
         self.topology = None
         self.positions = None
         self.restart = None
@@ -144,13 +149,55 @@ class MDSim:
 
         self.removecmmotion = removecmmotion
 
+        self.temperature = temperature * kelvin
+        if pressure:
+            self.pressure = pressure * bar
+        else:
+            self.pressure = None
+
+        self.tstep = tstep * picoseconds
+        self.gamma = gamma / picoseconds
+
         if xml:
             self.read_system(xml)
-            return
+        else:
+            self.fix_topology()
+            self.setup_system()
 
-        self.fix_topology()
 
-        self.setup_system()
+    def setup_simulation(self,*,restart=None, positions=None, resources='CPU', tstep=None, gamma=None):
+        self.resources = resources
+
+        if positions:
+            self.positions=positions
+        if restart:
+            self.set_restart(restart)
+        if tstep:
+            self.tstep = tstep * picoseconds
+        if gamma:
+            self.gamma = gamma / picoseconds
+
+        if self.restart and not self.topology:
+            self.set_dummy_topology()
+
+        self.integrator = LangevinIntegrator(self.temperature, self.gamma, self.tstep)
+        self.platform = Platform.getPlatformByName(self.resources)
+
+        if self.resources == "CUDA":
+            prop = dict(CudaPrecision="mixed", CudaDeviceIndex=str(device))
+            self.simulation = Simulation(
+                self.topology, self.system, self.integrator, self.platform, prop
+            )
+        if self.resources == "CPU":
+            self.simulation = Simulation(self.topology, self.system, self.integrator, self.platform)
+
+        if self.restart:
+            self.read_state(self.restart)
+        else:
+            if self.positions:
+                self.simulation.context.setPositions(self.positions)
+                self.set_velocities()
+
 
     def set_nonbonded(self, nb):
         self.nonbonded = ff.PME
@@ -349,6 +396,7 @@ class MDSim:
             self.stype = "gmx"
         if self.system:
             self.set_switching_function()
+            self.set_barostat()
             self.set_force_groups()
         else:
             self.system = System()
@@ -444,6 +492,11 @@ class MDSim:
         if self.system:
             for i, force in enumerate(self.system.getForces()):
                 force.setForceGroup(i)
+
+    def set_barostat(self):
+        if self.system and self.temperature and self.pressure:
+            barostat=MonteCarloBarostat(self.pressure,self.temperature)
+            self.system.addForce(barostat)
 
     def set_dummy_topology(self):
         if not self.topology and self.system:
@@ -582,53 +635,6 @@ class MDSim:
             )
             self.simulation.reporters.append(log)
             self.simulation.step(nstep)
-
-    def setup_simulation(
-        self,
-        *,
-        temperature=298,
-        gamma=0.01,
-        tstep=0.001,
-        resources="CPU",
-        device=0,
-        positions=None,
-        restart=None,
-    ) -> None:
-        # temperature: in K
-        # tstep: in ps
-        # gamma: in 1/ps
-        # resources: 'CPU' or 'CUDA'
-
-        assert self.system is not None, "need openMM system object to be defined"
-
-        self.set_restart(restart)
-
-        if self.restart and not self.topology:
-            self.set_dummy_topology()
-
-        self.temperature = temperature * kelvin
-        self.tstep = tstep * picoseconds
-        self.gamma = gamma / picoseconds
-        self.resources = resources
-
-        self.integrator = LangevinIntegrator(self.temperature, self.gamma, self.tstep)
-        self.platform = Platform.getPlatformByName(self.resources)
-        self.simulation = None
-        if self.resources == "CUDA":
-            prop = dict(CudaPrecision="mixed", CudaDeviceIndex=str(device))
-            self.simulation = Simulation(
-                self.topology, self.system, self.integrator, self.platform, prop
-            )
-        if self.resources == "CPU":
-            self.simulation = Simulation(self.topology, self.system, self.integrator, self.platform)
-        if self.restart is not None:
-            self.read_state(self.restart)
-        else:
-            if positions is not None:
-                self.positions = positions
-            if self.positions is not None:
-                self.simulation.context.setPositions(self.positions)
-                self.set_velocities()
 
     def set_box(self, box) -> None:
         ax_nm, by_nm, cz_nm = self._normalize_box(box)
