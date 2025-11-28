@@ -584,11 +584,21 @@ class MDSim:
         force.addPerParticleParameter("y0")
         force.addPerParticleParameter("z0")
 
+        # Convert positions to nm if they are a Quantity
+        if hasattr(pos, "value_in_unit"):
+            # pos is a Quantity (e.g. from State.getPositions())
+            pos_nm = pos.value_in_unit(nanometer)
+        else:
+            # pos is already a list/array of Vec3 or xyz triples in nm
+            pos_nm = pos
+
         for idx in indices:
-            p = pos[idx]
-            x0 = p.x.value_in_unit(nanometer)
-            y0 = p.y.value_in_unit(nanometer)
-            z0 = p.z.value_in_unit(nanometer)
+            p = pos_nm[idx]
+            # p can be a Vec3 or a length-3 iterable of floats
+            if hasattr(p, "x"):
+                x0, y0, z0 = p.x, p.y, p.z
+            else:
+                x0, y0, z0 = p[0], p[1], p[2]
             force.addParticle(idx, [x0, y0, z0])
 
         force.setName("PositionalRestraints")
