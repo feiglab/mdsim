@@ -117,6 +117,7 @@ class MDSim:
         self.simulation = None
         self.topology = None
         self.positions = None
+        self.velocities = None
         self.box = None
         self.box_vectors = None
         self.stype = None
