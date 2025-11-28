@@ -165,7 +165,15 @@ class MDSim:
             self.setup_system()
 
     def setup_simulation(
-        self, *, restart=None, positions=None, resources="CPU", device=0, tstep=None, gamma=None
+        self,
+        *,
+        restart=None,
+        positions=None,
+        resources="CPU",
+        device=0,
+        tstep=None,
+        gamma=None,
+        temperature=None,
     ):
         self.resources = resources
 
@@ -177,6 +185,8 @@ class MDSim:
             self.tstep = tstep * picoseconds
         if gamma:
             self.gamma = gamma / picoseconds
+        if temperature:
+            self.temperature = temperature * kelvin
 
         if self.restart and not self.topology:
             self.set_dummy_topology()
@@ -493,10 +503,15 @@ class MDSim:
             for i, force in enumerate(self.system.getForces()):
                 force.setForceGroup(i)
 
-    def set_barostat(self):
-        if self.system and self.temperature and self.pressure:
-            barostat = MonteCarloBarostat(self.pressure, self.temperature)
-            self.system.addForce(barostat)
+    def set_barostat(self, pressure=None, temperature=None):
+        if self.system:
+            if pressure:
+                self.pressure = pressure * bar
+            if temperature:
+                self.temperature = temperature * kelvin
+            if self.temperature and self.pressure:
+                barostat = MonteCarloBarostat(self.pressure, self.temperature)
+                self.system.addForce(barostat)
 
     def set_dummy_topology(self):
         if not self.topology and self.system:
@@ -613,27 +628,29 @@ class MDSim:
             tolerance = tol * kilojoule / (nanometer * mole)
             self.simulation.minimizeEnergy(tolerance=tolerance, maxIterations=nstep)
 
-    def simulate(self, *, nstep=1000, nout=100, logfile="energy.log", dcdfile="traj.dcd"):
+    def simulate(self, *, nstep=1000, nout=100, logfile=None, dcdfile=None):
         if self.simulation is not None:
-            dcd = DCDReporter(dcdfile, nout)
-            self.simulation.reporters.append(dcd)
-            log = StateDataReporter(
-                logfile,
-                nout,
-                step=True,
-                time=True,
-                potentialEnergy=True,
-                kineticEnergy=True,
-                totalEnergy=True,
-                temperature=True,
-                volume=True,
-                progress=True,
-                remainingTime=True,
-                speed=True,
-                totalSteps=nstep,
-                separator=" ",
-            )
-            self.simulation.reporters.append(log)
+            if dcdfile:
+                dcd = DCDReporter(dcdfile, nout)
+                self.simulation.reporters.append(dcd)
+            if logfile:
+                log = StateDataReporter(
+                    logfile,
+                    nout,
+                    step=True,
+                    time=True,
+                    potentialEnergy=True,
+                    kineticEnergy=True,
+                    totalEnergy=True,
+                    temperature=True,
+                    volume=True,
+                    progress=True,
+                    remainingTime=True,
+                    speed=True,
+                    totalSteps=nstep,
+                    separator=" ",
+                )
+                self.simulation.reporters.append(log)
             self.simulation.step(nstep)
 
     def set_box(self, box) -> None:
