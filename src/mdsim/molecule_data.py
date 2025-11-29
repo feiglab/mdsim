@@ -166,6 +166,71 @@ class Model:
             return out
         return [int(i) for i in indices]  # type: ignore[return-value]
 
+    def _center_of_geometry(self, indices: list[int]) -> tuple[float, float, float]:
+        """
+        Internal: center of geometry (Å) for a set of atom indices in this model.
+        """
+        if not indices:
+            raise ValueError("center of geometry requires at least one atom index")
+
+        sx = sy = sz = 0.0
+        for idx in indices:
+            a = self.atoms[idx]
+            sx += a.x
+            sy += a.y
+            sz += a.z
+
+        inv_n = 1.0 / float(len(indices))
+        return sx * inv_n, sy * inv_n, sz * inv_n
+
+    def distance(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+    ) -> unit.Quantity:
+        """
+        Center-of-geometry distance between two atom groups, as an OpenMM Quantity in nm.
+
+        Parameters
+        ----------
+        group_a, group_b
+            Atom index lists (0-based) or list-of-lists of indices relative to this Model.
+            Indices must be valid for this model.
+
+        Returns
+        -------
+        openmm.unit.Quantity
+            Distance in nanometers between the two groups' centers of geometry.
+
+        Raises
+        ------
+        ValueError
+            If either group is empty after flattening.
+        IndexError
+            If an index is out of range for this model.
+        """
+        flat_a = self._flatten_indices(group_a)
+        flat_b = self._flatten_indices(group_b)
+
+        if not flat_a or not flat_b:
+            raise ValueError("distance requires both groups to contain at least one atom")
+
+        n_atoms = self.natoms()
+        for idx in flat_a + flat_b:
+            if idx < 0 or idx >= n_atoms:
+                raise IndexError(f"Atom index {idx} is out of range for model with {n_atoms} atoms")
+
+        cx_a, cy_a, cz_a = self._center_of_geometry(flat_a)
+        cx_b, cy_b, cz_b = self._center_of_geometry(flat_b)
+
+        dx = cx_a - cx_b
+        dy = cy_a - cy_b
+        dz = cz_a - cz_b
+
+        # distance in Å (internal coordinates), then convert to nm Quantity
+        dist_ang = (dx * dx + dy * dy + dz * dz) ** 0.5
+        return unit.Quantity(dist_ang, unit.angstrom).in_units_of(unit.nanometer)
+
     def select_byindex(self, indices: Union[list[int], list[list[int]]]) -> Model:
         """
         Return a new Model containing only atoms at the given 0-based indices
@@ -339,6 +404,36 @@ class Structure:
             n_sphere_points=n_sphere_points,
             radii=radii,
         )
+
+    def distance(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+    ) -> list[unit.Quantity]:
+        """
+        Center-of-geometry distance between two atom groups for all models.
+
+        Applies the same index lists to each model in `self.models` and returns
+        one distance Quantity per model in order.
+
+        Parameters
+        ----------
+        group_a, group_b
+            Atom index lists (0-based) or list-of-lists of indices. Interpreted
+            in each model's atom ordering.
+
+        Returns
+        -------
+        list[openmm.unit.Quantity]
+            Distances in nanometers, one per model. Returns [] if there are no models.
+        """
+        if not self.models:
+            return []
+
+        distances: list[unit.Quantity] = []
+        for m in self.models:
+            distances.append(m.distance(group_a, group_b))
+        return distances
 
 
 # --- Parser ------------------------------------------------------------------

@@ -9,6 +9,7 @@ import numpy as np
 from openmm import (
     CMMotionRemover,
     CustomBondForce,
+    CustomCentroidBondForce,
     CustomExternalForce,
     CustomNonbondedForce,
     LangevinIntegrator,
@@ -576,11 +577,6 @@ class MDSim:
         force.setName("PositionalRestraints")
         self.system.addForce(force)
 
-    def set_force_groups(self):
-        if self.system:
-            for i, force in enumerate(self.system.getForces()):
-                force.setForceGroup(i)
-
     def set_barostat(self, pressure=None, temperature=None):
         if self.system:
             if pressure:
@@ -590,6 +586,25 @@ class MDSim:
             if self.temperature and self.pressure:
                 barostat = MonteCarloBarostat(self.pressure, self.temperature)
                 self.system.addForce(barostat)
+
+    def set_umbrella_xyz_distance(self, groupa, groupb, *, direction="x", target=0.0, k=10.0):
+        if self.system:
+            bias = f"0.5 * uk_{direction} * ((abs({direction}2 - {direction}1) - target)^2)"
+            force = CustomCentroidBondForce(2, bias)
+            force.addPerBondParameter("target")  # target distance (nm)
+            force.addGlobalParameter(f"uk_{direction}", k * kilojoule / mole / nanometer**2)
+            force.addGroup(groupa)
+            force.addGroup(groupb)
+            force.addBond([0, 1], [target * nanometer])
+            if self.box_vectors:
+                force.setUsesPeriodicBoundaryConditions(True)
+            force.setName(f"Umbrella_{direction}")
+            self.system.addForce(force)
+
+    def set_force_groups(self):
+        if self.system:
+            for i, force in enumerate(self.system.getForces()):
+                force.setForceGroup(i)
 
     def set_dummy_topology(self):
         if not self.topology and self.system:
