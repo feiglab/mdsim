@@ -183,7 +183,7 @@ class Model:
 
     def select_bystring(self, spec: str) -> Model:
         """
-        Return a new Model using a textual selection `spec` via DomainSelector.
+        Return a new Model using a textual selection `spec` via StructureSelector.
         This method builds a temporary single-model Structure to reuse the selector.
         """
         if not isinstance(spec, str) or not spec.strip():
@@ -199,7 +199,7 @@ class Model:
         # Build a temporary Structure with this model only
         temp_struct = Structure(models=[self])
 
-        sel = DomainSelector(raw)
+        sel = StructureSelector(raw)
         # list-of-lists (per selector semantics)
         idx_lists = sel.atom_lists(temp_struct, model_index=0)
         return self.select_byindex(idx_lists)
@@ -599,11 +599,97 @@ def _res_id(r: Residue) -> tuple[str, str, int, str]:
     return (r.resname, r.chain, r.resnum, r.seg)
 
 
-# ---- DomainSelector ----------------------------------------------------------
+# ---- StructureSelector ----------------------------------------------------------
 
 
 class SelectionError(ValueError):
     """Raised when a selection term cannot be parsed or resolved."""
+
+
+# ----------------------------- selection constants ---------------------------
+
+# Protein residue names (3-letter codes) used by the "protein" keyword.
+_AMINO_ACID_RESNAMES: set[str] = {
+    "ALA",
+    "ARG",
+    "ASN",
+    "ASP",
+    "CYS",
+    "GLN",
+    "GLU",
+    "GLY",
+    "HIS",
+    "HSD",
+    "HSE",
+    "ILE",
+    "LEU",
+    "LYS",
+    "MET",
+    "PHE",
+    "PRO",
+    "SER",
+    "THR",
+    "TRP",
+    "TYR",
+    "VAL",
+}
+
+# Simple solvent/ion classes.
+_WATER_RESNAMES: set[str] = {"HOH", "TIP3", "WAT", "SPC"}
+_ION_RESNAMES: set[str] = {"SOD", "POT", "CLA", "MG", "NA"}
+
+
+def _is_hydrogen(atom: Atom) -> bool:
+    """Return True if this atom should be treated as hydrogen.
+
+    Uses both the deduced element and common PDB atom-name patterns
+    (H*, ?H*), to be robust against imperfect element assignment.
+    """
+    name = (atom.name or "").strip().upper()
+    if not name:
+        return False
+    el = (getattr(atom, "element", "") or "").upper()
+    if el == "H":
+        return True
+    # H*, 1H*, 2H*, etc.
+    if name[0] == "H":
+        return True
+    if len(name) >= 2 and name[1] == "H":
+        return True
+    return False
+
+
+def _is_element_like(atom: Atom, symbol: str) -> bool:
+    """Heuristic element classifier using Atom.element and atom name."""
+    symbol = symbol.upper()
+    el = (getattr(atom, "element", "") or "").upper()
+    if el == symbol:
+        return True
+    name = (atom.name or "").strip().upper()
+    if not name:
+        return False
+    if name[0] == symbol:
+        return True
+    if len(name) >= 2 and name[1] == symbol:
+        return True
+    return False
+
+
+def _residue_matches_groups(res: Residue, flags: frozenset[str]) -> bool:
+    """
+    Apply residue-group filters ("protein", "water", "ions") to a Residue.
+    If no such flags are present, always returns True.
+    """
+    if not {"protein", "water", "ions"} & flags:
+        return True
+    name = (res.resname or "").strip().upper()
+    if "protein" in flags and name not in _AMINO_ACID_RESNAMES:
+        return False
+    if "water" in flags and name not in _WATER_RESNAMES:
+        return False
+    if "ions" in flags and name not in _ION_RESNAMES:
+        return False
+    return True
 
 
 # ----------------------------- parsing primitives ----------------------------
@@ -622,7 +708,8 @@ class ResidueSelector:
         if s == "all":
             return ResidueSelector(all_residues=True)
 
-        toks = [t for t in re.split(r"[.:]", spec) if t.strip()]
+        # '.' and ':' kept as before; '+' added as an extra union separator.
+        toks = [t for t in re.split(r"[.:+]", spec) if t.strip()]
         ranges: list[tuple[int, int]] = []
         for t in toks:
             t = t.strip()
@@ -655,15 +742,53 @@ class ResidueSelector:
 
 
 @dataclass(frozen=True)
+class AtomSelector:
+    """
+    Atom-level constraints for a Term.
+
+    names:
+        Specific atom names to include (e.g. ("CA", "CB")).  Comparison is
+        case-insensitive against Atom.name.
+
+    flags:
+        Keyword filters applied in addition to names:
+          - "heavy"      : exclude hydrogens
+          - "hydrogens"  : only hydrogens
+          - "carbons"    : only carbons
+          - "nitrogens"  : only nitrogens
+          - "oxygens"    : only oxygens
+          - "protein"    : only residues in _AMINO_ACID_RESNAMES
+          - "water"      : only residues in _WATER_RESNAMES
+          - "ions"       : only residues in _ION_RESNAMES
+    """
+
+    names: Optional[tuple[str, ...]] = None
+    flags: frozenset[str] = frozenset()
+
+    def has_residue_filters(self) -> bool:
+        return bool({"protein", "water", "ions"} & self.flags)
+
+    def has_atom_filters(self) -> bool:
+        return bool(self.names) or bool(self.flags - {"protein", "water", "ions"})
+
+
+@dataclass(frozen=True)
 class Term:
-    """One selection term: chains (or None for all chains) + residue selector (or all)."""
+    """
+    One selection term:
+      - chains (or None for all chains)
+      - residue selector (or all)
+      - optional atom selector.
+    """
 
     chains: Optional[tuple[str, ...]]  # None => all chains
     residues: ResidueSelector
+    atom_selector: Optional[AtomSelector] = None
 
 
 def _parse_chain_list(s: str) -> tuple[str, ...]:
-    ids = [tok for tok in s.split(":") if tok.strip()]
+    # Chains separated by ':' or '+' (e.g. 'A:B:C' or 'A+B+C').
+    ids = [tok.strip() for tok in re.split(r"[:+]", s) if tok.strip()]
     if not ids:
         raise SelectionError(f"Empty chain list in '{s}'")
     return tuple(ids)
@@ -673,18 +798,75 @@ def _looks_like_residue_spec(s: str) -> bool:
     s = s.strip().lower()
     if s == "all":
         return True
-    # digits, dashes, dots, colons => residue expressions (e.g., "2-91.93-94" or "5:7")
-    return bool(re.fullmatch(r"[0-9][0-9:.\-]*", s))
+    # digits, dashes, dots, colons, plus => residue expressions (e.g., "2-91:93-94").
+    return bool(re.fullmatch(r"[0-9][0-9:.\-+]*", s))
+
+
+# Atom / residue macro keywords ------------------------------------------------
+
+_RESIDUE_GROUP_KEYWORDS = {"protein", "proteins", "water", "waters", "ion", "ions"}
+
+_ATOM_FLAG_ALIASES = {
+    "heavy": "heavy",
+    "heavies": "heavy",
+    "hydrogen": "hydrogens",
+    "hydrogens": "hydrogens",
+    "carbon": "carbons",
+    "carbons": "carbons",
+    "nitrogen": "nitrogens",
+    "nitrogens": "nitrogens",
+    "oxygen": "oxygens",
+    "oxygens": "oxygens",
+    "protein": "protein",
+    "proteins": "protein",
+    "water": "water",
+    "waters": "water",
+    "ion": "ions",
+    "ions": "ions",
+}
+
+
+def _parse_atom_spec(spec: str) -> AtomSelector:
+    """
+    Parse the atom part of a term, supporting:
+
+      - Explicit names:  'CA', 'CA:CB', 'CA+CB'
+      - Keywords: 'heavy', 'carbons', 'hydrogens', 'nitrogens', 'oxygens'
+      - Residue group keywords: 'protein', 'water', 'ions'
+    """
+    spec = spec.strip()
+    if not spec:
+        raise SelectionError("Empty atom spec")
+
+    names: list[str] = []
+    flags: set[str] = set()
+
+    for raw in re.split(r"[:+]", spec):
+        tok = raw.strip()
+        if not tok:
+            continue
+        key = tok.lower()
+        if key in _ATOM_FLAG_ALIASES:
+            flags.add(_ATOM_FLAG_ALIASES[key])
+        else:
+            # treat as literal atom-name filter
+            names.append(tok.upper())
+
+    if not names and not flags:
+        raise SelectionError(f"Could not parse atom spec '{spec}'")
+
+    return AtomSelector(names=tuple(names) if names else None, flags=frozenset(flags))
 
 
 # ----------------------------- public selector -------------------------------
 
 
-class DomainSelector:
+class StructureSelector:
     """
     Parse domain spec strings and produce atom lists from your Structure/Model.
 
-    Semantics:
+    Extended semantics (superset of original behaviour):
+
       • If input is a single string: commas and/or whitespace separate terms that are
         COMBINED into one selection (one atom list if any explicit chains are present).
         Example: "A:2-10,B:5-15" -> one combined list over A:2-10 and B:5-15.
@@ -696,11 +878,25 @@ class DomainSelector:
           – If NO term specifies chains  => return ONE atom list PER CHAIN (same residue spec).
 
     Grammar (per term, forgiving):
-      - Chain lists use ':' (e.g., 'H271:H272').
-      - Chain vs residues separated by first '.' (e.g., 'H271.2-91' or 'H271.all').
-      - If only residues are given (e.g., '2-91.93-94'), they apply to all chains.
-      - 'all' alone => all chains, all residues.
+
+      - Chain lists use ':' or '+' (e.g., 'A:B:C' or 'A+B+C').
+      - Chain vs residues separated by first '.' (e.g., 'A:B.2-91').
+      - An optional second '.' introduces atom selection:
+
+            A:B:C.2-90        # residues only
+            A:B:C.2-90.CA     # specific atom names
+            A:B:C.2-40:50-60.CA:CB
+            A:B:C.CA          # all residues, atom name CA
+            A:B:C.heavy       # heavy atoms only in these chains
+            2-90.CA           # all chains, residues 2-90, atoms CA
+            protein.CA        # CA atoms in protein residues/chains
+            protein           # all atoms in protein residues
+
+      - Residue ranges support ':' or '+' as union separators ("2-10:20-30", "2-10+20-30").
+      - Atom-name lists support ':' or '+' ("CA:CB", "CA+CB").
+      - 'all' alone => all chains, all residues, all atoms.
       - Terms in a group separated by commas and/or whitespace.
+      - ';' or '_' in a single-string spec split it into multiple groups.
     """
 
     def __init__(self, spec: Union[str, Iterable[str]]):
@@ -726,39 +922,102 @@ class DomainSelector:
         atom_to_idx = {id(a): i for i, a in enumerate(model.atoms)}
         out_lists: list[list[int]] = []
 
-        for grp, has_explicit in zip(self._groups, self._group_has_explicit):
-            alias_to_resnums = self._resolve_residues_for_terms(model, grp)
+        # Precompute chain ordering and alias mapping once per call
+        chains = list(model.chains())
+        chain_index: dict[int, int] = {id(ch): i for i, ch in enumerate(chains)}
+        all_aliases: set[str] = set()
+        chain_by_alias: dict[str, Chain] = {}
+        for ch in chains:
+            for k in _all_chain_aliases(ch):
+                if k is not None:
+                    all_aliases.add(k)
+                    chain_by_alias[k] = ch
 
+        def target_chains(term: Term) -> list[Chain]:
+            if term.chains is None:
+                return chains
+            unknown: list[str] = []
+            out: list[Chain] = []
+            seen_ids: set[int] = set()
+            for tok in term.chains:
+                ch = chain_by_alias.get(tok)
+                if ch is None:
+                    unknown.append(tok)
+                    continue
+                cid = id(ch)
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    out.append(ch)
+            if unknown:
+                avail = sorted(all_aliases)
+                raise SelectionError(
+                    f"Unknown chain IDs in spec '{self._raw}': {unknown}. Available: {avail}"
+                )
+            return out or chains
+
+        def residue_ok(res: Residue, atom_sel: Optional[AtomSelector]) -> bool:
+            if atom_sel is None:
+                return True
+            return _residue_matches_groups(res, atom_sel.flags)
+
+        def atom_ok(atom: Atom, atom_sel: Optional[AtomSelector]) -> bool:
+            if atom_sel is None or not atom_sel.has_atom_filters():
+                return True
+
+            name = (atom.name or "").strip().upper()
+            if atom_sel.names is not None and name not in atom_sel.names:
+                return False
+
+            flags = atom_sel.flags
+            if "hydrogens" in flags:
+                if not _is_hydrogen(atom):
+                    return False
+            if "heavy" in flags:
+                if _is_hydrogen(atom):
+                    return False
+            if "carbons" in flags and not _is_element_like(atom, "C"):
+                return False
+            if "nitrogens" in flags and not _is_element_like(atom, "N"):
+                return False
+            if "oxygens" in flags and not _is_element_like(atom, "O"):
+                return False
+            return True
+
+        for grp, has_explicit in zip(self._groups, self._group_has_explicit):
             if has_explicit:
                 pooled: set[int] = set()
-                for ch in model.chains():
-                    resnums = _union_resnums_for_chain(ch, alias_to_resnums)
-                    if not resnums:
-                        continue
+            else:
+                per_chain: dict[int, set[int]] = {}
+
+            for term in grp:
+                for ch in target_chains(term):
                     for r in ch.residues:
-                        if r.resnum in resnums:
-                            for a in r.atoms:
-                                idx = atom_to_idx.get(id(a))
-                                if idx is not None:
-                                    pooled.add(idx)
+                        if not term.residues.contains(r.resnum):
+                            continue
+                        if not residue_ok(r, term.atom_selector):
+                            continue
+                        for a in r.atoms:
+                            if not atom_ok(a, term.atom_selector):
+                                continue
+                            idx = atom_to_idx.get(id(a))
+                            if idx is None:
+                                continue
+                            if has_explicit:
+                                pooled.add(idx)
+                            else:
+                                ci = chain_index[id(ch)]
+                                bucket = per_chain.setdefault(ci, set())
+                                bucket.add(idx)
+
+            if has_explicit:
                 if pooled:
                     out_lists.append(sorted(pooled))
-                continue
-
-            # No explicit chains in this group ⇒ one list per chain with matches
-            for ch in model.chains():
-                resnums = _union_resnums_for_chain(ch, alias_to_resnums)
-                if not resnums:
-                    continue
-                acc: set[int] = set()
-                for r in ch.residues:
-                    if r.resnum in resnums:
-                        for a in r.atoms:
-                            idx = atom_to_idx.get(id(a))
-                            if idx is not None:
-                                acc.add(idx)
-                if acc:
-                    out_lists.append(sorted(acc))
+            else:
+                # Emit one list per chain with matches, in chain order
+                for ci in sorted(per_chain):
+                    lst = per_chain[ci]
+                    if lst:
+                        out_lists.append(sorted(lst))
 
         return out_lists
 
@@ -771,7 +1030,11 @@ class DomainSelector:
         return sorted(merged)
 
     def residue_keys(self, structure: Structure, model_index: int = 0) -> list[tuple[str, int]]:
-        """Union of (chain_key_id, residue_number) across all groups."""
+        """
+        Union of (chain_key_id, residue_number) across all groups.
+
+        Respects residue-group filters ("protein", "water", "ions") when present.
+        """
         model = structure.models[model_index]
         out: set[tuple[str, int]] = set()
         for grp in self._groups:
@@ -790,7 +1053,7 @@ class DomainSelector:
     def _resolve_residues_for_terms(
         self, model: Model, terms: tuple[Term, ...]
     ) -> dict[str, set[int]]:
-        """As _resolve_residues(), but for an explicit term group."""
+        """Original residue resolver, extended with residue-group filters."""
         # Collect alias universe
         all_aliases: set[str] = set()
         chain_by_alias: dict[str, Chain] = {}
@@ -824,13 +1087,23 @@ class DomainSelector:
             for alias in target_aliases:
                 ch = chain_by_alias[alias]
                 bucket = selected.setdefault(alias, set())
+                flags = (
+                    term.atom_selector.flags
+                    if getattr(term, "atom_selector", None) is not None
+                    else frozenset()
+                )
                 if term.residues.all_residues:
                     for r in ch.residues:
+                        if not _residue_matches_groups(r, flags):
+                            continue
                         bucket.add(r.resnum)
                 else:
                     for r in ch.residues:
-                        if term.residues.contains(r.resnum):
-                            bucket.add(r.resnum)
+                        if not term.residues.contains(r.resnum):
+                            continue
+                        if not _residue_matches_groups(r, flags):
+                            continue
+                        bucket.add(r.resnum)
         return selected
 
     @staticmethod
@@ -850,7 +1123,7 @@ class DomainSelector:
             for s in raw_groups:
                 if not isinstance(s, str) or not s.strip():
                     continue
-                groups.append(DomainSelector._parse_terms(s))
+                groups.append(StructureSelector._parse_terms(s))
             return groups
 
         # Iterable of group strings
@@ -858,41 +1131,155 @@ class DomainSelector:
         for s in spec:
             if not isinstance(s, str) or not s.strip():
                 continue
-            groups.append(DomainSelector._parse_terms(s))
+            groups.append(StructureSelector._parse_terms(s))
         return groups
 
     @staticmethod
     def _parse_terms(group_spec: str) -> tuple[Term, ...]:
+        """
+        Parse a group specification into Term objects.
+
+        This expands the original grammar to support optional atom parts while
+        remaining backward compatible for chain/residue-only specs.
+        """
         terms: list[Term] = []
-        # split on commas, whitespace, or '+' (multiple allowed)
-        for raw_term in re.split(r"[,\s+]+", group_spec.strip()):
+        # split on commas or whitespace; '+' is now reserved for atom/residue lists
+        for raw_term in re.split(r"[,\s]+", group_spec.strip()):
             t = raw_term.strip()
             if not t:
                 continue
             if t.lower() == "all":
-                terms.append(Term(chains=None, residues=ResidueSelector(all_residues=True)))
+                terms.append(
+                    Term(
+                        chains=None, residues=ResidueSelector(all_residues=True), atom_selector=None
+                    )
+                )
                 continue
 
-            if "." in t:
-                head, tail = t.split(".", 1)
-                head = head.strip()
-                tail = tail.strip()
-                chains = _parse_chain_list(head) if head else None
-                residues = ResidueSelector.parse(tail)
-                terms.append(Term(chains=chains, residues=residues))
-                continue
-
-            if _looks_like_residue_spec(t):
-                residues = ResidueSelector.parse(t)
-                terms.append(Term(chains=None, residues=residues))
+            parts = t.split(".")
+            if len(parts) == 1:
+                terms.append(StructureSelector._parse_term_single(parts[0]))
+            elif len(parts) == 2:
+                terms.append(StructureSelector._parse_term_two(parts[0], parts[1]))
+            elif len(parts) == 3:
+                terms.append(StructureSelector._parse_term_three(parts[0], parts[1], parts[2]))
             else:
-                chains = _parse_chain_list(t)
-                residues = ResidueSelector(all_residues=True)
-                terms.append(Term(chains=chains, residues=residues))
+                raise SelectionError(f"Too many '.' segments in term '{t}'")
 
         if not terms:
             raise SelectionError(f"Could not parse spec '{group_spec}'")
         return tuple(terms)
+
+    @staticmethod
+    def _parse_term_single(spec: str) -> Term:
+        """Handle a single-fragment term, e.g. 'A:B', '2-10', 'protein'."""
+        s = spec.strip()
+        if not s:
+            raise SelectionError("Empty term")
+
+        if _looks_like_residue_spec(s):
+            residues = ResidueSelector.parse(s)
+            return Term(chains=None, residues=residues, atom_selector=None)
+
+        lower = s.lower()
+        if lower in _RESIDUE_GROUP_KEYWORDS or lower in _ATOM_FLAG_ALIASES:
+            # e.g. 'protein', 'water', 'heavy', 'carbons'
+            atom_sel = _parse_atom_spec(s)
+            return Term(
+                chains=None, residues=ResidueSelector(all_residues=True), atom_selector=atom_sel
+            )
+
+        # Fallback: treat as chain list (original behaviour)
+        chains = _parse_chain_list(s)
+        residues = ResidueSelector(all_residues=True)
+        return Term(chains=chains, residues=residues, atom_selector=None)
+
+    @staticmethod
+    def _parse_term_two(first: str, second: str) -> Term:
+        """Handle two-part terms, e.g. 'A:B.2-10', 'A:B.CA', 'protein.CA', '2-10.CA'."""
+        first = first.strip()
+        second = second.strip()
+        if not first or not second:
+            raise SelectionError(f"Malformed term '{first}.{second}'")
+
+        lower_first = first.lower()
+        # Residue-group keywords in first position: 'protein.CA' or 'protein.2-10'
+        if lower_first in _RESIDUE_GROUP_KEYWORDS:
+            residues: ResidueSelector
+            atom_names: Optional[str]
+
+            if _looks_like_residue_spec(second):
+                residues = ResidueSelector.parse(second)
+                atom_names = None
+            else:
+                residues = ResidueSelector(all_residues=True)
+                atom_names = second
+
+            if atom_names is not None:
+                atom_sel = _parse_atom_spec(atom_names)
+                flags = set(atom_sel.flags)
+            else:
+                atom_sel = AtomSelector(names=None, flags=frozenset())
+                flags = set()
+
+            flags.add(_ATOM_FLAG_ALIASES[lower_first])
+            atom_sel = AtomSelector(
+                names=atom_sel.names,
+                flags=frozenset(flags),
+            )
+            return Term(chains=None, residues=residues, atom_selector=atom_sel)
+
+        # Residue-only then atom: '2-40+50-60.CA'
+        if _looks_like_residue_spec(first):
+            residues = ResidueSelector.parse(first)
+            atom_sel = _parse_atom_spec(second)
+            return Term(chains=None, residues=residues, atom_selector=atom_sel)
+
+        # Otherwise: chains first
+        chains = _parse_chain_list(first)
+
+        # Second fragment decides residue vs atom
+        if _looks_like_residue_spec(second) or second.lower() == "all":
+            residues = ResidueSelector.parse(second)
+            atom_sel = None
+        else:
+            residues = ResidueSelector(all_residues=True)
+            atom_sel = _parse_atom_spec(second)
+
+        return Term(chains=chains, residues=residues, atom_selector=atom_sel)
+
+    @staticmethod
+    def _parse_term_three(first: str, second: str, third: str) -> Term:
+        """Handle three-part terms, typically 'chains.residues.atoms'."""
+        first = first.strip()
+        second = second.strip()
+        third = third.strip()
+        if not first or not second or not third:
+            raise SelectionError(f"Malformed term '{first}.{second}.{third}'")
+
+        lower_first = first.lower()
+        if lower_first in _RESIDUE_GROUP_KEYWORDS:
+            # e.g. 'protein.2-90.CA'
+            residues = (
+                ResidueSelector.parse(second)
+                if _looks_like_residue_spec(second)
+                else ResidueSelector(all_residues=True)
+            )
+            atom_sel = _parse_atom_spec(third)
+            flags = set(atom_sel.flags)
+            flags.add(_ATOM_FLAG_ALIASES[lower_first])
+            atom_sel = AtomSelector(names=atom_sel.names, flags=frozenset(flags))
+            return Term(chains=None, residues=residues, atom_selector=atom_sel)
+
+        # Default: 'chains.residues.atoms'
+        chains = _parse_chain_list(first)
+        residues = (
+            ResidueSelector.parse(second)
+            if _looks_like_residue_spec(second)
+            else ResidueSelector(all_residues=True)
+        )
+        atom_sel = _parse_atom_spec(third)
+        return Term(chains=chains, residues=residues, atom_selector=atom_sel)
 
 
 # ----------------------------- helpers ---------------------------------------
@@ -908,7 +1295,7 @@ def _all_chain_aliases(ch: Chain) -> tuple[str, ...]:
         out.append(str(getattr(ch, "chain_id")))
     # De-duplicate while preserving order
     seen = set()
-    uniq = []
+    uniq: list[str] = []
     for k in out:
         if k not in seen:
             uniq.append(k)
@@ -924,6 +1311,7 @@ def _union_resnums_for_chain(ch: Chain, alias_to_resnums: dict[str, set[int]]) -
     return resnums
 
 
+# ---- summarize topology ---------------------------------------------------------
 def summarize_topology(
     topology: Topology,
     max_residues_per_chain: int = 5,
