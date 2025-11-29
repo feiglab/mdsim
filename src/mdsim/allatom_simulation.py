@@ -50,35 +50,6 @@ from openmm.unit import (
 from .__version__ import __version__
 from .molecule_data import Model, PDBReader, Structure
 
-# --- Data containers ---------------------------------------------------------
-
-aminoacids = [
-    "ALA",
-    "ARG",
-    "ASN",
-    "ASP",
-    "CYS",
-    "GLN",
-    "GLU",
-    "GLY",
-    "HIS",
-    "HSD",
-    "HSE",
-    "ILE",
-    "LEU",
-    "LYS",
-    "MET",
-    "PHE",
-    "PRO",
-    "SER",
-    "THR",
-    "TRP",
-    "TYR",
-    "VAL",
-]
-
-nucleicacids = ["ADE", "CYT", "GUA", "URA", "THY"]
-
 # --- Main class for COCOMO system --------------------------------------------
 
 
@@ -143,7 +114,7 @@ class MDSim:
         self.cutoff = cutoff * nanometer
         self.set_nonbonded(nonbonded)
         self.set_switching(switching)
-        self.ewaldtol = 1e-05
+        self.ewaldtol = 5e-04
         self.dispcorr = dispcorr
 
         self.rigidwater = rigidwater
