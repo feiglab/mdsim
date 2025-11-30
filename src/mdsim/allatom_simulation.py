@@ -46,6 +46,7 @@ from openmm.unit import (
     mole,
     nanometer,
     picoseconds,
+    radian,
 )
 
 from .__version__ import __version__
@@ -596,10 +597,285 @@ class MDSim:
             force.addGroup(groupa)
             force.addGroup(groupb)
             force.addBond([0, 1], [target * nanometer])
-            if self.box_vectors:
-                force.setUsesPeriodicBoundaryConditions(True)
             force.setName(f"Umbrella_{direction}")
             self.system.addForce(force)
+
+    def update_umbrella_xyz_distance(self, direction="x", k=10.0):
+        if self.system and self.simulation:
+            self.simulation.context.setParameter(
+                f"uk_{direction}", k * kilojoule / mole / nanometer**2
+            )
+
+    def set_umbrella_distance(self, groupa, groupb, *, target=0.0, k=10.0, periodic=False):
+        if self.system:
+            bias = "0.5 * uk_dist * ((distance(g1,g2) - target)^2)"
+            force = CustomCentroidBondForce(2, bias)
+            force.addPerBondParameter("target")  # target distance (nm)
+            force.addGlobalParameter("uk_dist", k * kilojoule / mole / nanometer**2)
+            force.addGroup(groupa)
+            force.addGroup(groupb)
+            force.addBond([0, 1], [target * nanometer])
+            if self.box_vectors and periodic:
+                force.setUsesPeriodicBoundaryConditions(True)
+            force.setName("Umbrella_distance")
+            self.system.addForce(force)
+
+    def update_umbrella_distance(self, k=10.0):
+        if self.system and self.simulation:
+            self.simulation.context.setParameter("uk_dist", k * kilojoule / mole / nanometer**2)
+
+    def _compute_com(self, group, positions_nm):
+        """Compute mass-weighted COM of `group` using positions in nm."""
+        masses = []
+        coords = []
+        for idx in group:
+            m = self.system.getParticleMass(idx)
+            masses.append(m._value)
+            p = positions_nm[idx]
+            if hasattr(p, "x"):
+                coords.append([p.x, p.y, p.z])
+            else:
+                coords.append([p[0], p[1], p[2]])
+        masses = np.asarray(masses, dtype=float)
+        coords = np.asarray(coords, dtype=float)
+        m_tot = masses.sum()
+        if m_tot == 0.0:
+            raise ValueError("Total mass of group is zero; cannot compute COM.")
+        com = (masses[:, None] * coords).sum(axis=0) / m_tot
+        return com  # (x, y, z) in nm
+
+    def set_umbrella_com(
+        self,
+        group,
+        *,
+        k=10.0,
+        target=None,  # tuple/list (x,y,z) in nm or Quantity
+        periodic=False,
+    ):
+        """
+        Restrain the COM of `group` to a fixed point.
+
+        If `target` is None, the target is taken as the current COM of the group.
+        Otherwise, COM is restrained to the given (x,y,z) in nm.
+        """
+        if self.system is None:
+            raise RuntimeError("System has not been created yet.")
+
+        if not group:
+            return
+
+        # Get reference positions to define COM if needed
+        if target is None:
+            # Determine positions to use
+            if self.positions is not None:
+                pos = self.positions
+            elif self.simulation is not None:
+                pos = self.simulation.context.getState(getPositions=True).getPositions()
+            else:
+                raise RuntimeError("No positions available to define COM restraint reference.")
+
+            # Convert to nm if Quantity
+            if hasattr(pos, "value_in_unit"):
+                pos_nm = pos.value_in_unit(nanometer)
+            else:
+                pos_nm = pos  # assume already in nm
+
+            x0, y0, z0 = self._compute_com(group, pos_nm)
+        else:
+            # Use user-supplied target
+            if hasattr(target, "value_in_unit"):
+                xyz_nm = target.value_in_unit(nanometer)
+                x0, y0, z0 = xyz_nm[0], xyz_nm[1], xyz_nm[2]
+            else:
+                x0, y0, z0 = float(target[0]), float(target[1]), float(target[2])
+
+        # Harmonic restraint on distance between COM and (x0,y0,z0)
+        bias = "0.5 * uk_com * ((x1-x0)^2 +(y1-y0)^2 +(z1-z0)^2)"
+        force = CustomCentroidBondForce(1, bias)
+        force.addGlobalParameter("uk_com", k * kilojoule / (mole * nanometer**2))
+        force.addPerBondParameter("x0")
+        force.addPerBondParameter("y0")
+        force.addPerBondParameter("z0")
+
+        force.addGroup(group)
+
+        # Single "bond" between COM (group) and fixed point
+        force.addBond([0], [x0, y0, z0])
+
+        # Using PBC-aware distance if PBC is enabled
+        if self.box_vectors and periodic:
+            force.setUsesPeriodicBoundaryConditions(True)
+
+        force.setName("Umbrella_COM")
+        self.system.addForce(force)
+
+    def update_umbrella_com(self, k=10.0):
+        if self.system and self.simulation:
+            self.simulation.context.setParameter("uk_com", k * kilojoule / (mole * nanometer**2))
+
+    def set_umbrella_angle_norm(
+        self,
+        groupa,
+        groupa1,
+        groupa2,
+        groupb,
+        groupb1,
+        groupb2,
+        *,
+        target=np.radians(0),
+        k=10.0,
+    ):
+        """
+        Harmonic umbrella on the angle between two plane normals (groups A and B).
+
+        Angle is in radians; target is in radians; k is in kJ/mol/rad^2.
+        """
+        if self.system:
+            bias = (
+                # harmonic in (angle - target)
+                "0.5 * uk_angle_norm * (acos(cosang) - target)^2;"
+                # numerically safe cosine between normals: clamp to [-1, 1]
+                "cosang = min(1.0, max(-1.0, dotAB/(magA*magB)));"
+                "dotAB = nxA_tmp*nxB_tmp + nyA_tmp*nyB_tmp + nzA_tmp*nzB_tmp;"
+                "magA = sqrt(nxA_tmp^2 + nyA_tmp^2 + nzA_tmp^2);"
+                "magB = sqrt(nxB_tmp^2 + nyB_tmp^2 + nzB_tmp^2);"
+                # cross products nA = vA1 × vA2, nB = vB1 × vB2
+                "nxA_tmp = vA1y*vA2z - vA1z*vA2y;"
+                "nyA_tmp = vA1z*vA2x - vA1x*vA2z;"
+                "nzA_tmp = vA1x*vA2y - vA1y*vA2x;"
+                "nxB_tmp = vB1y*vB2z - vB1z*vB2y;"
+                "nyB_tmp = vB1z*vB2x - vB1x*vB2z;"
+                "nzB_tmp = vB1x*vB2y - vB1y*vB2x;"
+                # plane A vectors (groups 1,2,3)
+                "vA1x = x2 - x1;"
+                "vA1y = y2 - y1;"
+                "vA1z = z2 - z1;"
+                "vA2x = x3 - x1;"
+                "vA2y = y3 - y1;"
+                "vA2z = z3 - z1;"
+                # plane B vectors (groups 4,5,6)
+                "vB1x = x5 - x4;"
+                "vB1y = y5 - y4;"
+                "vB1z = z5 - z4;"
+                "vB2x = x6 - x4;"
+                "vB2y = y6 - y4;"
+                "vB2z = z6 - z4;"
+            )
+
+            force = CustomCentroidBondForce(6, bias)
+            force.addPerBondParameter("target")  # radians
+            force.addGlobalParameter("uk_angle_norm", k * kilojoule / (mole * radian**2))
+
+            # group order: (A0, A1, A2, B0, B1, B2)
+            force.addGroup(groupa)
+            force.addGroup(groupa1)
+            force.addGroup(groupa2)
+            force.addGroup(groupb)
+            force.addGroup(groupb1)
+            force.addGroup(groupb2)
+
+            force.addBond([0, 1, 2, 3, 4, 5], [target * radian])
+
+            force.setName("Umbrella_angle_norm")
+            self.system.addForce(force)
+
+    def update_umbrella_angle_norm(self, k=10.0):
+        if self.system and self.simulation:
+            self.simulation.context.setParameter("uk_angle_norm", k * kilojoule / mole / radian**2)
+
+    def set_umbrella_dihedral_twist(
+        self,
+        groupa,
+        groupa1,
+        groupb,
+        groupb1,
+        target=0.0,
+        k=10.0,
+    ):
+        """
+        Harmonic umbrella on the dihedral angle between four centroids.
+
+        The minimum is at the dihedral = target (in radians), using a 2π-periodic
+        quadratic distance: we choose the smallest of (Δ, Δ+2π, Δ-2π).
+
+        Parameters
+        ----------
+        groupa, groupa1, groupb, groupb1 : sequence[int]
+            Atom indices for the four centroid groups.
+        target : float
+            Target dihedral angle in radians.
+        k : float
+            Force constant in kJ/mol/rad^2.
+        """
+        if not self.system:
+            return
+
+        bias = (
+            # periodic quadratic in the dihedral difference
+            "0.5 * uk_twist * "
+            "min((d - target)^2, min((d - target + 2*pi)^2, (d - target - 2*pi)^2));"
+            "pi=acos(-1);"
+            # d is the dihedral in radians
+            "d = dihedral(g1, g2, g3, g4)"
+        )
+
+        force = CustomCentroidBondForce(4, bias)
+        force.addPerBondParameter("target")  # radians
+        force.addGlobalParameter("uk_twist", k * kilojoule / (mole * radian**2))
+
+        # Order: (g1, g2, g3, g4)
+        force.addGroup(groupa)
+        force.addGroup(groupa1)
+        force.addGroup(groupb)
+        force.addGroup(groupb1)
+
+        force.addBond([1, 0, 2, 3], [target * radian])
+
+        force.setName("Umbrella_twist")
+        self.system.addForce(force)
+
+    def update_umbrella_dihedral_twist(self, k=10.0):
+        if self.system and self.simulation:
+            self.simulation.context.setParameter("uk_twist", k * kilojoule / mole / radian**2)
+
+    def set_umbrella_angle_rot(
+        self,
+        groupa,
+        groupb,
+        groupc,
+        target=np.pi / 2.0,
+        k=10.0,
+    ):
+        """
+        Harmonic umbrellas on an angle defined by centroid triplets.
+
+        Angle is in radians; restrained to `target`.
+
+        The angle is:
+          - angle(groupa,  groupb,  groupc)
+        """
+        if not self.system:
+            return
+
+        bias = "0.5 * uk_angle_rot * (angle(g1, g2, g3) - target)^2"
+
+        force = CustomCentroidBondForce(3, bias)
+        force.addPerBondParameter("target")  # radians
+        force.addGlobalParameter("uk_angle_rot", k * kilojoule / (mole * radian**2))
+
+        # group indices: 0=groupa, 1=groupb, 2=groupc
+        force.addGroup(groupa)
+        force.addGroup(groupb)
+        force.addGroup(groupc)
+
+        force.addBond([0, 1, 2], [target * radian])
+
+        force.setName("Umbrella_angle_rot")
+        self.system.addForce(force)
+
+    def update_umbrella_angle_rot(self, k=10.0):
+        if self.system and self.simulation:
+            self.simulation.context.setParameter("uk_angle_rot", k * kilojoule / mole / radian**2)
 
     def set_force_groups(self):
         if self.system:

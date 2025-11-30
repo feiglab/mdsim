@@ -231,6 +231,148 @@ class Model:
         dist_ang = (dx * dx + dy * dy + dz * dz) ** 0.5
         return unit.Quantity(dist_ang, unit.angstrom).in_units_of(unit.nanometer)
 
+    # ---- geometry helpers for umbrella-style angles/dihedrals ----
+
+    def _group_cog(self, group: Union[list[int], list[list[int]]]) -> np.ndarray:
+        """
+        Center-of-geometry (Å) for a group of atoms, returned as a 3D numpy vector.
+        """
+        flat = self._flatten_indices(group)
+        if not flat:
+            raise ValueError("group must contain at least one atom index")
+
+        n_atoms = self.natoms()
+        for idx in flat:
+            if idx < 0 or idx >= n_atoms:
+                raise IndexError(f"Atom index {idx} is out of range for model with {n_atoms} atoms")
+
+        cx, cy, cz = self._center_of_geometry(flat)
+        return np.array([cx, cy, cz], dtype=float)
+
+    @staticmethod
+    def _angle_between(u: np.ndarray, v: np.ndarray) -> float:
+        """
+        Angle between vectors u and v in radians.
+        """
+        nu = np.linalg.norm(u)
+        nv = np.linalg.norm(v)
+        if nu == 0.0 or nv == 0.0:
+            raise ValueError("Cannot compute angle with zero-length vector")
+        cosang = float(np.dot(u, v) / (nu * nv))
+        # numerical safety
+        cosang = max(-1.0, min(1.0, cosang))
+        return float(np.arccos(cosang))
+
+    @staticmethod
+    def _dihedral_angle(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> float:
+        """
+        Signed dihedral angle (−π..π) defined by four points, matching OpenMM's dihedral().
+        """
+        b1 = p2 - p1
+        b2 = p3 - p2
+        b3 = p4 - p3
+
+        # normals
+        n1 = np.cross(b1, b2)
+        n2 = np.cross(b2, b3)
+        n1_norm = np.linalg.norm(n1)
+        n2_norm = np.linalg.norm(n2)
+        if n1_norm == 0.0 or n2_norm == 0.0:
+            raise ValueError("Cannot compute dihedral with collinear points")
+
+        n1 /= n1_norm
+        n2 /= n2_norm
+        b2_unit = b2 / np.linalg.norm(b2)
+
+        m1 = np.cross(n1, b2_unit)
+
+        x = np.dot(n1, n2)
+        y = np.dot(m1, n2)
+        return float(np.arctan2(y, x))
+
+    def angle_norm(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_a1: Union[list[int], list[list[int]]],
+        group_a2: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+        group_b1: Union[list[int], list[list[int]]],
+        group_b2: Union[list[int], list[list[int]]],
+    ) -> unit.Quantity:
+        """
+        Angle (radians) between two plane normals, matching set_umbrella_angle_norm.
+
+        Plane A: defined by centroids of (group_a, group_a1, group_a2)
+        Plane B: defined by centroids of (group_b, group_b1, group_b2)
+        """
+        A0 = self._group_cog(group_a)
+        A1 = self._group_cog(group_a1)
+        A2 = self._group_cog(group_a2)
+        B0 = self._group_cog(group_b)
+        B1 = self._group_cog(group_b1)
+        B2 = self._group_cog(group_b2)
+
+        vA1 = A1 - A0
+        vA2 = A2 - A0
+        vB1 = B1 - B0
+        vB2 = B2 - B0
+
+        nA = np.cross(vA1, vA2)
+        nB = np.cross(vB1, vB2)
+
+        nu = np.linalg.norm(nA)
+        nv = np.linalg.norm(nB)
+        if nu == 0.0 or nv == 0.0:
+            raise ValueError("Cannot compute plane-normal angle for degenerate plane")
+
+        cosang = float(np.dot(nA, nB) / (nu * nv))
+        cosang = max(-1.0, min(1.0, cosang))
+        angle = float(np.arccos(cosang))
+
+        return unit.Quantity(angle, unit.radian)
+
+    def dihedral_twist(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_a1: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+        group_b1: Union[list[int], list[list[int]]],
+    ) -> unit.Quantity:
+        """
+        Dihedral angle (radians, −π..π) between four centroids,
+        matching set_umbrella_dihedral_twist geometry.
+        """
+        p1 = self._group_cog(group_a)
+        p2 = self._group_cog(group_a1)
+        p3 = self._group_cog(group_b)
+        p4 = self._group_cog(group_b1)
+
+        angle = self._dihedral_angle(p2, p1, p3, p4)
+        return unit.Quantity(angle, unit.radian)
+
+    def angle_rot(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+        group_c: Union[list[int], list[list[int]]],
+    ) -> tuple[unit.Quantity, unit.Quantity]:
+        """
+        Angle (radians) corresponding to the angle() terms used in
+        set_umbrella_angle_rot.
+
+        Returns
+        -------
+          theta = angle(group_a,  group_b,  group_c)
+        """
+        A = self._group_cog(group_a)
+        B = self._group_cog(group_b)
+        C = self._group_cog(group_c)
+
+        # angle(g1,g2,g3) = angle between (g1 - g2) and (g3 - g2)
+        theta = self._angle_between(A - B, C - B)
+
+        return unit.Quantity(theta, unit.radian)
+
     def select_byindex(self, indices: Union[list[int], list[list[int]]]) -> Model:
         """
         Return a new Model containing only atoms at the given 0-based indices
@@ -434,6 +576,72 @@ class Structure:
         for m in self.models:
             distances.append(m.distance(group_a, group_b))
         return distances
+
+    def angle_norm(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_a1: Union[list[int], list[list[int]]],
+        group_a2: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+        group_b1: Union[list[int], list[list[int]]],
+        group_b2: Union[list[int], list[list[int]]],
+    ) -> list[unit.Quantity]:
+        """
+        Plane-normal angle (radians) between two planes for all models.
+
+        Geometry matches the umbrella in set_umbrella_angle_norm.
+        """
+        if not self.models:
+            return []
+        out: list[unit.Quantity] = []
+        for m in self.models:
+            out.append(
+                m.angle_norm(
+                    group_a,
+                    group_a1,
+                    group_a2,
+                    group_b,
+                    group_b1,
+                    group_b2,
+                )
+            )
+        return out
+
+    def dihedral_twist(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_a1: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+        group_b1: Union[list[int], list[list[int]]],
+    ) -> list[unit.Quantity]:
+        """
+        Dihedral angle (radians, −π..π) between four centroids for all models.
+
+        Geometry matches the umbrella in set_umbrella_dihedral_twist.
+        """
+        if not self.models:
+            return []
+        out: list[unit.Quantity] = []
+        for m in self.models:
+            out.append(m.dihedral_twist(group_a, group_a1, group_b, group_b1))
+        return out
+
+    def angle_rot(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+        group_c: Union[list[int], list[list[int]]],
+    ) -> list[tuple[unit.Quantity, unit.Quantity]]:
+        """
+        Rotation angles (radians) per model, matching set_umbrella_angle_rot.
+
+        """
+        if not self.models:
+            return []
+        out: list[tuple[unit.Quantity, unit.Quantity]] = []
+        for m in self.models:
+            out.append(m.angle_rot(group_a, group_b, group_c))
+        return out
 
 
 # --- Parser ------------------------------------------------------------------
