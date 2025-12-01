@@ -6,13 +6,14 @@ from .molecule_data import (
     SelectionError,
     Structure,
     StructureSelector,
+    load_dcd,
     summarize_topology,
 )
 
 __all__ = [
     "__version__",
+    "load_dcd",
     "MDSim",
-    "DomainSelector",
     "Model",
     "PDBReader",
     "SelectionError",

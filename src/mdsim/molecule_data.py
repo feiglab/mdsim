@@ -65,6 +65,10 @@ class Model:
     residues: list[Residue] = field(default_factory=list)
     atoms: list[Atom] = field(default_factory=list)
 
+    # Optional parent trajectory/structure and frame index
+    _parent: Optional[Structure] = field(default=None, repr=False, compare=False)
+    _frame_index: int = field(default=0, repr=False, compare=False)
+
     def chains(self) -> Iterator[Chain]:
         return iter(self.chain.values())
 
@@ -96,12 +100,17 @@ class Model:
 
     def positions(self):
         """
-        Return positions as an OpenMM Quantity[list[Vec3]] in nanometers.
-        Assumes internal coordinates are in Angstroms (PDB convention).
+        Return positions as an OpenMM Quantity[list[Vec3]].
+        - Static models: internal coordinates are in Å, converted to nm.
+        - Trajectory-backed models: parent._coords_nm already in nm.
         """
-        # Build Vec3 list from parsed coordinates (Å)
+        if self._has_parent_coords():
+            coords_nm = self._parent._coords_nm[self._frame_index]  # (natoms, 3)
+            vecs = [Vec3(float(x), float(y), float(z)) for x, y, z in coords_nm]
+            return unit.Quantity(vecs, unit.nanometer)
+
+        # Static: use Atom coordinates in Å, convert to nm
         vecs = [Vec3(a.x, a.y, a.z) for a in self.atoms]
-        # Attach Å units, then convert to nm to match PDBFile default
         return unit.Quantity(vecs, unit.angstrom).in_units_of(unit.nanometer)
 
     def topology(self):
@@ -128,6 +137,11 @@ class Model:
         if not keep or not self.atoms:
             return m2
 
+        use_parent = self._has_parent_coords()
+        parent_frame_coords = None
+        if use_parent:
+            parent_frame_coords = self._parent._coords_nm[self._frame_index]  # (natoms, 3)
+
         running_idx = -1
         for key, ch in self.chain.items():
             new_chain = Chain(
@@ -140,8 +154,25 @@ class Model:
                 for a in r.atoms:
                     running_idx += 1
                     if running_idx in keep:
-                        kept_atoms.append(a)
-                        m2.atoms.append(a)
+                        if use_parent:
+                            x_nm, y_nm, z_nm = parent_frame_coords[running_idx]
+                            new_atom = Atom(
+                                serial=a.serial,
+                                name=a.name,
+                                element=a.element,
+                                resname=a.resname,
+                                chain=a.chain,
+                                resnum=a.resnum,
+                                x=float(x_nm * 10.0),  # back to Å for the static model
+                                y=float(y_nm * 10.0),
+                                z=float(z_nm * 10.0),
+                                seg=a.seg,
+                            )
+                        else:
+                            # static structure: reuse atom object
+                            new_atom = a
+                        kept_atoms.append(new_atom)
+                        m2.atoms.append(new_atom)
                 if kept_atoms:
                     new_res = Residue(
                         resname=r.resname,
@@ -152,8 +183,10 @@ class Model:
                     )
                     new_chain.residues.append(new_res)
                     m2.residues.append(new_res)
+
             if new_chain.residues:
                 m2.chain[key] = new_chain
+
         return m2
 
     @staticmethod
@@ -167,19 +200,47 @@ class Model:
             return out
         return [int(i) for i in indices]  # type: ignore[return-value]
 
+    # --- internal coordinate helpers for trajectory-backed models ---
+
+    def _has_parent_coords(self) -> bool:
+        """Return True if this model is backed by parent Structure coordinates."""
+        p = self._parent
+        return p is not None and getattr(p, "_coords_nm", None) is not None
+
+    def _coord_angstrom(self, idx: int) -> tuple[float, float, float]:
+        """
+        Return atom coordinates (Å) for atom index `idx` in this model.
+
+        If the model is trajectory-backed, pull from parent._coords_nm[frame].
+        Otherwise, use Atom.x/y/z as before.
+        """
+        if self._has_parent_coords():
+            coords_nm = self._parent._coords_nm  # shape (n_frames, n_atoms, 3)
+            x_nm, y_nm, z_nm = coords_nm[self._frame_index, idx, :]
+            # nm -> Å
+            return float(x_nm * 10.0), float(y_nm * 10.0), float(z_nm * 10.0)
+        else:
+            a = self.atoms[idx]
+            return float(a.x), float(a.y), float(a.z)
+
     def _center_of_geometry(self, indices: list[int]) -> tuple[float, float, float]:
         """
         Internal: center of geometry (Å) for a set of atom indices in this model.
+        Works both for static and trajectory-backed models.
         """
         if not indices:
             raise ValueError("center of geometry requires at least one atom index")
 
         sx = sy = sz = 0.0
         for idx in indices:
-            a = self.atoms[idx]
-            sx += a.x
-            sy += a.y
-            sz += a.z
+            if idx < 0 or idx >= self.natoms():
+                raise IndexError(
+                    f"Atom index {idx} is out of range for model with {self.natoms()} atoms"
+                )
+            x_ang, y_ang, z_ang = self._coord_angstrom(idx)
+            sx += x_ang
+            sy += y_ang
+            sz += z_ang
 
         inv_n = 1.0 / float(len(indices))
         return sx * inv_n, sy * inv_n, sz * inv_n
@@ -414,9 +475,15 @@ class Model:
 
     def mdtraj_trajectory(self):
         top = md.Topology.from_openmm(self.topology())
-        coords_nm = [(a.x / 10.0, a.y / 10.0, a.z / 10.0) for a in self.atoms]  # Å -> nm
 
-        if not coords_nm:
+        if self._has_parent_coords():
+            # one-frame view from parent coords, already in nm
+            coords_nm = self._parent._coords_nm[self._frame_index]  # (natoms, 3)
+        else:
+            # static model: use Atom coords (Å -> nm)
+            coords_nm = [(a.x / 10.0, a.y / 10.0, a.z / 10.0) for a in self.atoms]
+
+        if len(coords_nm) == 0:
             traj = md.Trajectory(xyz=np.zeros((1, 0, 3), dtype=float), topology=top)
             return traj
 
@@ -461,6 +528,9 @@ class Model:
 @dataclass
 class Structure:
     models: list[Model] = field(default_factory=list)
+
+    # Optional trajectory coordinates (nm), shape (n_models, n_atoms, 3)
+    _coords_nm: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
 
     def __getitem__(self, idx: Union[int, slice]) -> Union[Model, list[Model]]:
         return self.models[idx]
@@ -646,6 +716,30 @@ class Structure:
 
 
 # --- Parser ------------------------------------------------------------------
+
+
+def _ensure_template_model(
+    template: Union[Structure, Model, FileLike],
+) -> tuple[Structure, Model]:
+    """
+    Normalize a template specification into (Structure, Model).
+
+    template can be:
+      - Model       -> wrapped into a single-model Structure
+      - Structure   -> returns (template, template.model)
+      - str/Path    -> treated as PDB-like coordinate file, read via PDBReader
+    """
+    if isinstance(template, Model):
+        s = Structure(models=[template])
+        return s, template
+
+    if isinstance(template, Structure):
+        return template, template.model
+
+    # Assume it's a PDB-like file path or file-like
+    reader = PDBReader()
+    s = reader.read(template)  # type: ignore[arg-type]
+    return s, s.model
 
 
 class PDBReader:
@@ -1613,6 +1707,145 @@ def _union_resnums_for_chain(ch: Chain, alias_to_resnums: dict[str, set[int]]) -
     for alias in _all_chain_aliases(ch):
         resnums |= alias_to_resnums.get(alias, set())
     return resnums
+
+
+def _clone_model_with_coords(
+    template_model: Model,
+    coords_nm: np.ndarray,
+    model_id: int,
+) -> Model:
+    """
+    Clone `template_model` but replace coordinates with `coords_nm` (nm).
+
+    coords_nm: shape (natoms, 3), units nm, same atom order as template_model.atoms.
+    """
+    if coords_nm.shape != (template_model.natoms(), 3):
+        raise ValueError(
+            f"Coordinate array shape {coords_nm.shape} does not match "
+            f"template natoms={template_model.natoms()}"
+        )
+
+    new_model = Model(model_id=model_id)
+    natoms = template_model.natoms()
+    # index into coords_ang; must follow the same flattened atom order
+    idx = 0
+
+    for key, ch in template_model.chain.items():
+        new_chain = Chain(
+            key_id=ch.key_id,
+            seg_id=getattr(ch, "seg_id", None),
+            chain_id=getattr(ch, "chain_id", None),
+        )
+
+        for r in ch.residues:
+            new_res_atoms: list[Atom] = []
+            for old_atom in r.atoms:
+                if idx >= natoms:
+                    raise RuntimeError("Internal consistency error while cloning model coordinates")
+                x_nm, y_nm, z_nm = coords_nm[idx]
+                x_ang = float(x_nm * 10.0)
+                y_ang = float(y_nm * 10.0)
+                z_ang = float(z_nm * 10.0)
+
+                new_atom = Atom(
+                    serial=old_atom.serial,
+                    name=old_atom.name,
+                    element=old_atom.element,
+                    resname=old_atom.resname,
+                    chain=old_atom.chain,
+                    resnum=old_atom.resnum,
+                    x=x_ang,
+                    y=y_ang,
+                    z=z_ang,
+                    seg=old_atom.seg,
+                )
+                new_res_atoms.append(new_atom)
+                new_model.atoms.append(new_atom)
+                idx += 1
+
+            new_res = Residue(
+                resname=r.resname,
+                chain=r.chain,
+                resnum=r.resnum,
+                seg=r.seg,
+                atoms=new_res_atoms,
+            )
+            new_chain.residues.append(new_res)
+            new_model.residues.append(new_res)
+
+        new_model.chain[key] = new_chain
+
+    if idx != natoms:
+        raise RuntimeError(
+            f"Cloned coordinates for {idx} atoms, expected {natoms} from template model"
+        )
+    return new_model
+
+
+def load_dcd(
+    dcd_file: FileLike,
+    template: Union[Structure, Model, FileLike],
+) -> Structure:
+    """
+    Load a CHARMM DCD trajectory and represent it as a Structure with:
+
+      - One shared topology (chains/residues/atoms) from the template Model.
+      - Per-frame coordinates stored once as Structure._coords_nm (nm).
+      - models[i] is a lightweight Model view of frame i using that topology.
+
+    Parameters
+    ----------
+    dcd_file
+        Path (str/Path) to the DCD file, or file-like object MDTraj can read.
+    template
+        Reference topology for the trajectory:
+          - Structure: first model is used as template.
+          - Model    : used directly as template.
+          - str/Path : treated as a PDB-like file to be read via PDBReader.
+
+        The atom ordering in `template` must match the DCD topology.
+
+    Returns
+    -------
+    Structure
+        A Structure where each frame is a Model view; topology is only stored once.
+    """
+    struct_ref, tmpl_model = _ensure_template_model(template)
+
+    # Build MDTraj topology from the template OpenMM topology
+    top = md.Topology.from_openmm(tmpl_model.topology())
+
+    # MDTraj does DCD I/O, returns xyz in nm
+    traj = md.load_dcd(dcd_file, top=top)  # xyz: (n_frames, n_atoms, 3), nm
+
+    if traj.n_atoms != tmpl_model.natoms():
+        raise ValueError(
+            f"DCD has {traj.n_atoms} atoms but template has {tmpl_model.natoms()} atoms"
+        )
+
+    coords_nm = np.asarray(traj.xyz, dtype=float)  # (n_frames, n_atoms, 3)
+
+    s = Structure()
+    s._coords_nm = coords_nm
+
+    # Share topology across all models; no per-frame copies of chains/residues/atoms
+    base_chain = tmpl_model.chain
+    base_residues = tmpl_model.residues
+    base_atoms = tmpl_model.atoms
+
+    n_frames = coords_nm.shape[0]
+    for i in range(n_frames):
+        m = Model(
+            model_id=i + 1,
+            chain=base_chain,
+            residues=base_residues,
+            atoms=base_atoms,
+        )
+        m._parent = s
+        m._frame_index = i
+        s.models.append(m)
+
+    return s
 
 
 # ---- summarize topology ---------------------------------------------------------
