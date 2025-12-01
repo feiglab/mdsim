@@ -70,14 +70,12 @@ class Model:
 
     def iter_residues(self) -> Iterator[Residue]:
         for c in self.chain.values():
-            for r in c.residues:
-                yield from c.residues
+            yield from c.residues
 
     def iter_atoms(self) -> Iterator[Atom]:
         for c in self.chain.values():
             for r in c.residues:
-                for a in r.atoms:
-                    yield from r.atoms
+                yield from r.atoms
 
     def __repr__(self) -> str:
         n_chains = self.nchains()
@@ -115,7 +113,10 @@ class Model:
                 res = top.addResidue(rname, chain)
                 for a in r.atoms:
                     sym = (getattr(a, "element", "") or "").upper()
-                    el = element.Element.getBySymbol(sym) or element.carbon
+                    try:
+                        el = element.Element.getBySymbol(sym)
+                    except Exception:
+                        el = element.carbon
                     top.addAtom(a.name, element=el, residue=res)
         return top
 
@@ -288,7 +289,7 @@ class Model:
 
         x = np.dot(n1, n2)
         y = np.dot(m1, n2)
-        return float(np.arctan2(y, x))
+        return float(-np.arctan2(y, x))
 
     def angle_norm(
         self,
@@ -331,34 +332,34 @@ class Model:
 
         return unit.Quantity(angle, unit.radian)
 
-    def dihedral_twist(
-        self,
-        group_a: Union[list[int], list[list[int]]],
-        group_a1: Union[list[int], list[list[int]]],
-        group_b: Union[list[int], list[list[int]]],
-        group_b1: Union[list[int], list[list[int]]],
-    ) -> unit.Quantity:
-        """
-        Dihedral angle (radians, −π..π) between four centroids,
-        matching set_umbrella_dihedral_twist geometry.
-        """
-        p1 = self._group_cog(group_a)
-        p2 = self._group_cog(group_a1)
-        p3 = self._group_cog(group_b)
-        p4 = self._group_cog(group_b1)
-
-        angle = self._dihedral_angle(p2, p1, p3, p4)
-        return unit.Quantity(angle, unit.radian)
-
-    def angle_rot(
+    def dihedral(
         self,
         group_a: Union[list[int], list[list[int]]],
         group_b: Union[list[int], list[list[int]]],
         group_c: Union[list[int], list[list[int]]],
-    ) -> tuple[unit.Quantity, unit.Quantity]:
+        group_d: Union[list[int], list[list[int]]],
+    ) -> unit.Quantity:
+        """
+        Dihedral angle (radians, −π..π) between four centroids,
+        matching set_umbrella_dihedral geometry.
+        """
+        p1 = self._group_cog(group_a)
+        p2 = self._group_cog(group_b)
+        p3 = self._group_cog(group_c)
+        p4 = self._group_cog(group_d)
+
+        angle = self._dihedral_angle(p1, p2, p3, p4)
+        return unit.Quantity(angle, unit.radian)
+
+    def angle(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+        group_c: Union[list[int], list[list[int]]],
+    ) -> unit.Quantity:
         """
         Angle (radians) corresponding to the angle() terms used in
-        set_umbrella_angle_rot.
+        set_umbrella_angle.
 
         Returns
         -------
@@ -444,7 +445,7 @@ class Model:
 
         traj = self.mdtraj_trajectory()
         if traj.n_atoms == 0:
-            return {}
+            return []
 
         # MDTraj expects nm for radii; returns nm^2
         sasa_nm2 = md.shrake_rupley(
@@ -454,7 +455,7 @@ class Model:
         )  # shape (1, n_residues)
         per_res_nm2 = sasa_nm2[0]
 
-        return per_res_nm2
+        return per_res_nm2.tolist()
 
 
 @dataclass
@@ -538,7 +539,7 @@ class Structure:
         Compute SASA (nm^2) by residue for a chosen model (default 0) via MDTraj.
         """
         if not self.models:
-            return {}
+            return []
         if model_index < 0 or model_index >= len(self.models):
             raise IndexError(f"model_index {model_index} out of range (0..{len(self.models)-1})")
         return self.models[model_index].sasa_by_residue(
@@ -607,40 +608,40 @@ class Structure:
             )
         return out
 
-    def dihedral_twist(
+    def dihedral(
         self,
         group_a: Union[list[int], list[list[int]]],
-        group_a1: Union[list[int], list[list[int]]],
         group_b: Union[list[int], list[list[int]]],
-        group_b1: Union[list[int], list[list[int]]],
+        group_c: Union[list[int], list[list[int]]],
+        group_d: Union[list[int], list[list[int]]],
     ) -> list[unit.Quantity]:
         """
         Dihedral angle (radians, −π..π) between four centroids for all models.
 
-        Geometry matches the umbrella in set_umbrella_dihedral_twist.
+        Geometry matches the umbrella in set_umbrella_dihedral
         """
         if not self.models:
             return []
         out: list[unit.Quantity] = []
         for m in self.models:
-            out.append(m.dihedral_twist(group_a, group_a1, group_b, group_b1))
+            out.append(m.dihedral(group_a, group_b, group_c, group_d))
         return out
 
-    def angle_rot(
+    def angle(
         self,
         group_a: Union[list[int], list[list[int]]],
         group_b: Union[list[int], list[list[int]]],
         group_c: Union[list[int], list[list[int]]],
-    ) -> list[tuple[unit.Quantity, unit.Quantity]]:
+    ) -> list[unit.Quantity]:
         """
-        Rotation angles (radians) per model, matching set_umbrella_angle_rot.
+        Rotation angles (radians) per model, matching set_umbrella_angle.
 
         """
         if not self.models:
             return []
         out: list[tuple[unit.Quantity, unit.Quantity]] = []
         for m in self.models:
-            out.append(m.angle_rot(group_a, group_b, group_c))
+            out.append(m.angle(group_a, group_b, group_c))
         return out
 
 

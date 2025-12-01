@@ -783,12 +783,12 @@ class MDSim:
         if self.system and self.simulation:
             self.simulation.context.setParameter("uk_angle_norm", k * kilojoule / mole / radian**2)
 
-    def set_umbrella_dihedral_twist(
+    def set_umbrella_dihedral(
         self,
         groupa,
-        groupa1,
         groupb,
-        groupb1,
+        groupc,
+        groupd,
         target=0.0,
         k=10.0,
     ):
@@ -812,7 +812,7 @@ class MDSim:
 
         bias = (
             # periodic quadratic in the dihedral difference
-            "0.5 * uk_twist * "
+            "0.5 * uk_dihedral * "
             "min((d - target)^2, min((d - target + 2*pi)^2, (d - target - 2*pi)^2));"
             "pi=acos(-1);"
             # d is the dihedral in radians
@@ -821,24 +821,24 @@ class MDSim:
 
         force = CustomCentroidBondForce(4, bias)
         force.addPerBondParameter("target")  # radians
-        force.addGlobalParameter("uk_twist", k * kilojoule / (mole * radian**2))
+        force.addGlobalParameter("uk_dihedral", k * kilojoule / (mole * radian**2))
 
         # Order: (g1, g2, g3, g4)
         force.addGroup(groupa)
-        force.addGroup(groupa1)
         force.addGroup(groupb)
-        force.addGroup(groupb1)
+        force.addGroup(groupc)
+        force.addGroup(groupd)
 
-        force.addBond([1, 0, 2, 3], [target * radian])
+        force.addBond([0, 1, 2, 3], [target * radian])
 
-        force.setName("Umbrella_twist")
+        force.setName("Umbrella_dihedral")
         self.system.addForce(force)
 
-    def update_umbrella_dihedral_twist(self, k=10.0):
+    def update_umbrella_dihedral(self, k=10.0):
         if self.system and self.simulation:
-            self.simulation.context.setParameter("uk_twist", k * kilojoule / mole / radian**2)
+            self.simulation.context.setParameter("uk_dihedral", k * kilojoule / mole / radian**2)
 
-    def set_umbrella_angle_rot(
+    def set_umbrella_angle(
         self,
         groupa,
         groupb,
@@ -857,11 +857,11 @@ class MDSim:
         if not self.system:
             return
 
-        bias = "0.5 * uk_angle_rot * (angle(g1, g2, g3) - target)^2"
+        bias = "0.5 * uk_angle * (angle(g1, g2, g3) - target)^2"
 
         force = CustomCentroidBondForce(3, bias)
         force.addPerBondParameter("target")  # radians
-        force.addGlobalParameter("uk_angle_rot", k * kilojoule / (mole * radian**2))
+        force.addGlobalParameter("uk_angle", k * kilojoule / (mole * radian**2))
 
         # group indices: 0=groupa, 1=groupb, 2=groupc
         force.addGroup(groupa)
@@ -870,12 +870,12 @@ class MDSim:
 
         force.addBond([0, 1, 2], [target * radian])
 
-        force.setName("Umbrella_angle_rot")
+        force.setName("Umbrella_angle")
         self.system.addForce(force)
 
-    def update_umbrella_angle_rot(self, k=10.0):
+    def update_umbrella_angle(self, k=10.0):
         if self.system and self.simulation:
-            self.simulation.context.setParameter("uk_angle_rot", k * kilojoule / mole / radian**2)
+            self.simulation.context.setParameter("uk_angle", k * kilojoule / mole / radian**2)
 
     def set_force_groups(self):
         if self.system:
@@ -945,32 +945,16 @@ class MDSim:
             "CustomNonbondedForce": 7,
         }
 
-        # First pass: ensure unique force groups
         forces = list(self.system.getForces())
-        used_groups = set()
 
-        for frc in forces:
-            g = frc.getForceGroup()
-            if g in used_groups:
-                # Find an unused group in [0, 31]
-                for candidate in range(32):
-                    if candidate not in used_groups:
-                        frc.setForceGroup(candidate)
-                        g = candidate
-                        break
-            used_groups.add(g)
-
-        # Prepare sortable list with original indices as tie-breakers
         indexed_forces = []
         for idx, frc in enumerate(forces):
             cls_name = frc.__class__.__name__
-            order = priority.get(cls_name, 100)  # unknown forces go last
+            order = priority.get(cls_name, 100)
             indexed_forces.append((order, idx, frc))
 
-        # Sort by requested order, then original index
         indexed_forces.sort(key=lambda x: (x[0], x[1]))
 
-        # Compute energies
         energies = {}
         for _, _, frc in indexed_forces:
             g = frc.getForceGroup()
