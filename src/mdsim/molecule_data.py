@@ -69,6 +69,8 @@ class Model:
     _parent: Optional[Structure] = field(default=None, repr=False, compare=False)
     _frame_index: int = field(default=0, repr=False, compare=False)
 
+    _atom_index_cache: Optional[dict[int, int]] = field(default=None, repr=False, compare=False)
+
     def chains(self) -> Iterator[Chain]:
         return iter(self.chain.values())
 
@@ -231,16 +233,25 @@ class Model:
         if not indices:
             raise ValueError("center of geometry requires at least one atom index")
 
+        n_atoms = self.natoms()
+        for idx in indices:
+            if idx < 0 or idx >= n_atoms:
+                raise IndexError(f"Atom index {idx} is out of range for model with {n_atoms} atoms")
+
+        if self._has_parent_coords():
+            # Fast path: use parent trajectory coordinates (nm) and numpy
+            coords_nm = self._parent._coords_nm[self._frame_index]  # type: ignore[union-attr]
+            idx_arr = np.asarray(indices, dtype=np.int64)
+            cog_ang = coords_nm[idx_arr].mean(axis=0) * 10.0  # nm → Å
+            return float(cog_ang[0]), float(cog_ang[1]), float(cog_ang[2])
+
+        # Static structure: accumulate directly from Atom coordinates (already Å)
         sx = sy = sz = 0.0
         for idx in indices:
-            if idx < 0 or idx >= self.natoms():
-                raise IndexError(
-                    f"Atom index {idx} is out of range for model with {self.natoms()} atoms"
-                )
-            x_ang, y_ang, z_ang = self._coord_angstrom(idx)
-            sx += x_ang
-            sy += y_ang
-            sz += z_ang
+            a = self.atoms[idx]
+            sx += float(a.x)
+            sy += float(a.y)
+            sz += float(a.z)
 
         inv_n = 1.0 / float(len(indices))
         return sx * inv_n, sy * inv_n, sz * inv_n
@@ -252,35 +263,12 @@ class Model:
     ) -> unit.Quantity:
         """
         Center-of-geometry distance between two atom groups, as an OpenMM Quantity in nm.
-
-        Parameters
-        ----------
-        group_a, group_b
-            Atom index lists (0-based) or list-of-lists of indices relative to this Model.
-            Indices must be valid for this model.
-
-        Returns
-        -------
-        openmm.unit.Quantity
-            Distance in nanometers between the two groups' centers of geometry.
-
-        Raises
-        ------
-        ValueError
-            If either group is empty after flattening.
-        IndexError
-            If an index is out of range for this model.
         """
         flat_a = self._flatten_indices(group_a)
         flat_b = self._flatten_indices(group_b)
 
         if not flat_a or not flat_b:
             raise ValueError("distance requires both groups to contain at least one atom")
-
-        n_atoms = self.natoms()
-        for idx in flat_a + flat_b:
-            if idx < 0 or idx >= n_atoms:
-                raise IndexError(f"Atom index {idx} is out of range for model with {n_atoms} atoms")
 
         cx_a, cy_a, cz_a = self._center_of_geometry(flat_a)
         cx_b, cy_b, cz_b = self._center_of_geometry(flat_b)
@@ -289,11 +277,8 @@ class Model:
         dy = cy_a - cy_b
         dz = cz_a - cz_b
 
-        # distance in Å (internal coordinates), then convert to nm Quantity
-        dist_ang = (dx * dx + dy * dy + dz * dz) ** 0.5
+        dist_ang = (dx * dx + dy * dy + dz * dz) ** 0.5  # Å
         return unit.Quantity(dist_ang, unit.angstrom).in_units_of(unit.nanometer)
-
-    # ---- geometry helpers for umbrella-style angles/dihedrals ----
 
     def _group_cog(self, group: Union[list[int], list[list[int]]]) -> np.ndarray:
         """
@@ -303,13 +288,8 @@ class Model:
         if not flat:
             raise ValueError("group must contain at least one atom index")
 
-        n_atoms = self.natoms()
-        for idx in flat:
-            if idx < 0 or idx >= n_atoms:
-                raise IndexError(f"Atom index {idx} is out of range for model with {n_atoms} atoms")
-
         cx, cy, cz = self._center_of_geometry(flat)
-        return np.array([cx, cy, cz], dtype=float)
+        return np.array((cx, cy, cz), dtype=float)
 
     @staticmethod
     def _angle_between(u: np.ndarray, v: np.ndarray) -> float:
@@ -626,27 +606,41 @@ class Structure:
         """
         Center-of-geometry distance between two atom groups for all models.
 
-        Applies the same index lists to each model in `self.models` and returns
-        one distance Quantity per model in order.
-
-        Parameters
-        ----------
-        group_a, group_b
-            Atom index lists (0-based) or list-of-lists of indices. Interpreted
-            in each model's atom ordering.
-
-        Returns
-        -------
-        list[openmm.unit.Quantity]
-            Distances in nanometers, one per model. Returns [] if there are no models.
+        If trajectory-backed (Structure._coords_nm is set), uses a vectorized
+        numpy implementation over all frames. Otherwise falls back to per-model
+        computation.
         """
         if not self.models:
             return []
 
-        distances: list[unit.Quantity] = []
-        for m in self.models:
-            distances.append(m.distance(group_a, group_b))
-        return distances
+        # Fast path for trajectory-backed structures
+        if self._coords_nm is not None:
+            flat_a = Model._flatten_indices(group_a)  # type: ignore[attr-defined]
+            flat_b = Model._flatten_indices(group_b)  # type: ignore[attr-defined]
+
+            if not flat_a or not flat_b:
+                raise ValueError("distance requires both groups to contain at least one atom")
+
+            n_atoms = self.natoms()
+            for idx in flat_a + flat_b:
+                if idx < 0 or idx >= n_atoms:
+                    raise IndexError(
+                        f"Atom index {idx} is out of range for structure with {n_atoms} atoms"
+                    )
+
+            idx_a = np.asarray(flat_a, dtype=np.int64)
+            idx_b = np.asarray(flat_b, dtype=np.int64)
+
+            coords_nm = self._coords_nm  # (n_frames, n_atoms, 3)
+            cog_a_nm = coords_nm[:, idx_a, :].mean(axis=1)
+            cog_b_nm = coords_nm[:, idx_b, :].mean(axis=1)
+            diff_nm = cog_a_nm - cog_b_nm
+            dist_nm = np.linalg.norm(diff_nm, axis=1)
+
+            return [unit.Quantity(float(d), unit.nanometer) for d in dist_nm]
+
+        # Static / multi-model fallback
+        return [m.distance(group_a, group_b) for m in self.models]
 
     def angle_norm(
         self,
@@ -709,7 +703,7 @@ class Structure:
         """
         if not self.models:
             return []
-        out: list[tuple[unit.Quantity, unit.Quantity]] = []
+        out: list[unit.Quantity] = []
         for m in self.models:
             out.append(m.angle(group_a, group_b, group_c))
         return out
@@ -765,19 +759,35 @@ class PDBReader:
         return self._parse(pdb_text.splitlines())
 
     # -- internals --
-
     @staticmethod
     def _open_text(file: FileLike) -> Iterable[str]:
-        if isinstance(file, (io.StringIO, io.BytesIO)):
-            if isinstance(file, io.BytesIO):
-                return io.TextIOWrapper(file, encoding="utf-8", newline="").read().splitlines()
-            return file.getvalue().splitlines()
+        """
+        Yield text lines from a PDB(-like) source.
+
+        - For StringIO/BytesIO, read from the in-memory buffer.
+        - For filesystem paths, stream line-by-line (no full-file read).
+        """
+        if isinstance(file, io.StringIO):
+            for line in file.getvalue().splitlines():
+                yield line
+            return
+
+        if isinstance(file, io.BytesIO):
+            text = io.TextIOWrapper(file, encoding="utf-8", newline="").read()
+            for line in text.splitlines():
+                yield line
+            return
+
         p = Path(file)
         if p.suffix == ".gz":
             with gzip.open(p, "rt", encoding="utf-8", newline="") as fh:
-                return fh.read().splitlines()
+                for line in fh:
+                    yield line.rstrip("\n")
+            return
+
         with open(p, encoding="utf-8", newline="") as fh:
-            return fh.read().splitlines()
+            for line in fh:
+                yield line.rstrip("\n")
 
     @classmethod
     def _read_direct(cls, file: FileLike) -> Structure:
@@ -789,32 +799,28 @@ class PDBReader:
         current_model: Optional[Model] = None
 
         # State for allocating fallback chain keys when SEGID is absent
-        # counts['A'] -> how many extra chains created beyond the first contiguous block
         fallback_counts: dict[str, int] = {}
-        last_chain_id_seen: Optional[str] = None  # last PDB chain ID encountered (for contiguity)
+        last_chain_id_seen: Optional[str] = None
 
-        def alloc_chain_key(atom: Atom) -> str:
+        def alloc_chain_key(m: Model, atom: Atom) -> str:
             """Return chain key for this atom per rules."""
             nonlocal last_chain_id_seen
-            if atom.seg.strip():
-                # Primary rule: group by segment ID, exactly as key
-                key = atom.seg.strip()
-                # still track for correctness across TER, but not used for seg
+
+            seg = atom.seg.strip()
+            if seg:
+                # Primary rule: group by segment ID
                 last_chain_id_seen = atom.chain
-                return key
+                return seg
 
             # Fallback: group by PDB chain ID, splitting non-contiguous repeats
             cid = (atom.chain or "").strip() or " "
-            if cid not in s.models[-1].chain:
-                # first ever chain with this cid in this model -> plain key
-                key = cid
+            if cid not in m.chain:
                 last_chain_id_seen = cid
-                return key
+                return cid
 
-            # If we are still in the same contiguous block (cid has not changed since last atom),
-            # keep using it
+            # Same contiguous block
             if last_chain_id_seen == cid:
-                return cid if cid in s.models[-1].chain else cid
+                return cid
 
             # Non-contiguous repeat: allocate suffixed key
             n = fallback_counts.get(cid, 0) + 1
@@ -823,10 +829,10 @@ class PDBReader:
             last_chain_id_seen = cid
             return key
 
-        def start_chain_if_needed(m: Model, key: str, atom: Atom):
+        def start_chain_if_needed(m: Model, key: str, atom: Atom) -> Chain:
             ch = m.chain.get(key)
             if ch is None:
-                ch = Chain(key_id=key, seg_id=(atom.seg.strip() or None))
+                ch = Chain(key_id=key, residues=[], seg_id=(atom.seg.strip() or None))
                 m.chain[key] = ch
             # record original PDB chain id
             ch.chain_id = atom.chain or " "
@@ -834,10 +840,9 @@ class PDBReader:
 
         def add_atom_to_model(m: Model, atom: Atom):
             m.atoms.append(atom)
-            key = alloc_chain_key(atom)
+            key = alloc_chain_key(m, atom)
             chain = start_chain_if_needed(m, key, atom)
 
-            # residue identity is solely by original PDB chain id and resnum/resname
             rid = (atom.resname, atom.chain, atom.resnum, atom.seg)
             if not chain.residues or _res_id(chain.residues[-1]) != rid:
                 chain.residues.append(Residue(*rid))
@@ -849,10 +854,9 @@ class PDBReader:
             rec = raw[0:6].strip().upper()
 
             if rec == "MODEL":
-                model_id = _safe_int(raw[10:14], default=len(s.models) + 1)
+                model_id = _safe_int(raw[10:14], default=len(s.models) + 1) or len(s.models) + 1
                 current_model = Model(model_id=model_id)
                 s.models.append(current_model)
-                # reset fallback state for a new model
                 fallback_counts = {}
                 last_chain_id_seen = None
                 continue
@@ -865,7 +869,6 @@ class PDBReader:
                 if current_model is None:
                     current_model = Model(model_id=1)
                     s.models.append(current_model)
-                    # reset fallback state for implicit first model
                     fallback_counts = {}
                     last_chain_id_seen = None
                 atom = _parse_atom_line(raw)
@@ -873,9 +876,6 @@ class PDBReader:
                 continue
 
             if rec == "TER":
-                # TER terminates a chain segment
-                # subsequent atom with the same PDB chain ID will start a new chain
-                # (e.g., A -> TER -> A becomes A1).
                 last_chain_id_seen = None
                 continue
 
@@ -1314,10 +1314,15 @@ class StructureSelector:
     ) -> list[list[int]]:
         """
         Return one or more atom lists (each sorted, 0-based indices into Model.atoms).
-        One or more groups -> lists are concatenated in the same order as groups.
         """
         model = structure.models[model_index] if isinstance(structure, Structure) else structure
-        atom_to_idx = {id(a): i for i, a in enumerate(model.atoms)}
+
+        # Cache atom id → index map on the Model
+        atom_to_idx = getattr(model, "_atom_index_cache", None)
+        if atom_to_idx is None:
+            atom_to_idx = {id(a): i for i, a in enumerate(model.atoms)}
+            model._atom_index_cache = atom_to_idx
+
         out_lists: list[list[int]] = []
 
         # Precompute chain ordering and alias mapping once per call
@@ -1823,7 +1828,7 @@ def load_dcd(
             f"DCD has {traj.n_atoms} atoms but template has {tmpl_model.natoms()} atoms"
         )
 
-    coords_nm = np.asarray(traj.xyz, dtype=float)  # (n_frames, n_atoms, 3)
+    coords_nm = np.asarray(traj.xyz, copy=False)
 
     s = Structure()
     s._coords_nm = coords_nm
