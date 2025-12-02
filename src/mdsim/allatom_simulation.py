@@ -649,24 +649,65 @@ class MDSim:
         group,
         *,
         k=10.0,
-        target=None,  # tuple/list (x,y,z) in nm or Quantity
+        target=None,  # single or per-group; see docstring
         periodic=False,
     ):
         """
-        Restrain the COM of `group` to a fixed point.
+        Restrain the COM of one or more groups to fixed points.
 
-        If `target` is None, the target is taken as the current COM of the group.
-        Otherwise, COM is restrained to the given (x,y,z) in nm.
+        Parameters
+        ----------
+        group
+            Either:
+              - sequence[int]: one group of atom indices, or
+              - sequence[sequence[int]]: multiple groups, each a sequence of atom indices.
+        k
+            Force constant in kJ/mol/nm^2 (shared for all groups).
+        target
+            - None:
+                For each group, target is taken as its current COM.
+            - Single (x,y,z) in nm (tuple/list) or 3-element Quantity:
+                Same target used for all groups.
+            - Sequence of length 1 or n_groups:
+                Per-group targets; each element may be:
+                  * None  -> use current COM of that group
+                  * (x,y,z) in nm (tuple/list)
+                  * 3-element Quantity with length units
+        periodic
+            If True and a periodic box is defined, enable PBC on the bias.
         """
+        from collections.abc import Sequence
+
         if self.system is None:
             raise RuntimeError("System has not been created yet.")
 
-        if not group:
+        # --- normalize groups to a list of lists of ints --------------------
+        def _is_int_like(x):
+            return isinstance(x, int)
+
+        if not isinstance(group, Sequence) or len(group) == 0:
             return
 
-        # Get reference positions to define COM if needed
-        if target is None:
-            # Determine positions to use
+        if _is_int_like(group[0]):
+            # single group: [i,j,k,...]
+            groups = [list(group)]
+        else:
+            # multiple groups: [[...], [...], ...]
+            groups = [list(g) for g in group]
+
+        if not groups:
+            return
+
+        n_groups = len(groups)
+
+        # --- positions in nm (computed lazily, only if needed) -------------
+        pos_nm = None
+
+        def _get_pos_nm():
+            nonlocal pos_nm
+            if pos_nm is not None:
+                return pos_nm
+
             if self.positions is not None:
                 pos = self.positions
             elif self.simulation is not None:
@@ -674,35 +715,94 @@ class MDSim:
             else:
                 raise RuntimeError("No positions available to define COM restraint reference.")
 
-            # Convert to nm if Quantity
             if hasattr(pos, "value_in_unit"):
-                pos_nm = pos.value_in_unit(nanometer)
+                pos_nm_local = pos.value_in_unit(nanometer)
             else:
-                pos_nm = pos  # assume already in nm
+                pos_nm_local = pos  # assume already in nm
 
-            x0, y0, z0 = self._compute_com(group, pos_nm)
+            pos_nm = pos_nm_local
+            return pos_nm
+
+        # --- helpers --------------------------------------------------------
+        def _norm_xyz(t):
+            """Return (x,y,z) in nm as floats from Quantity or 3-sequence."""
+            if hasattr(t, "value_in_unit"):
+                arr = t.value_in_unit(nanometer)
+                return float(arr[0]), float(arr[1]), float(arr[2])
+            # assume 3-sequence of numbers
+            return float(t[0]), float(t[1]), float(t[2])
+
+        def _is_scalar_xyz(seq):
+            """Heuristic: 3 non-sequence elements -> treat as single xyz."""
+            if not isinstance(seq, Sequence):
+                return False
+            if len(seq) != 3:
+                return False
+            for v in seq:
+                if isinstance(v, Sequence) and not hasattr(v, "value_in_unit"):
+                    return False
+            return True
+
+        # --- build per-group reference coordinates --------------------------
+        xyz_list = []
+
+        if target is None:
+            # All targets from current COMs
+            pos_nm = _get_pos_nm()
+            for g in groups:
+                xyz_list.append(self._compute_com(g, pos_nm))
         else:
-            # Use user-supplied target
-            if hasattr(target, "value_in_unit"):
-                xyz_nm = target.value_in_unit(nanometer)
-                x0, y0, z0 = xyz_nm[0], xyz_nm[1], xyz_nm[2]
+            # target provided; could be:
+            # - Quantity -> same for all groups
+            # - (x,y,z) -> same for all groups
+            # - sequence of per-group entries
+            if hasattr(target, "value_in_unit") or _is_scalar_xyz(target):
+                base = _norm_xyz(target)
+                xyz_list = [base for _ in range(n_groups)]
             else:
-                x0, y0, z0 = float(target[0]), float(target[1]), float(target[2])
+                # Treat as per-group target list
+                if not isinstance(target, Sequence):
+                    raise TypeError(
+                        "target must be None, a single (x,y,z)/Quantity, "
+                        "or a sequence of per-group targets."
+                    )
 
-        # Harmonic restraint on distance between COM and (x0,y0,z0)
-        bias = "0.5 * uk_com * ((x1-x0)^2 +(y1-y0)^2 +(z1-z0)^2)"
+                # allow broadcasting: length 1 -> repeat for all groups
+                if len(target) == 1 and n_groups > 1:
+                    per_group = list(target) * n_groups
+                else:
+                    if len(target) != n_groups:
+                        raise ValueError(
+                            "Per-group target sequence length must be 1 or match "
+                            "the number of groups."
+                        )
+                    per_group = list(target)
+
+                for g, t in zip(groups, per_group):
+                    if t is None:
+                        pos_nm = _get_pos_nm()
+                        xyz_list.append(self._compute_com(g, pos_nm))
+                    else:
+                        xyz_list.append(_norm_xyz(t))
+
+        # --- define the CustomCentroidBondForce -----------------------------
+        bias = "0.5 * uk_com * ((x1 - x0)^2 + (y1 - y0)^2 + (z1 - z0)^2)"
         force = CustomCentroidBondForce(1, bias)
         force.addGlobalParameter("uk_com", k * kilojoule / (mole * nanometer**2))
         force.addPerBondParameter("x0")
         force.addPerBondParameter("y0")
         force.addPerBondParameter("z0")
 
-        force.addGroup(group)
+        # add groups
+        group_ids = []
+        for g in groups:
+            gid = force.addGroup(g)
+            group_ids.append(gid)
 
-        # Single "bond" between COM (group) and fixed point
-        force.addBond([0], [x0, y0, z0])
+        # add one bond per group
+        for gid, (x0, y0, z0) in zip(group_ids, xyz_list):
+            force.addBond([gid], [x0, y0, z0])
 
-        # Using PBC-aware distance if PBC is enabled
         if self.box_vectors and periodic:
             force.setUsesPeriodicBoundaryConditions(True)
 
