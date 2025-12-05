@@ -833,58 +833,71 @@ class MDSim:
 
         Angle is in radians; target is in radians; k is in kJ/mol/rad^2.
         """
-        if self.system:
-            bias = (
-                # harmonic in (angle - target)
-                "0.5 * uk_angle_norm * (acos(cosang) - target)^2;"
-                # numerically safe cosine between normals: clamp to [-1, 1]
-                "cosang = min(1.0, max(-1.0, dotAB/(magA*magB)));"
-                "dotAB = nxA_tmp*nxB_tmp + nyA_tmp*nyB_tmp + nzA_tmp*nzB_tmp;"
-                "magA = sqrt(nxA_tmp^2 + nyA_tmp^2 + nzA_tmp^2 + 1e-12);"
-                "magB = sqrt(nxB_tmp^2 + nyB_tmp^2 + nzB_tmp^2 + 1e-12);"
-                # cross products nA = vA1 × vA2, nB = vB1 × vB2
-                "nxA_tmp = vA1y*vA2z - vA1z*vA2y;"
-                "nyA_tmp = vA1z*vA2x - vA1x*vA2z;"
-                "nzA_tmp = vA1x*vA2y - vA1y*vA2x;"
-                "nxB_tmp = vB1y*vB2z - vB1z*vB2y;"
-                "nyB_tmp = vB1z*vB2x - vB1x*vB2z;"
-                "nzB_tmp = vB1x*vB2y - vB1y*vB2x;"
-                # plane A vectors (groups 1,2,3)
-                "vA1x = x2 - x1;"
-                "vA1y = y2 - y1;"
-                "vA1z = z2 - z1;"
-                "vA2x = x3 - x1;"
-                "vA2y = y3 - y1;"
-                "vA2z = z3 - z1;"
-                # plane B vectors (groups 4,5,6)
-                "vB1x = x5 - x4;"
-                "vB1y = y5 - y4;"
-                "vB1z = z5 - z4;"
-                "vB2x = x6 - x4;"
-                "vB2y = y6 - y4;"
-                "vB2z = z6 - z4;"
-            )
+        if not self.system:
+            return
 
-            force = CustomCentroidBondForce(6, bias)
-            force.addPerBondParameter("target")  # radians
-            force.addGlobalParameter("uk_angle_norm", k * kilojoule / (mole * radian**2))
+        bias = (
+            # Harmonic in the angle between plane normals
+            "0.5 * uk_angle_norm * (theta - target)^2;"
+            # angle in [0, pi]: y >= 0 ensures atan2 ∈ [0, pi]
+            "theta = atan2(sinang, cosang);"
+            "sinang = magCross / denom;"
+            "cosang = dotAB / denom;"
+            # denom ~ |nA||nB| via dot/cross identity, with small epsilon to avoid 0
+            "denom = sqrt(dotAB*dotAB + magCross*magCross) + 1e-8;"
+            "magCross = sqrt(cx*cx + cy*cy + cz*cz);"
+            # nA × nB
+            "cx = nyA_tmp*nzB_tmp - nzA_tmp*nyB_tmp;"
+            "cy = nzA_tmp*nxB_tmp - nxA_tmp*nzB_tmp;"
+            "cz = nxA_tmp*nyB_tmp - nyA_tmp*nxB_tmp;"
+            # nA · nB
+            "dotAB = nxA_tmp*nxB_tmp + nyA_tmp*nyB_tmp + nzA_tmp*nzB_tmp;"
+            # plane A normal nA = vA1 × vA2
+            "nxA_tmp = vA1y*vA2z - vA1z*vA2y;"
+            "nyA_tmp = vA1z*vA2x - vA1x*vA2z;"
+            "nzA_tmp = vA1x*vA2y - vA1y*vA2x;"
+            # plane B normal nB = vB1 × vB2
+            "nxB_tmp = vB1y*vB2z - vB1z*vB2y;"
+            "nyB_tmp = vB1z*vB2x - vB1x*vB2z;"
+            "nzB_tmp = vB1x*vB2y - vB1y*vB2x;"
+            # in-plane vectors for plane A: (A1-A0) and (A2-A0)
+            "vA1x = x2 - x1;"
+            "vA1y = y2 - y1;"
+            "vA1z = z2 - z1;"
+            "vA2x = x3 - x1;"
+            "vA2y = y3 - y1;"
+            "vA2z = z3 - z1;"
+            # in-plane vectors for plane B: (B1-B0) and (B2-B0)
+            "vB1x = x5 - x4;"
+            "vB1y = y5 - y4;"
+            "vB1z = z5 - z4;"
+            "vB2x = x6 - x4;"
+            "vB2y = y6 - y4;"
+            "vB2z = z6 - z4;"
+        )
 
-            # group order: (A0, A1, A2, B0, B1, B2)
-            force.addGroup(groupa)
-            force.addGroup(groupa1)
-            force.addGroup(groupa2)
-            force.addGroup(groupb)
-            force.addGroup(groupb1)
-            force.addGroup(groupb2)
+        force = CustomCentroidBondForce(6, bias)
+        force.addPerBondParameter("target")  # radians
+        force.addGlobalParameter("uk_angle_norm", k * kilojoule / (mole * radian**2))
 
-            force.addBond([0, 1, 2, 3, 4, 5], [target * radian])
+        # group order: (A0, A1, A2, B0, B1, B2)
+        force.addGroup(groupa)
+        force.addGroup(groupa1)
+        force.addGroup(groupa2)
+        force.addGroup(groupb)
+        force.addGroup(groupb1)
+        force.addGroup(groupb2)
 
-            force.setName("Umbrella_angle_norm")
-            self.system.addForce(force)
+        force.addBond([0, 1, 2, 3, 4, 5], [target * radian])
+
+        force.setName("Umbrella_angle_norm")
+        self.system.addForce(force)
 
     def update_umbrella_angle_norm(self, k=10.0):
         if self.system and self.simulation:
-            self.simulation.context.setParameter("uk_angle_norm", k * kilojoule / mole / radian**2)
+            self.simulation.context.setParameter(
+                "uk_angle_norm", k * kilojoule / (mole * radian**2)
+            )
 
     def set_umbrella_dihedral(
         self,
