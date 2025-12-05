@@ -903,39 +903,52 @@ class MDSim:
 
         Parameters
         ----------
-        groupa, groupa1, groupb, groupb1 : sequence[int]
+        groupa, groupb, groupc, groupd : sequence[int]
             Atom indices for the four centroid groups.
         target : float
             Target dihedral angle in radians.
         k : float
-            Force constant in kJ/mol/rad^2.
+            Force constant in kJ/mol/rad^2. Only used on first creation;
+            later calls just add more bonds. Adjust at runtime with
+            `update_umbrella_dihedral`.
         """
         if not self.system:
             return
 
-        bias = (
-            # periodic quadratic in the dihedral difference
-            "0.5 * uk_dihedral * "
-            "min((d - target)^2, min((d - target + 2*pi)^2, (d - target - 2*pi)^2));"
-            "pi=acos(-1);"
-            # d is the dihedral in radians
-            "d = dihedral(g1, g2, g3, g4)"
-        )
+        # Try to find an existing Umbrella_dihedral force
+        force = None
+        for f in self.system.getForces():
+            if isinstance(f, CustomCentroidBondForce) and f.getName() == "Umbrella_dihedral":
+                force = f
+                break
 
-        force = CustomCentroidBondForce(4, bias)
-        force.addPerBondParameter("target")  # radians
-        force.addGlobalParameter("uk_dihedral", k * kilojoule / (mole * radian**2))
+        if force is None:
+            # Create the force the first time
+            bias = (
+                # periodic quadratic in the dihedral difference
+                "0.5 * uk_dihedral * "
+                "min((d - target)^2, min((d - target + 2*pi)^2, (d - target - 2*pi)^2));"
+                "pi=acos(-1);"
+                # d is the dihedral in radians
+                "d = dihedral(g1, g2, g3, g4)"
+            )
 
-        # Order: (g1, g2, g3, g4)
-        force.addGroup(groupa)
-        force.addGroup(groupb)
-        force.addGroup(groupc)
-        force.addGroup(groupd)
+            force = CustomCentroidBondForce(4, bias)
+            force.addPerBondParameter("target")  # radians
+            force.addGlobalParameter(
+                "uk_dihedral",
+                k * kilojoule / (mole * radian**2),
+            )
+            force.setName("Umbrella_dihedral")
+            self.system.addForce(force)
 
-        force.addBond([0, 1, 2, 3], [target * radian])
+        # For each call, add new centroid groups + a new bond
+        idx_a = force.addGroup(groupa)
+        idx_b = force.addGroup(groupb)
+        idx_c = force.addGroup(groupc)
+        idx_d = force.addGroup(groupd)
 
-        force.setName("Umbrella_dihedral")
-        self.system.addForce(force)
+        force.addBond([idx_a, idx_b, idx_c, idx_d], [target * radian])
 
     def update_umbrella_dihedral(self, k=10.0):
         if self.system and self.simulation:
@@ -955,26 +968,36 @@ class MDSim:
         Angle is in radians; restrained to `target`.
 
         The angle is:
-          - angle(groupa,  groupb,  groupc)
+          - angle(groupa, groupb, groupc)
+
+        All angle restraints share the same global force constant `uk_angle`.
         """
         if not self.system:
             return
 
-        bias = "0.5 * uk_angle * (angle(g1, g2, g3) - target)^2"
+        # Try to find an existing Umbrella_angle force
+        force = None
+        for f in self.system.getForces():
+            if isinstance(f, CustomCentroidBondForce) and f.getName() == "Umbrella_angle":
+                force = f
+                break
 
-        force = CustomCentroidBondForce(3, bias)
-        force.addPerBondParameter("target")  # radians
-        force.addGlobalParameter("uk_angle", k * kilojoule / (mole * radian**2))
+        if force is None:
+            # Create the force the first time
+            bias = "0.5 * uk_angle * (angle(g1, g2, g3) - target)^2"
+            force = CustomCentroidBondForce(3, bias)
+            force.addPerBondParameter("target")  # radians
+            force.addGlobalParameter("uk_angle", k * kilojoule / (mole * radian**2))
+            force.setName("Umbrella_angle")
 
-        # group indices: 0=groupa, 1=groupb, 2=groupc
-        force.addGroup(groupa)
-        force.addGroup(groupb)
-        force.addGroup(groupc)
+            self.system.addForce(force)
 
-        force.addBond([0, 1, 2], [target * radian])
+        # For each call, add new centroid groups + a new bond
+        idx_a = force.addGroup(groupa)
+        idx_b = force.addGroup(groupb)
+        idx_c = force.addGroup(groupc)
 
-        force.setName("Umbrella_angle")
-        self.system.addForce(force)
+        force.addBond([idx_a, idx_b, idx_c], [target * radian])
 
     def update_umbrella_angle(self, k=10.0):
         if self.system and self.simulation:
@@ -1068,6 +1091,57 @@ class MDSim:
 
         return energies
 
+    def get_force_groups(self, names: Sequence[str]) -> dict[str, int]:
+        """
+        Return a mapping {force_key: force_group} for forces whose names
+        match any of the provided strings.
+
+        If a force name appears multiple times, additional entries are created
+        with keys 'name', 'name_2', 'name_3', ...
+
+        Parameters
+        ----------
+        names : sequence of str
+            Name fragments to match against Force.getName() (or class name).
+
+        Returns
+        -------
+        dict[str, int]
+            Keys are disambiguated force labels, values are their force group indices.
+        """
+        if self.system is None:
+            raise RuntimeError("System has not been created yet.")
+
+        # Normalize input
+        if isinstance(names, str):
+            patterns = [names]
+        else:
+            patterns = list(names)
+
+        patterns = [p for p in patterns if p]
+        if not patterns:
+            return {}
+
+        forcelist: dict[str, int] = {}
+
+        for force in self.system.getForces():
+            fname = force.getName() or force.__class__.__name__
+            # check if any pattern matches this force name
+            if not any(pat in fname for pat in patterns):
+                continue
+
+            # determine dict key, handling duplicates: name, name_2, name_3, ...
+            key = fname
+            if key in forcelist:
+                i = 2
+                while f"{fname}_{i}" in forcelist:
+                    i += 1
+                key = f"{fname}_{i}"
+
+            forcelist[key] = force.getForceGroup()
+
+        return forcelist
+
     def set_velocities(self, *, seed=None, newtemp=None):
         if self.simulation is not None:
             if newtemp is not None:
@@ -1084,7 +1158,41 @@ class MDSim:
             tolerance = tol * kilojoule / (nanometer * mole)
             self.simulation.minimizeEnergy(tolerance=tolerance, maxIterations=nstep)
 
-    def simulate(self, *, nstep=1000, nout=1000, logfile=None, dcdfile=None):
+    class EnergyReporter:
+        def __init__(self, file, reportInterval, bias_force_names_to_groups):
+            """
+            file: output filename
+            reportInterval: reporting interval in steps
+            bias_force_names_to_groups: dict like {"angle": 1, "torsion": 2}
+            """
+            self.file = open(file, "w")
+            self.interval = reportInterval
+            self.bias_force_names_to_groups = bias_force_names_to_groups
+            header = f"{'Step':<20s}" + "".join(
+                f"{name:<20s}" for name in bias_force_names_to_groups
+            )
+            self.file.write(header + "\n")
+
+        def describeNextReport(self, simulation):
+            return (self.interval, False, False, False, False)
+
+        def report(self, simulation, state):
+            # First column: step, left-aligned in width 20
+            line = f"{simulation.currentStep:<20d}"
+            for name, group in self.bias_force_names_to_groups.items():
+                bias_state = simulation.context.getState(getEnergy=True, groups={group})
+                energy = bias_state.getPotentialEnergy().value_in_unit(kilojoule / mole)
+                line += f"{energy:<20.8f}"
+
+            self.file.write(line + "\n")
+            self.file.flush()
+
+        def __del__(self):
+            self.file.close()
+
+    def simulate(
+        self, *, nstep=1000, nout=1000, logfile=None, dcdfile=None, elogfile=None, forcelist=None
+    ):
         if self.simulation is not None:
             if dcdfile:
                 dcd = DCDReporter(dcdfile, nout)
@@ -1106,6 +1214,9 @@ class MDSim:
                     totalSteps=nstep,
                     separator=" ",
                 )
+                self.simulation.reporters.append(log)
+            if elogfile and forcelist:
+                log = self.EnergyReporter(elogfile, nout, self.get_force_groups(forcelist))
                 self.simulation.reporters.append(log)
             self.simulation.step(nstep)
 
