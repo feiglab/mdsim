@@ -521,6 +521,14 @@ class Structure:
     def __iter__(self) -> Iterator[Model]:
         return iter(self.models)
 
+    def __repr__(self) -> str:
+        lenmod=len(self.models)
+        if self._coords_nm is not None:
+            ncoord=len(self._coords_nm)
+            return f"<Structure with {ncoord} coordinate frames>"
+        else:
+            return f"<Structure with {lenmod} models"
+
     @property
     def model(self) -> Model:
         """Return the first model (common for single-model files)."""

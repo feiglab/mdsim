@@ -149,7 +149,7 @@ class MDSim:
         velocities=None,
         box=None,
         resources="CPU",
-        device=0,
+        device=None,
         tstep=None,
         gamma=None,
         temperature=None,
@@ -178,7 +178,10 @@ class MDSim:
         self.platform = Platform.getPlatformByName(self.resources)
 
         if self.resources == "CUDA":
-            prop = dict(CudaPrecision="mixed", CudaDeviceIndex=str(device))
+            if device:
+                prop = dict(CudaPrecision="mixed", CudaDeviceIndex=str(device))
+            else:
+                prop = dict(CudaPrecision="mixed")
             self.simulation = Simulation(
                 self.topology, self.system, self.integrator, self.platform, prop
             )
