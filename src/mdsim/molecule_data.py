@@ -522,9 +522,9 @@ class Structure:
         return iter(self.models)
 
     def __repr__(self) -> str:
-        lenmod=len(self.models)
+        lenmod = len(self.models)
         if self._coords_nm is not None:
-            ncoord=len(self._coords_nm)
+            ncoord = len(self._coords_nm)
             return f"<Structure with {ncoord} coordinate frames>"
         else:
             return f"<Structure with {lenmod} models"
