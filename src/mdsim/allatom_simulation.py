@@ -840,8 +840,8 @@ class MDSim:
                 # numerically safe cosine between normals: clamp to [-1, 1]
                 "cosang = min(1.0, max(-1.0, dotAB/(magA*magB)));"
                 "dotAB = nxA_tmp*nxB_tmp + nyA_tmp*nyB_tmp + nzA_tmp*nzB_tmp;"
-                "magA = sqrt(nxA_tmp^2 + nyA_tmp^2 + nzA_tmp^2);"
-                "magB = sqrt(nxB_tmp^2 + nyB_tmp^2 + nzB_tmp^2);"
+                "magA = sqrt(nxA_tmp^2 + nyA_tmp^2 + nzA_tmp^2 + 1e-12);"
+                "magB = sqrt(nxB_tmp^2 + nyB_tmp^2 + nzB_tmp^2 + 1e-12);"
                 # cross products nA = vA1 × vA2, nB = vB1 × vB2
                 "nxA_tmp = vA1y*vA2z - vA1z*vA2y;"
                 "nyA_tmp = vA1z*vA2x - vA1x*vA2z;"
@@ -925,12 +925,11 @@ class MDSim:
         if force is None:
             # Create the force the first time
             bias = (
-                # periodic quadratic in the dihedral difference
-                "0.5 * uk_dihedral * "
-                "min((d - target)^2, min((d - target + 2*pi)^2, (d - target - 2*pi)^2));"
-                "pi=acos(-1);"
-                # d is the dihedral in radians
-                "d = dihedral(g1, g2, g3, g4)"
+                "0.5 * uk_dihedral * delta^2; "
+                "delta = delta - 2*pi*floor((delta + pi)/(2*pi));"
+                "pi = acos(-1);"
+                "delta = d - target;"
+                "d = dihedral(g1, g2, g3, g4);"
             )
 
             force = CustomCentroidBondForce(4, bias)
