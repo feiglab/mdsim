@@ -346,7 +346,15 @@ class Model:
 
         Plane A: defined by centroids of (group_a, group_a1, group_a2)
         Plane B: defined by centroids of (group_b, group_b1, group_b2)
+
+        Angle is evaluated via atan2(sin, cos) with:
+          sin = |nA × nB| / sqrt((nA·nB)^2 + |nA × nB|^2)
+          cos = (nA·nB)  / sqrt((nA·nB)^2 + |nA × nB|^2)
+
+        which matches the CustomCentroidBondForce expression used in
+        MDSim.set_umbrella_angle_norm.
         """
+        # centroids (Å)
         A0 = self._group_cog(group_a)
         A1 = self._group_cog(group_a1)
         A2 = self._group_cog(group_a2)
@@ -354,24 +362,32 @@ class Model:
         B1 = self._group_cog(group_b1)
         B2 = self._group_cog(group_b2)
 
+        # in-plane vectors
         vA1 = A1 - A0
         vA2 = A2 - A0
         vB1 = B1 - B0
         vB2 = B2 - B0
 
+        # plane normals (unnormalized): nA = vA1 × vA2, nB = vB1 × vB2
         nA = np.cross(vA1, vA2)
         nB = np.cross(vB1, vB2)
 
-        nu = np.linalg.norm(nA)
-        nv = np.linalg.norm(nB)
-        if nu == 0.0 or nv == 0.0:
-            raise ValueError("Cannot compute plane-normal angle for degenerate plane")
+        # nA × nB and nA · nB
+        crossAB = np.cross(nA, nB)
+        magCross = float(np.linalg.norm(crossAB))
+        dotAB = float(np.dot(nA, nB))
 
-        cosang = float(np.dot(nA, nB) / (nu * nv))
-        cosang = max(-1.0, min(1.0, cosang))
-        angle = float(np.arccos(cosang))
+        # denom ~ |nA||nB| via dot/cross identity, +eps to avoid 0
+        denom = float(np.sqrt(dotAB * dotAB + magCross * magCross) + 1.0e-8)
 
-        return unit.Quantity(angle, unit.radian)
+        # sin/cos of angle between plane normals
+        sinang = magCross / denom
+        cosang = dotAB / denom
+
+        # Angle in [0, π] (since sinang >= 0)
+        theta = float(np.arctan2(sinang, cosang))
+
+        return unit.Quantity(theta, unit.radian)
 
     def dihedral(
         self,
@@ -503,6 +519,24 @@ class Model:
         per_res_nm2 = sasa_nm2[0]
 
         return per_res_nm2.tolist()
+
+    # --- I/O helpers ---------------------------------------------------------
+
+    def write_pdb(self, file: FileLike, *, model_records: Optional[bool] = None) -> None:
+        """
+        Write this Model to a PDB file.
+
+        Parameters
+        ----------
+        file : FileLike
+            Output path or file-like (str, Path, StringIO, BytesIO).
+        model_records : Optional[bool], optional
+            If None (default), do not emit MODEL/ENDMDL for this single model.
+            If True, wrap this model in MODEL/ENDMDL.
+            If False, never emit MODEL/ENDMDL.
+        """
+        writer = PDBWriter()
+        writer.write(self, file, model_records=model_records)
 
 
 @dataclass
@@ -716,6 +750,18 @@ class Structure:
             out.append(m.angle(group_a, group_b, group_c))
         return out
 
+    # --- I/O helpers ---------------------------------------------------------
+
+    def write_pdb(self, file: FileLike, *, model_records: Optional[bool] = None) -> None:
+        """
+        Write this Structure to a PDB file.
+
+        By default, if the Structure contains more than one model, a single
+        multi-model PDB is written using MODEL/ENDMDL records for each model.
+        """
+        writer = PDBWriter()
+        writer.write(self, file, model_records=model_records)
+
 
 # --- Parser ------------------------------------------------------------------
 
@@ -890,6 +936,193 @@ class PDBReader:
         if not s.models:
             s.models.append(Model(model_id=1))
         return s
+
+
+class _PDBTextSink:
+    """
+    Internal helper: line-oriented text sink that understands FileLike.
+    """
+
+    def __init__(self, file: FileLike):
+        self._needs_close = False
+        self._binary = False
+
+        if isinstance(file, io.StringIO):
+            self._fh = file
+        elif isinstance(file, io.BytesIO):
+            self._fh = file
+            self._binary = True
+        else:
+            p = Path(file)
+            if p.suffix == ".gz":
+                self._fh = gzip.open(p, "wt", encoding="utf-8", newline="")
+            else:
+                self._fh = open(p, "w", encoding="utf-8", newline="\n")
+            self._needs_close = True
+
+    def write_line(self, line: str) -> None:
+        if self._binary:
+            assert isinstance(self._fh, io.BytesIO)
+            self._fh.write((line + "\n").encode("utf-8"))
+        else:
+            self._fh.write(line + "\n")
+
+    def close(self) -> None:
+        if self._needs_close:
+            self._fh.close()
+
+
+class PDBWriter:
+    """
+    Minimal PDB writer, parallel to PDBReader.
+
+    - Accepts a Structure (possibly multi-model) or a single Model.
+    - Uses MODEL/ENDMDL records when there is more than one model
+      by default, so you get a single PDB with multiple models.
+    - Coordinates come from the Model, including trajectory-backed
+      Structures via Model._coord_angstrom().
+    """
+
+    def write(
+        self,
+        structure: Union[Structure, Model],
+        file: FileLike,
+        *,
+        model_records: Optional[bool] = None,
+    ) -> None:
+        """
+        Write a Structure or Model to PDB.
+
+        Parameters
+        ----------
+        structure : Structure or Model
+            Data to write.
+        file : FileLike
+            Output path or file-like object.
+        model_records : Optional[bool], optional
+            - None (default): use MODEL/ENDMDL only if there is >1 model.
+            - True          : always emit MODEL/ENDMDL for each model.
+            - False         : never emit MODEL/ENDMDL.
+        """
+        if isinstance(structure, Model):
+            s = Structure(models=[structure])
+        else:
+            s = structure
+
+        sink = _PDBTextSink(file)
+        try:
+            if not s.models:
+                sink.write_line("END")
+                return
+
+            if model_records is None:
+                use_model_records = len(s.models) > 1
+            else:
+                use_model_records = bool(model_records)
+
+            for frame_index, m in enumerate(s.models):
+                if use_model_records:
+                    model_id = getattr(m, "model_id", None)
+                    if not isinstance(model_id, int):
+                        model_id = frame_index + 1
+                    sink.write_line(f"MODEL     {model_id:4d}")
+
+                self._write_model_atoms(m, sink)
+
+                if use_model_records:
+                    sink.write_line("ENDMDL")
+
+            sink.write_line("END")
+        finally:
+            sink.close()
+
+    @staticmethod
+    def _write_model_atoms(model: Model, sink: _PDBTextSink) -> None:
+        """
+        Write all ATOM records for a single Model.
+
+        Coordinates are taken from Model._coord_angstrom(idx), so this works
+        both for static and trajectory-backed models.
+        """
+        natoms = model.natoms()
+        if natoms == 0:
+            return
+
+        idx = 0
+        serial_counter = 1
+
+        # Deterministic chain order: respect insertion order from parsing.
+        for key in model.chain:
+            ch = model.chain[key]
+
+            for res in ch.residues:
+                for atom in res.atoms:
+                    if idx >= natoms:
+                        raise RuntimeError(
+                            "Internal inconsistency while writing PDB: atom index overflow"
+                        )
+
+                    x_ang, y_ang, z_ang = model._coord_angstrom(idx)
+                    idx += 1
+
+                    # Preserve existing PDB serials when present; otherwise assign sequential.
+                    atom_serial = getattr(atom, "serial", 0) or 0
+                    serial = atom_serial if atom_serial > 0 else serial_counter
+                    serial_counter += 1
+
+                    name = (atom.name or "")[:4]
+                    resname = (atom.resname or "")[:4]
+                    chain_id = (atom.chain or " ")[:1]
+                    seg = (atom.seg or "")[:4]
+                    # element = (atom.element or "")[:2].upper()
+
+                    # PDB v3.3-like formatting compatible with _parse_atom_line.
+
+                    if int(serial) < 100000:
+                        line = (
+                            "{:<6s}{:>5d} {:<4s}{:1s}{:<4s}{:1s}{:>4d}{:1s}"
+                            "   {:>8.3f}{:>8.3f}{:>8.3f}{:>6.2f}{:>6.2f}      {:>4s}"
+                        ).format(
+                            "ATOM",
+                            int(serial),
+                            name,
+                            "",  # altLoc
+                            resname,
+                            chain_id,
+                            int(atom.resnum),
+                            "",  # iCode
+                            float(x_ang),
+                            float(y_ang),
+                            float(z_ang),
+                            1.00,  # occupancy
+                            0.00,  # tempFactor
+                            seg,
+                        )
+                    else:
+                        line = (
+                            "{:<6s}***** {:<4s}{:1s}{:<4s}{:1s}{:>4d}{:1s}"
+                            "   {:>8.3f}{:>8.3f}{:>8.3f}{:>6.2f}{:>6.2f}      {:>4s}"
+                        ).format(
+                            "ATOM",
+                            name,
+                            "",  # altLoc
+                            resname,
+                            chain_id,
+                            int(atom.resnum),
+                            "",  # iCode
+                            float(x_ang),
+                            float(y_ang),
+                            float(z_ang),
+                            1.00,  # occupancy
+                            0.00,  # tempFactor
+                            seg,
+                        )
+                    sink.write_line(line)
+
+        if idx != natoms:
+            raise RuntimeError(
+                f"Internal inconsistency while writing PDB: wrote {idx} atoms, expected {natoms}"
+            )
 
 
 # --- parsing utilities -------------------------------------------------------

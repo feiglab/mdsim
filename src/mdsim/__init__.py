@@ -3,6 +3,7 @@ from .allatom_simulation import MDSim
 from .molecule_data import (
     Model,
     PDBReader,
+    PDBWriter,
     SelectionError,
     Structure,
     StructureSelector,
@@ -16,6 +17,7 @@ __all__ = [
     "MDSim",
     "Model",
     "PDBReader",
+    "PDBWriter",
     "SelectionError",
     "Structure",
     "StructureSelector",
