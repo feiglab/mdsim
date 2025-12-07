@@ -2069,7 +2069,7 @@ def load_dcd(
             f"DCD has {traj.n_atoms} atoms but template has {tmpl_model.natoms()} atoms"
         )
 
-    coords_nm = np.asarray(traj.xyz, copy=False)
+    coords_nm = np.asarray(traj.xyz)
 
     s = Structure()
     s._coords_nm = coords_nm
