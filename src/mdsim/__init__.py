@@ -1,5 +1,11 @@
 from .__version__ import __version__
-from .allatom_simulation import MDSim
+from .allatom_simulation import (
+    MDSim,
+    harmonic_energy_angle,
+    harmonic_energy_dihedral,
+    harmonic_energy_distance,
+    harmonic_energy_xyz,
+)
 from .molecule_data import (
     Atom,
     Chain,
@@ -16,7 +22,6 @@ from .molecule_data import (
 
 __all__ = [
     "__version__",
-    "load_dcd",
     "Atom",
     "Chain",
     "MDSim",
@@ -27,5 +32,10 @@ __all__ = [
     "SelectionError",
     "Structure",
     "StructureSelector",
+    "harmonic_energy_xyz",
+    "harmonic_energy_distance",
+    "harmonic_energy_angle",
+    "harmonic_energy_dihedral",
+    "load_dcd",
     "summarize_topology",
 ]

@@ -280,6 +280,34 @@ class Model:
         dist_ang = (dx * dx + dy * dy + dz * dz) ** 0.5  # Å
         return unit.Quantity(dist_ang, unit.angstrom).in_units_of(unit.nanometer)
 
+    def distance_vector(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+    ) -> unit.Quantity:
+        """
+        Center-of-geometry displacement vector (from group_b -> group_a) as an
+        OpenMM Quantity[Vec3] in nm.
+
+        Uses the same center-of-geometry definition as `distance()`.
+        """
+        flat_a = self._flatten_indices(group_a)
+        flat_b = self._flatten_indices(group_b)
+
+        if not flat_a or not flat_b:
+            raise ValueError("distance_vector requires both groups to contain at least one atom")
+
+        cx_a, cy_a, cz_a = self._center_of_geometry(flat_a)
+        cx_b, cy_b, cz_b = self._center_of_geometry(flat_b)
+
+        dx = cx_a - cx_b
+        dy = cy_a - cy_b
+        dz = cz_a - cz_b
+
+        # Å -> nm
+        vec_ang = Vec3(float(dx), float(dy), float(dz)) * unit.angstrom
+        return vec_ang.in_units_of(unit.nanometer)
+
     def _group_cog(self, group: Union[list[int], list[list[int]]]) -> np.ndarray:
         """
         Center-of-geometry (Å) for a group of atoms, returned as a 3D numpy vector.
@@ -579,6 +607,12 @@ class Structure:
     def natoms(self) -> int:
         return self.models[0].natoms()
 
+    def nframes(self) -> int:
+        if self._coords_nm is not None:
+            return len(self._coords_nm)
+        else:
+            return 0
+
     def positions(self, model_index: int = 0):
         """Positions for the selected model as Quantity[list[Vec3]] in nm."""
         return self.models[model_index].positions()
@@ -683,6 +717,53 @@ class Structure:
 
         # Static / multi-model fallback
         return [m.distance(group_a, group_b) for m in self.models]
+
+    def distance_vector(
+        self,
+        group_a: Union[list[int], list[list[int]]],
+        group_b: Union[list[int], list[list[int]]],
+    ) -> list[unit.Quantity]:
+        """
+        Center-of-geometry displacement vectors (from group_b -> group_a) for all models.
+
+        If trajectory-backed (Structure._coords_nm is set), uses a vectorized
+        numpy implementation over all frames. Otherwise falls back to per-model
+        computation and returns a list of Quantity[Vec3] in nm.
+        """
+        if not self.models:
+            return []
+
+        # Fast path for trajectory-backed structures
+        if self._coords_nm is not None:
+            flat_a = Model._flatten_indices(group_a)  # type: ignore[attr-defined]
+            flat_b = Model._flatten_indices(group_b)  # type: ignore[attr-defined]
+
+            if not flat_a or not flat_b:
+                raise ValueError("both groups have to contain at least one atom")
+
+            n_atoms = self.natoms()
+            for idx in flat_a + flat_b:
+                if idx < 0 or idx >= n_atoms:
+                    raise IndexError(
+                        f"Atom index {idx} is out of range for structure with {n_atoms} atoms"
+                    )
+
+            idx_a = np.asarray(flat_a, dtype=np.int64)
+            idx_b = np.asarray(flat_b, dtype=np.int64)
+
+            coords_nm = self._coords_nm  # (n_frames, n_atoms, 3)
+            cog_a_nm = coords_nm[:, idx_a, :].mean(axis=1)  # (n_frames, 3)
+            cog_b_nm = coords_nm[:, idx_b, :].mean(axis=1)  # (n_frames, 3)
+            diff_nm = cog_a_nm - cog_b_nm  # (n_frames, 3)
+
+            out: list[unit.Quantity] = []
+            for v in diff_nm:
+                vx, vy, vz = float(v[0]), float(v[1]), float(v[2])
+                out.append(Vec3(vx, vy, vz) * unit.nanometer)
+            return out
+
+        # Static / multi-model fallback
+        return [m.distance_vector(group_a, group_b) for m in self.models]
 
     def angle_norm(
         self,
