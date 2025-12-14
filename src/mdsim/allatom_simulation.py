@@ -202,10 +202,21 @@ class MDSim:
     def get_positions(self):
         if self.simulation:
             return self.simulation.context.getState(getPositions=True).getPositions()
+        else:
+            return None
 
     def get_velocities(self):
         if self.simulation:
             return self.simulation.context.getState(getVelocities=True).getVelocities()
+        else:
+            return None
+
+    def get_masses(self):
+        if self.system:
+            nparticles = self.system.getNumParticles()
+            return [self.system.getParticleMass(i) for i in range(nparticles)]
+        else:
+            return None
 
     def set_nonbonded(self, nb):
         self.nonbonded = ff.PME
@@ -592,14 +603,23 @@ class MDSim:
                 barostat = MonteCarloBarostat(self.pressure, self.temperature)
                 self.system.addForce(barostat)
 
-    def set_umbrella_xyz_distance(self, groupa, groupb, *, direction="x", target=0.0, k=10.0):
+    def set_umbrella_xyz_distance(
+        self, groupa, groupb, *, direction="x", target=0.0, k=10.0, center="cog"
+    ):
         if self.system:
             bias = f"0.5 * uk_{direction} * ((abs({direction}2 - {direction}1) - target)^2)"
             force = CustomCentroidBondForce(2, bias)
             force.addPerBondParameter("target")  # target distance (nm)
             force.addGlobalParameter(f"uk_{direction}", k * kilojoule / mole / nanometer**2)
-            force.addGroup(groupa)
-            force.addGroup(groupb)
+            if center.lower() == "cog":
+                force.addGroup(groupa, [1.0] * len(groupa))
+                force.addGroup(groupb, [1.0] * len(groupb))
+            elif center.lower() == "com":
+                force.addGroup(groupa)
+                force.addGroup(groupb)
+            else:
+                raise ValueError(f"Center option {center} is not valid.")
+
             force.addBond([0, 1], [target * nanometer])
             force.setName(f"Umbrella_{direction}")
             self.system.addForce(force)
@@ -610,14 +630,23 @@ class MDSim:
                 f"uk_{direction}", k * kilojoule / mole / nanometer**2
             )
 
-    def set_umbrella_distance(self, groupa, groupb, *, target=0.0, k=10.0, periodic=False):
+    def set_umbrella_distance(
+        self, groupa, groupb, *, target=0.0, k=10.0, periodic=False, center="cog"
+    ):
         if self.system:
             bias = "0.5 * uk_dist * ((distance(g1,g2) - target)^2)"
             force = CustomCentroidBondForce(2, bias)
             force.addPerBondParameter("target")  # target distance (nm)
             force.addGlobalParameter("uk_dist", k * kilojoule / mole / nanometer**2)
-            force.addGroup(groupa)
-            force.addGroup(groupb)
+            if center.lower() == "cog":
+                force.addGroup(groupa, [1.0] * len(groupa))
+                force.addGroup(groupb, [1.0] * len(groupb))
+            elif center.lower() == "com":
+                force.addGroup(groupa)
+                force.addGroup(groupb)
+            else:
+                raise ValueError(f"Center option {center} is not valid.")
+
             force.addBond([0, 1], [target * nanometer])
             if self.box_vectors and periodic:
                 force.setUsesPeriodicBoundaryConditions(True)
@@ -628,36 +657,76 @@ class MDSim:
         if self.system and self.simulation:
             self.simulation.context.setParameter("uk_dist", k * kilojoule / mole / nanometer**2)
 
-    def _compute_com(self, group, positions_nm):
-        """Compute mass-weighted COM of `group` using positions in nm."""
-        masses = []
-        coords = []
-        for idx in group:
-            m = self.system.getParticleMass(idx)
-            masses.append(m._value)
-            p = positions_nm[idx]
+    def _compute_center(self, group, positions_nm, *, center="cog"):
+        """Compute the center (COG or COM) of `group` using positions in nm.
+
+        Parameters
+        ----------
+        group : sequence[int]
+            Atom indices.
+        positions_nm : sequence
+            Positions in nm, either a list of Vec3 or an (N,3)-like array.
+        center : {"cog", "com"}
+            - "cog": center of geometry (equal weights)
+            - "com": center of mass (particle masses from `self.system`)
+
+        Returns
+        -------
+        np.ndarray
+            Shape (3,) array (x,y,z) in nm.
+        """
+        if group is None or len(group) == 0:
+            raise ValueError("group must contain at least one atom index")
+
+        mode = (center or "cog").lower()
+        if mode not in {"cog", "com"}:
+            raise ValueError(f"Center option {center} is not valid. Use 'cog' or 'com'.")
+
+        # Coordinates
+        coords = np.empty((len(group), 3), dtype=float)
+        for i, idx in enumerate(group):
+            p = positions_nm[int(idx)]
             if hasattr(p, "x"):
-                coords.append([p.x, p.y, p.z])
+                coords[i, 0] = float(p.x)
+                coords[i, 1] = float(p.y)
+                coords[i, 2] = float(p.z)
             else:
-                coords.append([p[0], p[1], p[2]])
-        masses = np.asarray(masses, dtype=float)
-        coords = np.asarray(coords, dtype=float)
-        m_tot = masses.sum()
+                coords[i, 0] = float(p[0])
+                coords[i, 1] = float(p[1])
+                coords[i, 2] = float(p[2])
+
+        if mode == "cog":
+            return coords.mean(axis=0)
+
+        # COM
+        if self.system is None:
+            raise RuntimeError("System has not been created yet; cannot compute COM.")
+
+        masses = np.empty((len(group),), dtype=float)
+        for i, idx in enumerate(group):
+            m = self.system.getParticleMass(int(idx))
+            # Quantity-like in dalton; we only need a unitless weight.
+            if hasattr(m, "value_in_unit") and hasattr(m, "unit"):
+                masses[i] = float(m.value_in_unit(m.unit))
+            else:
+                masses[i] = float(getattr(m, "_value", m))
+
+        m_tot = float(masses.sum())
         if m_tot == 0.0:
             raise ValueError("Total mass of group is zero; cannot compute COM.")
-        com = (masses[:, None] * coords).sum(axis=0) / m_tot
-        return com  # (x, y, z) in nm
+        return (masses[:, None] * coords).sum(axis=0) / m_tot
 
-    def set_umbrella_com(
+    def set_umbrella_center(
         self,
         group,
         *,
         k=10.0,
         target=None,  # single or per-group; see docstring
         periodic=False,
+        center="cog",
     ):
         """
-        Restrain the COM of one or more groups to fixed points.
+        Restrain the center (COM or COG) of one or more groups to fixed points.
 
         Parameters
         ----------
@@ -669,16 +738,21 @@ class MDSim:
             Force constant in kJ/mol/nm^2 (shared for all groups).
         target
             - None:
-                For each group, target is taken as its current COM.
+                For each group, target is taken as its current center.
             - Single (x,y,z) in nm (tuple/list) or 3-element Quantity:
                 Same target used for all groups.
             - Sequence of length 1 or n_groups:
                 Per-group targets; each element may be:
-                  * None  -> use current COM of that group
+                  * None  -> use current center of that group
                   * (x,y,z) in nm (tuple/list)
                   * 3-element Quantity with length units
         periodic
             If True and a periodic box is defined, enable PBC on the bias.
+        center
+            - cog:
+                Center of geometry (default)
+            - com
+                Center of mass
         """
         from collections.abc import Sequence
 
@@ -717,7 +791,7 @@ class MDSim:
             elif self.simulation is not None:
                 pos = self.simulation.context.getState(getPositions=True).getPositions()
             else:
-                raise RuntimeError("No positions available to define COM restraint reference.")
+                raise RuntimeError("No positions available to define center restraint reference.")
 
             if hasattr(pos, "value_in_unit"):
                 pos_nm_local = pos.value_in_unit(nanometer)
@@ -751,10 +825,10 @@ class MDSim:
         xyz_list = []
 
         if target is None:
-            # All targets from current COMs
+            # All targets from current centers
             pos_nm = _get_pos_nm()
             for g in groups:
-                xyz_list.append(self._compute_com(g, pos_nm))
+                xyz_list.append(self._compute_center(g, pos_nm, center=center))
         else:
             # target provided; could be:
             # - Quantity -> same for all groups
@@ -785,23 +859,30 @@ class MDSim:
                 for g, t in zip(groups, per_group):
                     if t is None:
                         pos_nm = _get_pos_nm()
-                        xyz_list.append(self._compute_com(g, pos_nm))
+                        xyz_list.append(self._compute_center(g, pos_nm, center=center))
                     else:
                         xyz_list.append(_norm_xyz(t))
 
         # --- define the CustomCentroidBondForce -----------------------------
-        bias = "0.5 * uk_com * ((x1 - x0)^2 + (y1 - y0)^2 + (z1 - z0)^2)"
+        bias = "0.5 * uk_center * ((x1 - x0)^2 + (y1 - y0)^2 + (z1 - z0)^2)"
         force = CustomCentroidBondForce(1, bias)
-        force.addGlobalParameter("uk_com", k * kilojoule / (mole * nanometer**2))
+        force.addGlobalParameter("uk_center", k * kilojoule / (mole * nanometer**2))
         force.addPerBondParameter("x0")
         force.addPerBondParameter("y0")
         force.addPerBondParameter("z0")
 
         # add groups
         group_ids = []
-        for g in groups:
-            gid = force.addGroup(g)
-            group_ids.append(gid)
+        if center.lower() == "cog":
+            for g in groups:
+                gid = force.addGroup(g, [1.0] * len(g))
+                group_ids.append(gid)
+        elif center.lower() == "com":
+            for g in groups:
+                gid = force.addGroup(g)
+                group_ids.append(gid)
+        else:
+            raise ValueError(f"Center option {center} is not valid.")
 
         # add one bond per group
         for gid, (x0, y0, z0) in zip(group_ids, xyz_list):
@@ -810,12 +891,12 @@ class MDSim:
         if self.box_vectors and periodic:
             force.setUsesPeriodicBoundaryConditions(True)
 
-        force.setName("Umbrella_COM")
+        force.setName("Umbrella_center")
         self.system.addForce(force)
 
-    def update_umbrella_com(self, k=10.0):
+    def update_umbrella_center(self, k=10.0):
         if self.system and self.simulation:
-            self.simulation.context.setParameter("uk_com", k * kilojoule / (mole * nanometer**2))
+            self.simulation.context.setParameter("uk_center", k * kilojoule / (mole * nanometer**2))
 
     def set_umbrella_angle_norm(
         self,
@@ -828,6 +909,7 @@ class MDSim:
         *,
         target=np.radians(0),
         k=10.0,
+        center="cog",
     ):
         """
         Harmonic umbrella on the angle between two plane normals (groups A and B).
@@ -882,12 +964,22 @@ class MDSim:
         force.addGlobalParameter("uk_angle_norm", k * kilojoule / (mole * radian**2))
 
         # group order: (A0, A1, A2, B0, B1, B2)
-        force.addGroup(groupa)
-        force.addGroup(groupa1)
-        force.addGroup(groupa2)
-        force.addGroup(groupb)
-        force.addGroup(groupb1)
-        force.addGroup(groupb2)
+        if center.lower() == "cog":
+            force.addGroup(groupa, [1.0] * len(groupa))
+            force.addGroup(groupa1, [1.0] * len(groupa1))
+            force.addGroup(groupa2, [1.0] * len(groupa2))
+            force.addGroup(groupb, [1.0] * len(groupb))
+            force.addGroup(groupb1, [1.0] * len(groupb1))
+            force.addGroup(groupb2, [1.0] * len(groupb2))
+        elif center.lower() == "com":
+            force.addGroup(groupa)
+            force.addGroup(groupa1)
+            force.addGroup(groupa2)
+            force.addGroup(groupb)
+            force.addGroup(groupb1)
+            force.addGroup(groupb2)
+        else:
+            raise ValueError(f"Center option {center} is not valid.")
 
         force.addBond([0, 1, 2, 3, 4, 5], [target * radian])
 
@@ -906,8 +998,10 @@ class MDSim:
         groupb,
         groupc,
         groupd,
+        *,
         target=0.0,
         k=10.0,
+        center="cog",
     ):
         """
         Harmonic umbrella on the dihedral angle between four centroids.
@@ -956,10 +1050,18 @@ class MDSim:
             self.system.addForce(force)
 
         # For each call, add new centroid groups + a new bond
-        idx_a = force.addGroup(groupa)
-        idx_b = force.addGroup(groupb)
-        idx_c = force.addGroup(groupc)
-        idx_d = force.addGroup(groupd)
+        if center.lower() == "cog":
+            idx_a = force.addGroup(groupa, [1.0] * len(groupa))
+            idx_b = force.addGroup(groupb, [1.0] * len(groupb))
+            idx_c = force.addGroup(groupc, [1.0] * len(groupc))
+            idx_d = force.addGroup(groupd, [1.0] * len(groupd))
+        elif center.lower() == "com":
+            idx_a = force.addGroup(groupa)
+            idx_b = force.addGroup(groupb)
+            idx_c = force.addGroup(groupc)
+            idx_d = force.addGroup(groupd)
+        else:
+            raise ValueError(f"Center option {center} is not valid.")
 
         force.addBond([idx_a, idx_b, idx_c, idx_d], [target * radian])
 
@@ -972,8 +1074,10 @@ class MDSim:
         groupa,
         groupb,
         groupc,
+        *,
         target=np.pi / 2.0,
         k=10.0,
+        center="cog",
     ):
         """
         Harmonic umbrellas on an angle defined by centroid triplets.
@@ -1006,9 +1110,16 @@ class MDSim:
             self.system.addForce(force)
 
         # For each call, add new centroid groups + a new bond
-        idx_a = force.addGroup(groupa)
-        idx_b = force.addGroup(groupb)
-        idx_c = force.addGroup(groupc)
+        if center.lower() == "cog":
+            idx_a = force.addGroup(groupa, [1.0] * len(groupa))
+            idx_b = force.addGroup(groupb, [1.0] * len(groupb))
+            idx_c = force.addGroup(groupc, [1.0] * len(groupc))
+        elif center.lower() == "com":
+            idx_a = force.addGroup(groupa)
+            idx_b = force.addGroup(groupb)
+            idx_c = force.addGroup(groupc)
+        else:
+            raise ValueError(f"Center option {center} is not valid.")
 
         force.addBond([idx_a, idx_b, idx_c], [target * radian])
 
