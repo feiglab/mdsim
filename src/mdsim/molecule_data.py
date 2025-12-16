@@ -797,10 +797,16 @@ class Structure:
 
     @property
     def model(self) -> Model:
-        """Return the first model (common for single-model files)."""
+        """Return the first model"""
         if not self.models:
             raise ValueError("Structure has no models")
         return self.models[0]
+
+    def get_model(self, model_index: int = 0) -> Model:
+        """Return a single model, default: first model"""
+        if not self.models:
+            raise ValueError("Structure has no models")
+        return self.models[model_index]
 
     def nchains(self) -> int:
         return self.models[0].nchains()
@@ -2453,7 +2459,7 @@ def load_dcd(
             f"DCD has {traj.n_atoms} atoms but template has {tmpl_model.natoms()} atoms"
         )
 
-    coords_nm = np.asarray(traj.xyz)
+    coords_nm = np.asarray(traj.xyz, dtype=np.float64)
 
     s = Structure()
     s._coords_nm = coords_nm
