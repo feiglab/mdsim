@@ -148,6 +148,7 @@ class MDSim:
         restart=None,
         positions=None,
         velocities=None,
+        resetvelocities=False,
         box=None,
         resources="CPU",
         device=None,
@@ -191,10 +192,15 @@ class MDSim:
 
         if self.positions:
             self.simulation.context.setPositions(self.positions)
-        if self.velocities:
-            self.simulation.context.setVelocities(self.velocities)
-        else:
+
+        if resetvelocities:
             self.set_velocities()
+        else:
+            if self.velocities:
+                self.simulation.context.setVelocities(self.velocities)
+            else:
+                self.set_velocities()
+
         if self.box_vectors:
             a, b, c = self.box_vectors
             self.simulation.context.setPeriodicBoxVectors(a, b, c)
