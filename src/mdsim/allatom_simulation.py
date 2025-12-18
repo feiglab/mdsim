@@ -1369,29 +1369,12 @@ class MDSim:
         if self.topology is not None:
             self.topology.setPeriodicBoxVectors((a_top, b_top, c_top))
 
-    def setup_forces(self) -> None:
-        self.forces = {}
-        if self.topology is not None:
-            if self.removecmmotion:
-                self.setupCMMotionRemover()
-            self.forcemapping = self.assign_force_groups()
-
     def setupCMMotionRemover(self) -> None:
         if self.topology is not None and self.removecmmotion:
             force = CMMotionRemover()
             force.setName("cmmotion")
             self.forces["cmmotion"] = force
             self.system.addForce(force)
-
-    def assign_force_groups(self):
-        mapping = {}
-        for i, frc in enumerate(self.system.getForces()):
-            frc.setForceGroup(i % 32)
-            name = frc.getName()
-            if not name:
-                name = frc.__class__.__name__
-            mapping[frc.getForceGroup()] = (i, name)
-        return mapping
 
     @staticmethod
     def _group_energy(context, group: int):
