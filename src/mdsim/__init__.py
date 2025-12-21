@@ -19,6 +19,9 @@ from .molecule_data import (
     load_dcd,
     summarize_topology,
 )
+from .solvation import (
+    solvate,
+)
 
 __all__ = [
     "__version__",
@@ -37,5 +40,6 @@ __all__ = [
     "harmonic_energy_angle",
     "harmonic_energy_dihedral",
     "load_dcd",
+    "solvate",
     "summarize_topology",
 ]

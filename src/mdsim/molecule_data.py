@@ -140,6 +140,31 @@ class Model:
     def natoms(self):
         return len(self.atoms)
 
+    def nominal_charge(self) -> int:
+        """Return the nominal net charge (integer) based on residue names.
+
+        Notes
+        -----
+        The PDB parser populates residues under `self.chain[...].residues`.  The
+        `self.residues` list is not guaranteed to be populated for all loaders,
+        so we iterate over `iter_residues()` for correctness.
+        """
+        charge_map = {
+            "LYS": 1,
+            "ARG": 1,
+            "HSP": 1,
+            "ASP": -1,
+            "GLU": -1,
+            "SOD": 1,
+            "CLA": -1,
+            "POT": 1,
+        }
+        q = 0
+        for r in self.iter_residues():
+            rn = (getattr(r, "resname", "") or "").strip().upper()
+            q += charge_map.get(rn, 0)
+        return int(q)
+
     def positions(self):
         """
         Return positions as an OpenMM Quantity[list[Vec3]].
@@ -413,7 +438,7 @@ class Model:
         center: str = "cog",
     ) -> tuple[float, float, float]:
         """
-        Internal: center (Å) for a flat list of atom indices in this model.
+        Internal: center (nm) for a flat list of atom indices in this model.
 
         center:
           - cog: center of geometry
@@ -433,27 +458,33 @@ class Model:
 
         idx_arr = np.asarray(indices, dtype=np.int64)
 
+        # Build coordinates in nm
         if self._has_parent_coords():
             coords_nm = self._parent._coords_nm[self._frame_index]  # type: ignore[union-attr]
-            coords_ang = coords_nm[idx_arr, :] * 10.0  # nm → Å
+            coords_nm = coords_nm[idx_arr, :]
         else:
-            coords_ang = np.array(
+            # static model stores Atom coords in Å -> nm
+            coords_nm = np.array(
                 [
-                    [float(self.atoms[i].x), float(self.atoms[i].y), float(self.atoms[i].z)]
+                    [
+                        float(self.atoms[i].x) / 10.0,
+                        float(self.atoms[i].y) / 10.0,
+                        float(self.atoms[i].z) / 10.0,
+                    ]
                     for i in idx_arr
                 ],
                 dtype=float,
             )
 
         if mode == "cog":
-            c = coords_ang.mean(axis=0)
+            c = coords_nm.mean(axis=0)
             return float(c[0]), float(c[1]), float(c[2])
 
         masses = np.array([self._atom_mass(self.atoms[i]) for i in idx_arr], dtype=float)
         m_tot = float(masses.sum())
         if m_tot == 0.0:
             raise ValueError("Total mass of group is zero; cannot compute COM.")
-        com = (masses[:, None] * coords_ang).sum(axis=0) / m_tot
+        com = (masses[:, None] * coords_nm).sum(axis=0) / m_tot
         return float(com[0]), float(com[1]), float(com[2])
 
     def distance(
@@ -470,10 +501,11 @@ class Model:
           - cog: center of geometry
           - com: center of mass
         """
-        A = self._group_center(group_a, center=center)  # Å
-        B = self._group_center(group_b, center=center)  # Å
-        dist_ang = float(np.linalg.norm(A - B))
-        return Quantity(dist_ang, angstrom).in_units_of(nanometer)
+        A = self.center(group_a, center=center).value_in_unit(nanometer)  # Quantity[nm]
+        B = self.center(group_b, center=center).value_in_unit(nanometer)  # Quantity[nm]
+        d = (A - B).value_in_unit(nanometer)
+        dist_nm = float(np.linalg.norm(d))
+        return Quantity(dist_nm, nanometer)
 
     def distance_vector(
         self,
@@ -489,35 +521,93 @@ class Model:
           - cog: center of geometry
           - com: center of mass
         """
-        A = self._group_center(group_a, center=center)  # Å
-        B = self._group_center(group_b, center=center)  # Å
-        d = A - B  # Å
+        A = self.center(group_a, center=center)  # Quantity[nm]
+        B = self.center(group_b, center=center)  # Quantity[nm]
+        d = (A - B).value_in_unit(nanometer)
 
-        vec_ang = Vec3(float(d[0]), float(d[1]), float(d[2])) * angstrom
-        return vec_ang.in_units_of(nanometer)
+        return Vec3(float(d[0]), float(d[1]), float(d[2])) * nanometer
 
-    def _group_center(
+    def center(
         self,
-        group: Union[list[int], list[list[int]]],
+        group: Optional[Union[list[int], list[list[int]]]] = None,
         *,
         center="cog",
-    ) -> np.ndarray:
+    ) -> Quantity:
         """
-        Center (Å) for a group of atoms, returned as a 3D numpy vector.
+        Center for a group of atoms, returned as an OpenMM Quantity in nm.
 
         center:
            - cog: center of geometry
            - com: center of mass
         """
 
-        flat = self._flatten_indices(group)
-        if not flat:
-            raise ValueError("group must contain at least one atom index")
+        if group is None:
+            flat = list(range(self.natoms()))
+        else:
+            flat = self._flatten_indices(group)
+            if not flat:
+                raise ValueError("group must contain at least one atom index")
 
         cx, cy, cz = self._center_of_group(flat, center=center)
-        return np.array((cx, cy, cz), dtype=float)
+        return Quantity(np.array((cx, cy, cz), dtype=float), nanometer)
 
     @staticmethod
+    @staticmethod
+    def _as_nm_vector(
+        v: Union[Quantity, Sequence[Union[Quantity, float, int, np.floating]], np.ndarray],
+    ) -> np.ndarray:
+        """Coerce translation vector into a (3,) float ndarray in nm.
+
+        Accepts:
+          - Quantity of length 3 (e.g., Vec3*unit, Quantity[list], Quantity[np.ndarray])
+          - Sequence of 3 Quantities (scalars)
+          - Sequence/ndarray of 3 numbers (assumed nm)
+        """
+        # Quantity vector (Vec3*unit or Quantity wrapping a 3-vector)
+        if isinstance(v, Quantity):
+            arr = np.asarray(v.value_in_unit(nanometer), dtype=float).reshape(3)
+            return arr
+
+        # Sequence (len 3): possibly scalars with units
+        if isinstance(v, (list, tuple, np.ndarray)):
+            if len(v) != 3:
+                raise ValueError(f"translate vector must have length 3, got {len(v)}")
+            if any(isinstance(x, Quantity) for x in v):
+                return np.array(
+                    [
+                        float(x.value_in_unit(nanometer)) if isinstance(x, Quantity) else float(x)
+                        for x in v
+                    ],
+                    dtype=float,
+                )
+            return np.array([float(x) for x in v], dtype=float)
+
+        raise TypeError(
+            "translate expects a 3-vector: Quantity, list of 3 Quantities, or 3 numbers (nm)"
+        )
+
+    def translate(
+        self,
+        v: Union[Quantity, Sequence[Union[Quantity, float, int, np.floating]], np.ndarray],
+    ) -> None:
+        """Translate coordinates by vector `v` (nm).
+
+        - Trajectory-backed models: shifts parent._coords_nm for this frame (in-place).
+        - Static models: shifts Atom coordinates stored in Å (in-place; nm->Å conversion).
+        """
+        dv_nm = self._as_nm_vector(v)  # (3,) float in nm
+
+        if self._has_parent_coords():
+            self._parent._coords_nm[self._frame_index] += dv_nm
+            return
+
+        # Static: internal atom coordinates are Å
+        dv_A = dv_nm * 10.0
+        for a in self.atoms:
+            a.x += float(dv_A[0])
+            a.y += float(dv_A[1])
+            a.z += float(dv_A[2])
+
     def _angle_between(u: np.ndarray, v: np.ndarray) -> float:
         """
         Angle between vectors u and v in radians.
@@ -582,13 +672,13 @@ class Model:
         which matches the CustomCentroidBondForce expression used in
         MDSim.set_umbrella_angle_norm.
         """
-        # centroids (Å)
-        A0 = self._group_center(group_a, center=center)
-        A1 = self._group_center(group_a1, center=center)
-        A2 = self._group_center(group_a2, center=center)
-        B0 = self._group_center(group_b, center=center)
-        B1 = self._group_center(group_b1, center=center)
-        B2 = self._group_center(group_b2, center=center)
+        # centroids (nm)
+        A0 = self.center(group_a, center=center).value_in_unit(nanometer)
+        A1 = self.center(group_a1, center=center).value_in_unit(nanometer)
+        A2 = self.center(group_a2, center=center).value_in_unit(nanometer)
+        B0 = self.center(group_b, center=center).value_in_unit(nanometer)
+        B1 = self.center(group_b1, center=center).value_in_unit(nanometer)
+        B2 = self.center(group_b2, center=center).value_in_unit(nanometer)
 
         # in-plane vectors
         vA1 = A1 - A0
@@ -630,10 +720,10 @@ class Model:
         Dihedral angle (radians, −π..π) between four centroids,
         matching set_umbrella_dihedral geometry.
         """
-        p1 = self._group_center(group_a, center=center)
-        p2 = self._group_center(group_b, center=center)
-        p3 = self._group_center(group_c, center=center)
-        p4 = self._group_center(group_d, center=center)
+        p1 = self.center(group_a, center=center).value_in_unit(nanometer)
+        p2 = self.center(group_b, center=center).value_in_unit(nanometer)
+        p3 = self.center(group_c, center=center).value_in_unit(nanometer)
+        p4 = self.center(group_d, center=center).value_in_unit(nanometer)
 
         angle = self._dihedral_angle(p1, p2, p3, p4)
         return Quantity(angle, radian)
@@ -654,9 +744,9 @@ class Model:
         -------
           theta = angle(group_a,  group_b,  group_c)
         """
-        A = self._group_center(group_a, center=center)
-        B = self._group_center(group_b, center=center)
-        C = self._group_center(group_c, center=center)
+        A = self.center(group_a, center=center).value_in_unit(nanometer)
+        B = self.center(group_b, center=center).value_in_unit(nanometer)
+        C = self.center(group_c, center=center).value_in_unit(nanometer).value_in_unit(nanometer)
 
         # angle(g1,g2,g3) = angle between (g1 - g2) and (g3 - g2)
         theta = self._angle_between(A - B, C - B)
@@ -817,6 +907,15 @@ class Structure:
     def natoms(self) -> int:
         return self.models[0].natoms()
 
+    def nominal_charge(self) -> int:
+        """Return the nominal net charge (integer) based on residue names.
+
+        Computed from the first model (self.models[0]).
+        """
+        if not self.models:
+            return 0
+        return self.models[0].nominal_charge()
+
     def nframes(self) -> int:
         if self._coords_nm is not None:
             return len(self._coords_nm)
@@ -932,6 +1031,84 @@ class Structure:
             n_sphere_points=n_sphere_points,
             radii=radii,
         )
+
+    def center(
+        self,
+        group: Optional[Union[list[int], list[list[int]]]] = None,
+        *,
+        center: str = "cog",
+    ) -> Quantity:
+        """
+        Centers (nm) for all models/frames.
+
+        Parameters
+        ----------
+        group
+            Atom indices (0-based) as a flat list or list-of-lists. If None, uses all atoms.
+        center
+            "cog" (center of geometry) or "com" (center of mass).
+
+        Returns
+        -------
+        Quantity
+            OpenMM Quantity with unit nm; value has shape (n_models, 3).
+            For an empty Structure, value shape is (0, 3).
+        """
+        if not self.models:
+            return Quantity(np.zeros((0, 3), dtype=float), nanometer)
+
+        mode = (center or "cog").lower()
+        if mode not in {"cog", "com"}:
+            raise ValueError(f"Center option {center} is not valid. Use 'cog' or 'com'.")
+
+        if group is None:
+            flat = list(range(self.natoms()))
+        else:
+            flat = Model._flatten_indices(group)  # type: ignore[attr-defined]
+            if not flat:
+                raise ValueError("group must contain at least one atom index")
+
+        n_atoms = self.natoms()
+        for idx in flat:
+            if idx < 0 or idx >= n_atoms:
+                msg = f"Atom index {idx} is out of range for structure with {n_atoms} atoms"
+                raise IndexError(msg)
+
+        idx_arr = np.asarray(flat, dtype=np.int64)
+
+        # Fast path for trajectory-backed structures: vectorized over frames
+        if self._coords_nm is not None:
+            coords_nm = self._coords_nm  # (n_frames, n_atoms, 3)
+            if mode == "cog":
+                return Quantity(coords_nm[:, idx_arr, :].mean(axis=1), nanometer)
+
+            atoms0 = self.models[0].atoms
+            masses = np.asarray([Model._atom_mass(atoms0[i]) for i in idx_arr], dtype=float)
+            m_tot = float(masses.sum())
+            if m_tot == 0.0:
+                raise ValueError("Total mass of group is zero; cannot compute COM.")
+            return Quantity(
+                (coords_nm[:, idx_arr, :] * masses[None, :, None]).sum(axis=1) / m_tot, nanometer
+            )
+
+        # Static / multi-model fallback
+        centers_nm = [m.center(flat, center=center).value_in_unit(nanometer) for m in self.models]
+        return Quantity(np.asarray(centers_nm, dtype=float), nanometer)
+
+    def translate(
+        self,
+        v: Union[Quantity, Sequence[Union[Quantity, float, int, np.floating]], np.ndarray],
+    ) -> None:
+        """Translate all models/frames by vector `v` (nm), in-place."""
+        dv_nm = Model._as_nm_vector(v)
+
+        if self._coords_nm is not None:
+            # shape (n_models, n_atoms, 3)
+            self._coords_nm = self._coords_nm + dv_nm.reshape(1, 1, 3)
+            return
+
+        for m in self.models:
+            m.translate(dv_nm)
 
     def distance(
         self,
