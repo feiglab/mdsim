@@ -503,8 +503,7 @@ class Model:
         """
         A = self.center(group_a, center=center).value_in_unit(nanometer)  # Quantity[nm]
         B = self.center(group_b, center=center).value_in_unit(nanometer)  # Quantity[nm]
-        d = (A - B).value_in_unit(nanometer)
-        dist_nm = float(np.linalg.norm(d))
+        dist_nm = float(np.linalg.norm(A - B))
         return Quantity(dist_nm, nanometer)
 
     def distance_vector(
@@ -608,6 +607,7 @@ class Model:
             a.y += float(dv_A[1])
             a.z += float(dv_A[2])
 
+    @staticmethod
     def _angle_between(u: np.ndarray, v: np.ndarray) -> float:
         """
         Angle between vectors u and v in radians.
@@ -746,7 +746,7 @@ class Model:
         """
         A = self.center(group_a, center=center).value_in_unit(nanometer)
         B = self.center(group_b, center=center).value_in_unit(nanometer)
-        C = self.center(group_c, center=center).value_in_unit(nanometer).value_in_unit(nanometer)
+        C = self.center(group_c, center=center).value_in_unit(nanometer)
 
         # angle(g1,g2,g3) = angle between (g1 - g2) and (g3 - g2)
         theta = self._angle_between(A - B, C - B)
