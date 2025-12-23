@@ -21,6 +21,32 @@ FileLike = Union[str, Path, io.BytesIO, io.StringIO]
 _ELEMENT_MASS_CACHE: dict[str, float] = {}
 
 
+_OPENMM_ELEMENT_CACHE: dict[str, element.Element] = {}
+
+
+def _canonical_element_symbol(sym: str) -> str:
+    key = _normalize_element_symbol(sym)
+    if not key:
+        return "C"
+    if len(key) == 1:
+        return key.upper()
+    return key[0].upper() + key[1:].lower()
+
+
+def _openmm_element(sym: str) -> element.Element:
+    key = _normalize_element_symbol(sym) or "C"
+    cached = _OPENMM_ELEMENT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    symbol = _canonical_element_symbol(key)
+    try:
+        el = element.Element.getBySymbol(symbol)
+    except Exception:
+        el = element.carbon
+    _OPENMM_ELEMENT_CACHE[key] = el
+    return el
+
+
 def _normalize_element_symbol(sym: str) -> str:
     sym = (sym or "").strip().upper()
     # common aliases that sometimes leak into element/resname fields
@@ -42,7 +68,7 @@ def _mass_from_element_symbol(sym: str) -> float:
     if cached is not None:
         return cached
     try:
-        el = element.Element.getBySymbol(key)
+        el = element.Element.getBySymbol(_canonical_element_symbol(key))
     except Exception:
         el = element.carbon
     m = el.mass
@@ -237,12 +263,7 @@ class Model:
                 idx_map: dict[str, int] = {}
 
                 for a in r.atoms:
-                    sym = (getattr(a, "element", "") or "").upper()
-                    try:
-                        el = element.Element.getBySymbol(sym)
-                    except Exception:
-                        el = element.carbon
-
+                    el = _openmm_element(getattr(a, "element", ""))
                     ta = top.addAtom(a.name, element=el, residue=res)
                     atom_id_to_top[id(a)] = ta
 
@@ -523,10 +544,6 @@ class Model:
                         name_map["O"] = name_map["OT1"]
                     if "OT2" in name_map and "OXT" not in name_map:
                         name_map["OXT"] = name_map["OT2"]
-                    add_pairs(name_map, (("N", "CA"), ("CA", "C"), ("C", "O")))
-                    if "OXT" in name_map:
-                        add_pairs(name_map, (("C", "OXT"),))
-
                     add_pairs(name_map, (("N", "CA"), ("CA", "C"), ("C", "O")))
                     if "OXT" in name_map:
                         add_pairs(name_map, (("C", "OXT"),))
@@ -955,7 +972,6 @@ class Model:
         return Quantity(np.array((cx, cy, cz), dtype=float), nanometer)
 
     @staticmethod
-    @staticmethod
     def _as_nm_vector(
         v: Union[Quantity, Sequence[Union[Quantity, float, int, np.floating]], np.ndarray],
     ) -> np.ndarray:
@@ -1239,6 +1255,7 @@ class Model:
         # MDTraj expects nm for radii; returns nm^2
         sasa_nm2 = md.shrake_rupley(
             traj,
+            probe_radius=float(probe_radius),
             n_sphere_points=int(n_sphere_points),
             mode="residue",
         )  # shape (1, n_residues)
@@ -1296,7 +1313,7 @@ class Structure:
             ncoord = len(self._coords_nm)
             return f"<Structure with {ncoord} coordinate frames>"
         else:
-            return f"<Structure with {lenmod} models"
+            return f"<Structure with {lenmod} models>"
 
     @property
     def model(self) -> Model:
@@ -1331,9 +1348,8 @@ class Structure:
 
     def nframes(self) -> int:
         if self._coords_nm is not None:
-            return len(self._coords_nm)
-        else:
-            return 0
+            return int(self._coords_nm.shape[0])
+        return len(self.models)
 
     def positions(self, model_index: int = 0):
         """Positions for the selected model as Quantity[list[Vec3]] in nm."""
@@ -1393,7 +1409,7 @@ class Structure:
         *,
         bonds: Optional[bool] = None,
         auto: Optional[bool] = True,
-        cutoff: Optional[float, Quantity] = 0.2 * nanometer,  # nm
+        cutoff: Union[float, Quantity] = 0.2 * nanometer,  # nm
     ) -> Topology:
         return self.models[0].topology(bonds=bonds, auto=auto, cutoff=cutoff)
 
@@ -1523,7 +1539,7 @@ class Structure:
 
         if self._coords_nm is not None:
             # shape (n_models, n_atoms, 3)
-            self._coords_nm = self._coords_nm + dv_nm.reshape(1, 1, 3)
+            self._coords_nm += dv_nm.reshape(1, 1, 3)
             return
 
         for m in self.models:
@@ -3068,7 +3084,7 @@ def load_dcd(
     Structure
         A Structure where each frame is a Model view; topology is only stored once.
     """
-    struct_ref, tmpl_model = _ensure_template_model(template)
+    _, tmpl_model = _ensure_template_model(template)
 
     # Build MDTraj topology from the template OpenMM topology
     top = md.Topology.from_openmm(tmpl_model.topology())
