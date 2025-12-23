@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import Sequence
 from math import floor, pi
 from typing import Optional
@@ -86,6 +87,7 @@ class MDSim:
         dispcorr=False,  #
         hmass=None,  # hydrogen mass repartioning, True (3 amu) or give value
         removecmmotion=False,  # remove center of mass motion
+        renamehis=None,  # rename histidines
     ):
 
         self.simulation = None
@@ -96,6 +98,7 @@ class MDSim:
         self.box_vectors = None
         self.stype = None
 
+        self.set_xmlff(ff)
         self.set_psf(psf)
         self.set_gmxtop(gmx)
         self.set_pdb(pdb)
@@ -103,7 +106,6 @@ class MDSim:
         self.set_crd(crd)
         self.set_gro(gro)
         self.set_charmmpar(par)
-        self.set_xmlff(ff)
         self.read_restart(restart)
 
         if box:
@@ -139,7 +141,7 @@ class MDSim:
         if xml:
             self.read_system(xml)
         else:
-            self.fix_topology()
+            self.fix_topology(renamehis=renamehis)
             self.setup_system()
 
     def setup_simulation(
@@ -302,6 +304,14 @@ class MDSim:
                 self.positions = self.pdb.positions
             if not self.topology:
                 self.topology = self.pdb.topology
+                if self.ff:
+                    nhis = 0
+                    for res in self.topology.residues():
+                        if res.name in {"HSE", "HSD"}:
+                            nhis += 1
+                    if nhis > 0:
+                        msg = f"\n{nhis} HSE/HSD residues in PDB. Setup with XML FF likely fails."
+                        warnings.warn(msg, UserWarning, stacklevel=2)
 
     def set_psf(self, fname):
         self.psf = None
@@ -377,8 +387,12 @@ class MDSim:
             self.velocities = state.getVelocities()
             self.box_vectors = state.getPeriodicBoxVectors()
 
-    def fix_topology(self):
+    def fix_topology(self, *, renamehis=False):
         if self.topology:
+            if renamehis:
+                for res in self.topology.residues():
+                    if res.name in {"HSE", "HSD"}:
+                        res.name = "HIS"
             for atom in self.topology.atoms():
                 if atom.name == "SOD":
                     atom.element = element.sodium

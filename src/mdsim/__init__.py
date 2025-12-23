@@ -16,6 +16,7 @@ from .molecule_data import (
     SelectionError,
     Structure,
     StructureSelector,
+    compare_topology,
     load_dcd,
     summarize_topology,
 )
@@ -41,5 +42,6 @@ __all__ = [
     "harmonic_energy_dihedral",
     "load_dcd",
     "solvate",
+    "compare_topology",
     "summarize_topology",
 ]

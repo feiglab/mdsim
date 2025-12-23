@@ -180,20 +180,424 @@ class Model:
         vecs = [Vec3(a.x, a.y, a.z) for a in self.atoms]
         return Quantity(vecs, angstrom).in_units_of(nanometer)
 
-    def topology(self):
+    def topology(
+        self,
+        *,
+        bonds: Optional[bool] = None,
+        auto: Optional[bool] = True,
+        cutoff: Union[float, Quantity] = 0.2 * nanometer,
+        disulfide_cutoff: Union[float, Quantity] = 0.25 * nanometer,
+    ) -> Topology:
+        """Build an OpenMM Topology for this model.
+
+        Bonding rules:
+          - Standard amino acids: rule-based heavy-atom connectivity.
+          - Histidine variants: HIS/HSD/HSE/HSP are supported.
+          - Peptide bonds: C(i) -- N(i+1) within each chain.
+          - Disulfides: SG--SG added by distance.
+          - Ions: no bonds.
+          - Water (TIP3/SPC/TIP4/HOH/WAT): bonds only within each residue.
+          - Unknown residues: if auto=True, bonds are inferred by distance cutoff
+            within the residue and to immediate neighbors in the same chain.
+        """
         top = Topology()
+
+        do_bonds = True if bonds is None else bool(bonds)
+        do_auto = True if auto is None else bool(auto)
+
+        def _to_nm(val: Union[float, Quantity]) -> float:
+            if isinstance(val, Quantity):
+                return float(val.value_in_unit(nanometer))
+            return float(val)
+
+        cutoff_nm = _to_nm(cutoff)
+        disulf_nm = _to_nm(disulfide_cutoff)
+        h_cutoff_nm = 0.15  # nm, generous X-H covalent upper bound
+
+        natoms = self.natoms()
+        atom_id_to_idx = {id(a): i for i, a in enumerate(self.atoms)}
+
+        if natoms == 0:
+            coords_nm = np.zeros((0, 3), dtype=float)
+        elif self._has_parent_coords():
+            coords_nm = np.asarray(self._parent._coords_nm[self._frame_index], dtype=float)
+        else:
+            coords_nm = np.asarray([[a.x, a.y, a.z] for a in self.atoms], dtype=float) / 10.0
+
+        atom_id_to_top: dict[int, Any] = {}
+        res_id_to_atoms: dict[int, dict[str, Any]] = {}
+        res_id_to_idx_by_name: dict[int, dict[str, int]] = {}
+
         for c in self.chains():
             chain = top.addChain(c.key_id)
             for r in c.residues:
-                rname = r.resname
-                res = top.addResidue(rname, chain)
+                res_id = str(int(r.resnum))
+                res = top.addResidue(r.resname, chain, id=res_id)
+                name_map: dict[str, Any] = {}
+                idx_map: dict[str, int] = {}
+
                 for a in r.atoms:
                     sym = (getattr(a, "element", "") or "").upper()
                     try:
                         el = element.Element.getBySymbol(sym)
                     except Exception:
                         el = element.carbon
-                    top.addAtom(a.name, element=el, residue=res)
+
+                    ta = top.addAtom(a.name, element=el, residue=res)
+                    atom_id_to_top[id(a)] = ta
+
+                    an = (a.name or "").strip().upper()
+                    if an:
+                        name_map[an] = ta
+                        ai = atom_id_to_idx.get(id(a))
+                        if ai is not None:
+                            idx_map[an] = ai
+
+                res_id_to_atoms[id(r)] = name_map
+                res_id_to_idx_by_name[id(r)] = idx_map
+
+        if not do_bonds:
+            return top
+
+        bond_set: set[tuple[int, int]] = set()
+
+        def add_bond(a1: Any, a2: Any) -> None:
+            i = int(a1.index)
+            j = int(a2.index)
+            if i == j:
+                return
+            if i > j:
+                i, j = j, i
+            key = (i, j)
+            if key in bond_set:
+                return
+            top.addBond(a1, a2)
+            bond_set.add(key)
+
+        water_res = {"TIP3", "SPC", "TIP4", "HOH", "WAT"}
+        ion_res = {"SOD", "POT", "CLA", "MG", "NA", "CL", "K"}
+
+        aa_res = {
+            "ALA",
+            "ARG",
+            "ASN",
+            "ASP",
+            "CYS",
+            "GLN",
+            "GLU",
+            "GLY",
+            "HIS",
+            "HSD",
+            "HSE",
+            "HSP",
+            "ILE",
+            "LEU",
+            "LYS",
+            "MET",
+            "PHE",
+            "PRO",
+            "SER",
+            "THR",
+            "TRP",
+            "TYR",
+            "VAL",
+        }
+
+        aa_side_bonds: dict[str, tuple[tuple[str, str], ...]] = {
+            "ALA": (("CA", "CB"),),
+            "ARG": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "CD"),
+                ("CD", "NE"),
+                ("NE", "CZ"),
+                ("CZ", "NH1"),
+                ("CZ", "NH2"),
+            ),
+            "ASN": (("CA", "CB"), ("CB", "CG"), ("CG", "OD1"), ("CG", "ND2")),
+            "ASP": (("CA", "CB"), ("CB", "CG"), ("CG", "OD1"), ("CG", "OD2")),
+            "CYS": (("CA", "CB"), ("CB", "SG")),
+            "GLN": (("CA", "CB"), ("CB", "CG"), ("CG", "CD"), ("CD", "OE1"), ("CD", "NE2")),
+            "GLU": (("CA", "CB"), ("CB", "CG"), ("CG", "CD"), ("CD", "OE1"), ("CD", "OE2")),
+            "GLY": (),
+            "HIS": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "ND1"),
+                ("ND1", "CE1"),
+                ("CE1", "NE2"),
+                ("NE2", "CD2"),
+                ("CD2", "CG"),
+            ),
+            "HSD": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "ND1"),
+                ("ND1", "CE1"),
+                ("CE1", "NE2"),
+                ("NE2", "CD2"),
+                ("CD2", "CG"),
+            ),
+            "HSE": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "ND1"),
+                ("ND1", "CE1"),
+                ("CE1", "NE2"),
+                ("NE2", "CD2"),
+                ("CD2", "CG"),
+            ),
+            "HSP": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "ND1"),
+                ("ND1", "CE1"),
+                ("CE1", "NE2"),
+                ("NE2", "CD2"),
+                ("CD2", "CG"),
+            ),
+            "ILE": (("CA", "CB"), ("CB", "CG1"), ("CB", "CG2"), ("CG1", "CD1")),
+            "LEU": (("CA", "CB"), ("CB", "CG"), ("CG", "CD1"), ("CG", "CD2")),
+            "LYS": (("CA", "CB"), ("CB", "CG"), ("CG", "CD"), ("CD", "CE"), ("CE", "NZ")),
+            "MET": (("CA", "CB"), ("CB", "CG"), ("CG", "SD"), ("SD", "CE")),
+            "PHE": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "CD1"),
+                ("CG", "CD2"),
+                ("CD1", "CE1"),
+                ("CD2", "CE2"),
+                ("CE1", "CZ"),
+                ("CE2", "CZ"),
+            ),
+            "PRO": (("CA", "CB"), ("CB", "CG"), ("CG", "CD"), ("CD", "N")),
+            "SER": (("CA", "CB"), ("CB", "OG")),
+            "THR": (("CA", "CB"), ("CB", "OG1"), ("CB", "CG2")),
+            "TRP": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "CD1"),
+                ("CG", "CD2"),
+                ("CD1", "NE1"),
+                ("NE1", "CE2"),
+                ("CE2", "CD2"),
+                ("CE2", "CZ2"),
+                ("CZ2", "CH2"),
+                ("CH2", "CZ3"),
+                ("CZ3", "CE3"),
+                ("CE3", "CD2"),
+            ),
+            "TYR": (
+                ("CA", "CB"),
+                ("CB", "CG"),
+                ("CG", "CD1"),
+                ("CG", "CD2"),
+                ("CD1", "CE1"),
+                ("CD2", "CE2"),
+                ("CE1", "CZ"),
+                ("CE2", "CZ"),
+                ("CZ", "OH"),
+            ),
+            "VAL": (("CA", "CB"), ("CB", "CG1"), ("CB", "CG2")),
+        }
+
+        def add_pairs(name_map: dict[str, Any], pairs: tuple[tuple[str, str], ...]) -> None:
+            for n1, n2 in pairs:
+                a1 = name_map.get(n1)
+                a2 = name_map.get(n2)
+                if a1 is None or a2 is None:
+                    continue
+                add_bond(a1, a2)
+
+        def residue_indices(idx_map: dict[str, int]) -> list[int]:
+            return [int(i) for i in idx_map.values()]
+
+        def add_hydrogen_bonds(idx_list: list[int]) -> None:
+            if not idx_list:
+                return
+            heavy = [i for i in idx_list if not _is_hydrogen(self.atoms[i])]
+            if not heavy:
+                return
+            heavy_arr = np.asarray(heavy, dtype=np.int64)
+            heavy_xyz = coords_nm[heavy_arr, :]
+
+            for hi in idx_list:
+                if not _is_hydrogen(self.atoms[hi]):
+                    continue
+                d = heavy_xyz - coords_nm[hi]
+                dist2 = np.einsum("ij,ij->i", d, d)
+                k = int(dist2.argmin())
+                if float(dist2[k]) > (h_cutoff_nm * h_cutoff_nm):
+                    continue
+                parent = int(heavy_arr[k])
+                a1 = atom_id_to_top.get(id(self.atoms[hi]))
+                a2 = atom_id_to_top.get(id(self.atoms[parent]))
+                if a1 is None or a2 is None:
+                    continue
+                add_bond(a1, a2)
+
+        def add_heavy_bonds_by_cutoff(idx_list: list[int], cutoff_nm_: float) -> None:
+            heavy = [i for i in idx_list if not _is_hydrogen(self.atoms[i])]
+            if len(heavy) < 2:
+                return
+            idx = np.asarray(heavy, dtype=np.int64)
+            xyz = coords_nm[idx, :]
+            diff = xyz[:, None, :] - xyz[None, :, :]
+            dist2 = np.einsum("ijk,ijk->ij", diff, diff)
+            cut2 = float(cutoff_nm_ * cutoff_nm_)
+            mask = np.triu(dist2 <= cut2, 1)
+            ii, jj = np.where(mask)
+            for a, b in zip(ii.tolist(), jj.tolist()):
+                ai = int(idx[a])
+                bj = int(idx[b])
+                ta = atom_id_to_top.get(id(self.atoms[ai]))
+                tb = atom_id_to_top.get(id(self.atoms[bj]))
+                if ta is None or tb is None:
+                    continue
+                add_bond(ta, tb)
+
+        def add_cross_heavy_bonds(
+            idx_a: list[int],
+            idx_b: list[int],
+            cutoff_nm_: float,
+        ) -> None:
+            a = [i for i in idx_a if not _is_hydrogen(self.atoms[i])]
+            b = [i for i in idx_b if not _is_hydrogen(self.atoms[i])]
+            if not a or not b:
+                return
+            ia = np.asarray(a, dtype=np.int64)
+            ib = np.asarray(b, dtype=np.int64)
+            xa = coords_nm[ia, :]
+            xb = coords_nm[ib, :]
+            diff = xa[:, None, :] - xb[None, :, :]
+            dist2 = np.einsum("ijk,ijk->ij", diff, diff)
+            cut2 = float(cutoff_nm_ * cutoff_nm_)
+            ii, jj = np.where(dist2 <= cut2)
+            for i0, j0 in zip(ii.tolist(), jj.tolist()):
+                ai = int(ia[i0])
+                bj = int(ib[j0])
+                ta = atom_id_to_top.get(id(self.atoms[ai]))
+                tb = atom_id_to_top.get(id(self.atoms[bj]))
+                if ta is None or tb is None:
+                    continue
+                add_bond(ta, tb)
+
+        # Intra-residue bonds
+        for c in self.chains():
+            for r in c.residues:
+                rn = (r.resname or "").strip().upper()
+                name_map = res_id_to_atoms.get(id(r), {})
+                idx_map = res_id_to_idx_by_name.get(id(r), {})
+
+                # ILE sometimes appears with CD (instead of CD1) in PDBs.
+                # Treat CD and CD1 as aliases so the ILE template bonds apply.
+                if rn == "ILE":
+                    if "CD" in name_map and "CD1" not in name_map:
+                        name_map["CD1"] = name_map["CD"]
+                    elif "CD1" in name_map and "CD" not in name_map:
+                        name_map["CD"] = name_map["CD1"]
+
+                    if "CD" in idx_map and "CD1" not in idx_map:
+                        idx_map["CD1"] = idx_map["CD"]
+                    elif "CD1" in idx_map and "CD" not in idx_map:
+                        idx_map["CD"] = idx_map["CD1"]
+
+                idxs = residue_indices(idx_map)
+
+                if rn in ion_res:
+                    continue
+
+                if rn in water_res:
+                    o = name_map.get("O") or name_map.get("OH2") or name_map.get("OW")
+                    if o is None:
+                        continue
+                    for hname in ("H1", "H2", "HW1", "HW2"):
+                        h = name_map.get(hname)
+                        if h is not None:
+                            add_bond(o, h)
+                    continue
+
+                if rn in aa_res:
+                    # C-terminus alternate oxygen naming: OT1/OT2 ~ O/OXT.
+                    if "OT1" in name_map and "O" not in name_map:
+                        name_map["O"] = name_map["OT1"]
+                    if "OT2" in name_map and "OXT" not in name_map:
+                        name_map["OXT"] = name_map["OT2"]
+                    add_pairs(name_map, (("N", "CA"), ("CA", "C"), ("C", "O")))
+                    if "OXT" in name_map:
+                        add_pairs(name_map, (("C", "OXT"),))
+
+                    add_pairs(name_map, (("N", "CA"), ("CA", "C"), ("C", "O")))
+                    if "OXT" in name_map:
+                        add_pairs(name_map, (("C", "OXT"),))
+                    add_pairs(name_map, aa_side_bonds.get(rn, ()))
+                    add_hydrogen_bonds(idxs)
+                    continue
+
+                if do_auto:
+                    add_heavy_bonds_by_cutoff(idxs, cutoff_nm)
+                    add_hydrogen_bonds(idxs)
+
+        # Inter-residue bonds (only previous/next in chain)
+        for c in self.chains():
+            res_list = list(c.residues)
+            for i in range(len(res_list) - 1):
+                r0 = res_list[i]
+                r1 = res_list[i + 1]
+
+                rn0 = (r0.resname or "").strip().upper()
+                rn1 = (r1.resname or "").strip().upper()
+                if rn0 in ion_res or rn1 in ion_res:
+                    continue
+                if rn0 in water_res or rn1 in water_res:
+                    continue
+
+                m0 = res_id_to_atoms.get(id(r0), {})
+                m1 = res_id_to_atoms.get(id(r1), {})
+
+                if rn0 in aa_res and rn1 in aa_res:
+                    c_atom = m0.get("C")
+                    n_atom = m1.get("N")
+                    if c_atom is not None and n_atom is not None:
+                        add_bond(c_atom, n_atom)
+                    continue
+
+                if not do_auto:
+                    continue
+
+                known0 = rn0 in aa_res
+                known1 = rn1 in aa_res
+                if known0 and known1:
+                    continue
+
+                idx0 = residue_indices(res_id_to_idx_by_name.get(id(r0), {}))
+                idx1 = residue_indices(res_id_to_idx_by_name.get(id(r1), {}))
+                add_cross_heavy_bonds(idx0, idx1, cutoff_nm)
+
+        # Disulfide bonds by distance (SG--SG)
+        sg_list: list[tuple[int, Any]] = []
+        for r in self.iter_residues():
+            rn = (r.resname or "").strip().upper()
+            if rn in ion_res or rn in water_res:
+                continue
+            name_map = res_id_to_atoms.get(id(r), {})
+            idx_map = res_id_to_idx_by_name.get(id(r), {})
+            sg = name_map.get("SG")
+            sgi = idx_map.get("SG")
+            if sg is None or sgi is None:
+                continue
+            sg_list.append((int(sgi), sg))
+
+        if len(sg_list) >= 2:
+            sg_idx = np.asarray([i for i, _ in sg_list], dtype=np.int64)
+            sg_xyz = coords_nm[sg_idx, :]
+            n = len(sg_list)
+            for i in range(n - 1):
+                for j in range(i + 1, n):
+                    d = sg_xyz[i] - sg_xyz[j]
+                    if float(np.dot(d, d)) <= float(disulf_nm * disulf_nm):
+                        add_bond(sg_list[i][1], sg_list[j][1])
+
         return top
 
     @staticmethod
@@ -844,7 +1248,13 @@ class Model:
 
     # --- I/O helpers ---------------------------------------------------------
 
-    def write_pdb(self, file: FileLike, *, model_records: Optional[bool] = None) -> None:
+    def write_pdb(
+        self,
+        file: FileLike,
+        *,
+        model_records: Optional[bool] = None,
+        allhis: bool = False,
+    ) -> None:
         """
         Write this Model to a PDB file.
 
@@ -856,9 +1266,12 @@ class Model:
             If None (default), do not emit MODEL/ENDMDL for this single model.
             If True, wrap this model in MODEL/ENDMDL.
             If False, never emit MODEL/ENDMDL.
+        allhis : bool, optional
+            If True, write all histidine variants (HIS/HSD/HSE/HSP) with residue
+            name "HIS" in the output PDB. Does not modify the Model.
         """
         writer = PDBWriter()
-        writer.write(self, file, model_records=model_records)
+        writer.write(self, file, model_records=model_records, allhis=allhis)
 
 
 @dataclass
@@ -975,8 +1388,14 @@ class Structure:
             masses, atom_indices=atom_indices, assume_unit=assume_unit
         )
 
-    def topology(self):
-        return self.models[0].topology()
+    def topology(
+        self,
+        *,
+        bonds: Optional[bool] = None,
+        auto: Optional[bool] = True,
+        cutoff: Optional[float, Quantity] = 0.2 * nanometer,  # nm
+    ) -> Topology:
+        return self.models[0].topology(bonds=bonds, auto=auto, cutoff=cutoff)
 
     def select_CA(self) -> Structure:
         """Apply CA selection to each model; return a new Structure."""
@@ -1309,7 +1728,13 @@ class Structure:
 
     # --- I/O helpers ---------------------------------------------------------
 
-    def write_pdb(self, file: FileLike, *, model_records: Optional[bool] = None) -> None:
+    def write_pdb(
+        self,
+        file: FileLike,
+        *,
+        model_records: Optional[bool] = None,
+        allhis: bool = False,
+    ) -> None:
         """
         Write this Structure to a PDB file.
 
@@ -1317,7 +1742,7 @@ class Structure:
         multi-model PDB is written using MODEL/ENDMDL records for each model.
         """
         writer = PDBWriter()
-        writer.write(self, file, model_records=model_records)
+        writer.write(self, file, model_records=model_records, allhis=allhis)
 
 
 # --- Parser ------------------------------------------------------------------
@@ -1554,6 +1979,7 @@ class PDBWriter:
         file: FileLike,
         *,
         model_records: Optional[bool] = None,
+        allhis: bool = False,
     ) -> None:
         """
         Write a Structure or Model to PDB.
@@ -1592,7 +2018,7 @@ class PDBWriter:
                         model_id = frame_index + 1
                     sink.write_line(f"MODEL     {model_id:4d}")
 
-                self._write_model_atoms(m, sink)
+                self._write_model_atoms(m, sink, allhis=allhis)
 
                 if use_model_records:
                     sink.write_line("ENDMDL")
@@ -1602,7 +2028,12 @@ class PDBWriter:
             sink.close()
 
     @staticmethod
-    def _write_model_atoms(model: Model, sink: _PDBTextSink) -> None:
+    def _write_model_atoms(
+        model: Model,
+        sink: _PDBTextSink,
+        *,
+        allhis: bool = False,
+    ) -> None:
         """
         Write all ATOM records for a single Model.
 
@@ -1635,8 +2066,17 @@ class PDBWriter:
                     serial = atom_serial if atom_serial > 0 else serial_counter
                     serial_counter += 1
 
-                    name = (atom.name or "")[:4]
-                    resname = (atom.resname or "")[:4]
+                    raw_name = (atom.name or "").strip()
+                    name = raw_name[:4]
+                    if len(name) <= 3:
+                        name_field = f" {name:<3s}"
+                    else:
+                        name_field = f"{name:<4s}"
+                    resname_raw = (atom.resname or "").strip().upper()
+                    if allhis and resname_raw in {"HIS", "HSD", "HSE", "HSP"}:
+                        resname = "HIS"
+                    else:
+                        resname = resname_raw[:4]
                     chain_id = (atom.chain or " ")[:1]
                     seg = (atom.seg or "")[:4]
                     # element = (atom.element or "")[:2].upper()
@@ -1645,12 +2085,12 @@ class PDBWriter:
 
                     if int(serial) < 100000:
                         line = (
-                            "{:<6s}{:>5d} {:<4s}{:1s}{:<4s}{:1s}{:>4d}{:1s}"
+                            "{:<6s}{:>5d} {}{:1s}{:<4s}{:1s}{:>4d}{:1s}"
                             "   {:>8.3f}{:>8.3f}{:>8.3f}{:>6.2f}{:>6.2f}      {:>4s}"
                         ).format(
                             "ATOM",
                             int(serial),
-                            name,
+                            name_field,
                             "",  # altLoc
                             resname,
                             chain_id,
@@ -1665,11 +2105,11 @@ class PDBWriter:
                         )
                     else:
                         line = (
-                            "{:<6s}***** {:<4s}{:1s}{:<4s}{:1s}{:>4d}{:1s}"
+                            "{:<6s}***** {}{:1s}{:<4s}{:1s}{:>4d}{:1s}"
                             "   {:>8.3f}{:>8.3f}{:>8.3f}{:>6.2f}{:>6.2f}      {:>4s}"
                         ).format(
                             "ATOM",
-                            name,
+                            name_field,
                             "",  # altLoc
                             resname,
                             chain_id,
@@ -1826,6 +2266,7 @@ _AMINO_ACID_RESNAMES: set[str] = {
     "HIS",
     "HSD",
     "HSE",
+    "HSP",
     "ILE",
     "LEU",
     "LYS",
@@ -1840,15 +2281,20 @@ _AMINO_ACID_RESNAMES: set[str] = {
 }
 
 # Simple solvent/ion classes.
-_WATER_RESNAMES: set[str] = {"HOH", "TIP3", "WAT", "SPC"}
+_WATER_RESNAMES: set[str] = {"HOH", "TIP3", "WAT", "SPC", "TIP4"}
 _ION_RESNAMES: set[str] = {"SOD", "POT", "CLA", "MG", "NA"}
 
 
 def _is_hydrogen(atom: Atom) -> bool:
     """Return True if this atom should be treated as hydrogen.
 
-    Uses both the deduced element and common PDB atom-name patterns
-    (H*, ?H*), to be robust against imperfect element assignment.
+    Uses both the deduced element and common PDB atom-name patterns (H*, 1H*, 2H*, ...)
+    to be robust against imperfect element assignment.
+
+    Notes
+    -----
+    Do *not* treat names like "NH1" or "OH2" as hydrogens; only digit-prefixed
+    patterns (e.g. "1H", "2H") are considered in the second-character rule.
     """
     name = (atom.name or "").strip().upper()
     if not name:
@@ -1856,10 +2302,9 @@ def _is_hydrogen(atom: Atom) -> bool:
     el = (getattr(atom, "element", "") or "").upper()
     if el == "H":
         return True
-    # H*, 1H*, 2H*, etc.
     if name[0] == "H":
         return True
-    if len(name) >= 2 and name[1] == "H":
+    if len(name) >= 2 and name[0].isdigit() and name[1] == "H":
         return True
     return False
 
@@ -2733,5 +3178,499 @@ def summarize_topology(
 
         if len(bonds) > max_bonds:
             lines.append(f"  ... ({len(bonds) - max_bonds} more bonds not shown)")
+
+    return "\n".join(lines)
+
+
+def compare_topology(
+    top_a: Topology,
+    top_b: Topology,
+    *,
+    max_items: int = 200,
+) -> str:
+    """
+    Compare two OpenMM Topology objects.
+
+    Comparison rules
+    ----------------
+    - Chain IDs are ignored for chain equality, but reported separately.
+    - Chains differ only if number of residues or atoms differs.
+    - Residues differ only if residue name or number of atoms differs.
+    - Atom diffs are reported by atom-name count changes within matching residues.
+    - Bonds are compared by labeled atom paths using chain/residue indices and
+      atom names (chain/residue IDs are ignored).
+
+    Output
+    ------
+    1) Summary counts (chains, residues, atoms, bonds) for both.
+    2) Diff-style sections for chains, residues, atoms, and bonds.
+       - removed: '-' lines
+       - added:   '+' lines
+       - changed: '~' lines, compact "a -> b" format
+    """
+    if max_items <= 0:
+        raise ValueError("max_items must be > 0")
+
+    def _counts(t: Topology) -> tuple[int, int, int, int]:
+        return (
+            int(t.getNumChains()),
+            int(t.getNumResidues()),
+            int(t.getNumAtoms()),
+            int(t.getNumBonds()),
+        )
+
+    def _chain_id(ch: Any) -> str:
+        cid = getattr(ch, "id", None)
+        s = str(cid) if cid is not None else ""
+        return s.strip()
+
+    def _norm_name(v: Any) -> str:
+        return (str(v) if v is not None else "").strip().upper()
+
+    def _name_counts(names: list[str]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for n in names:
+            out[n] = out.get(n, 0) + 1
+        return out
+
+    def _chain_counts(ch: Any) -> tuple[int, int]:
+        residues = list(ch.residues())
+        n_res = len(residues)
+        n_atoms = sum(sum(1 for _ in r.atoms()) for r in residues)
+        return int(n_res), int(n_atoms)
+
+    def _res_counts(res: Any) -> tuple[str, int]:
+        rname = _norm_name(getattr(res, "name", ""))
+        n_atoms = sum(1 for _ in res.atoms())
+        return rname, int(n_atoms)
+
+    def _res_atom_counts(res: Any) -> dict[str, int]:
+        names = [_norm_name(getattr(a, "name", "")) for a in res.atoms()]
+        return _name_counts(names)
+
+    def _atom_labels(t: Topology) -> dict[int, str]:
+        labels: dict[int, str] = {}
+        for ci, ch in enumerate(t.chains()):
+            for ri, res in enumerate(ch.residues()):
+                rname = _norm_name(getattr(res, "name", ""))
+                seen: dict[str, int] = {}
+                for a in res.atoms():
+                    aname = _norm_name(getattr(a, "name", ""))
+                    seen[aname] = seen.get(aname, 0) + 1
+                    suf = f"#{seen[aname]}" if seen[aname] > 1 else ""
+                    labels[int(a.index)] = f"c{ci}:r{ri}:{rname}:{aname}{suf}"
+        return labels
+
+    def _bond_set(t: Topology, labels: dict[int, str]) -> set[str]:
+        out: set[str] = set()
+        for a1, a2 in t.bonds():
+            l1 = labels.get(int(a1.index))
+            l2 = labels.get(int(a2.index))
+            if l1 is None or l2 is None:
+                continue
+            out.add(f"{l1} -- {l2}" if l1 <= l2 else f"{l2} -- {l1}")
+        return out
+
+    a_counts = _counts(top_a)
+    b_counts = _counts(top_b)
+
+    lines: list[str] = []
+    lines.append(
+        "Topology 1: "
+        f"{a_counts[0]} chains, {a_counts[1]} residues, "
+        f"{a_counts[2]} atoms, {a_counts[3]} bonds"
+    )
+    lines.append(
+        "Topology 2: "
+        f"{b_counts[0]} chains, {b_counts[1]} residues, "
+        f"{b_counts[2]} atoms, {b_counts[3]} bonds"
+    )
+    lines.append(
+        "Delta (2 - 1): "
+        f"{b_counts[0] - a_counts[0]} chains, "
+        f"{b_counts[1] - a_counts[1]} residues, "
+        f"{b_counts[2] - a_counts[2]} atoms, "
+        f"{b_counts[3] - a_counts[3]} bonds"
+    )
+
+    chains_a = list(top_a.chains())
+    chains_b = list(top_b.chains())
+    n_common = min(len(chains_a), len(chains_b))
+
+    # ---- Chains ---------------------------------------------------------
+    removed_ch = list(range(n_common, len(chains_a)))
+    added_ch = list(range(n_common, len(chains_b)))
+
+    cnt_a = [_chain_counts(ch) for ch in chains_a]
+    cnt_b = [_chain_counts(ch) for ch in chains_b]
+    changed_ch = [
+        i for i in range(n_common) if (cnt_a[i][0] != cnt_b[i][0]) or (cnt_a[i][1] != cnt_b[i][1])
+    ]
+
+    id_changed = [i for i in range(n_common) if _chain_id(chains_a[i]) != _chain_id(chains_b[i])]
+
+    lines.append("\nChains:")
+    lines.append(f"  removed={len(removed_ch)}, added={len(added_ch)}, changed={len(changed_ch)}")
+
+    shown = 0
+    for i in removed_ch:
+        if shown >= max_items:
+            break
+        cid = _chain_id(chains_a[i]) or "''"
+        nres, nat = cnt_a[i]
+        lines.append(f"- Chain {i}: residues={nres}, atoms={nat}, id={cid}")
+        shown += 1
+
+    for i in added_ch:
+        if shown >= max_items:
+            break
+        cid = _chain_id(chains_b[i]) or "''"
+        nres, nat = cnt_b[i]
+        lines.append(f"+ Chain {i}: residues={nres}, atoms={nat}, id={cid}")
+        shown += 1
+
+    for i in changed_ch:
+        if shown >= max_items:
+            break
+        a_res, a_at = cnt_a[i]
+        b_res, b_at = cnt_b[i]
+        parts: list[str] = []
+        if a_res != b_res:
+            parts.append(f"residues {a_res}->{b_res}")
+        if a_at != b_at:
+            parts.append(f"atoms {a_at}->{b_at}")
+        change = ", ".join(parts) if parts else "no count changes"
+        lines.append(f"~ Chain {i}: {change}")
+        shown += 1
+
+    total_chain_diffs = len(removed_ch) + len(added_ch) + len(changed_ch)
+    if total_chain_diffs > max_items:
+        lines.append(f"  ... ({total_chain_diffs - max_items} more chain diffs not shown)")
+
+    lines.append("\nChain ID differences (ignored for chain equality):")
+    if not id_changed:
+        lines.append("  (no chain ID differences)")
+    else:
+        shown = 0
+        for i in id_changed:
+            if shown >= max_items:
+                break
+            a_id = _chain_id(chains_a[i]) or "''"
+            b_id = _chain_id(chains_b[i]) or "''"
+            lines.append(f"  ~ Chain {i}: id {a_id} -> {b_id}")
+            shown += 1
+        if len(id_changed) > max_items:
+            lines.append(f"  ... ({len(id_changed) - max_items} more not shown)")
+
+    # ---- Residues -------------------------------------------------------
+    res_removed: list[tuple[int, int]] = []
+    res_added: list[tuple[int, int]] = []
+    res_changed: list[tuple[int, int]] = []
+
+    for ci in range(n_common):
+        res_a = list(chains_a[ci].residues())
+        res_b = list(chains_b[ci].residues())
+        nres_c = min(len(res_a), len(res_b))
+
+        for ri in range(nres_c):
+            na, aa = _res_counts(res_a[ri])
+            nb, ab = _res_counts(res_b[ri])
+            if na != nb or aa != ab:
+                res_changed.append((ci, ri))
+
+        for ri in range(nres_c, len(res_a)):
+            res_removed.append((ci, ri))
+        for ri in range(nres_c, len(res_b)):
+            res_added.append((ci, ri))
+
+    lines.append("\nResidues:")
+    lines.append(
+        f"  removed={len(res_removed)}, added={len(res_added)}, changed={len(res_changed)}"
+    )
+
+    shown = 0
+    for ci, ri in res_removed:
+        if shown >= max_items:
+            break
+        res = list(chains_a[ci].residues())[ri]
+        rname, nat = _res_counts(res)
+        lines.append(f"- c{ci} r{ri}: {rname} atoms={nat}")
+        shown += 1
+
+    for ci, ri in res_added:
+        if shown >= max_items:
+            break
+        res = list(chains_b[ci].residues())[ri]
+        rname, nat = _res_counts(res)
+        lines.append(f"+ c{ci} r{ri}: {rname} atoms={nat}")
+        shown += 1
+
+    for ci, ri in res_changed:
+        if shown >= max_items:
+            break
+        ra = list(chains_a[ci].residues())[ri]
+        rb = list(chains_b[ci].residues())[ri]
+        na, aa = _res_counts(ra)
+        nb, ab = _res_counts(rb)
+        parts: list[str] = []
+        if na != nb:
+            parts.append(f"name {na}->{nb}")
+        if aa != ab:
+            parts.append(f"atoms {aa}->{ab}")
+        change = ", ".join(parts) if parts else "no changes"
+        lines.append(f"~ c{ci} r{ri}: {change}")
+        shown += 1
+
+    total_res_diffs = len(res_removed) + len(res_added) + len(res_changed)
+    if total_res_diffs > max_items:
+        lines.append(f"  ... ({total_res_diffs - max_items} more residue diffs not shown)")
+
+    # ---- Atoms ----------------------------------------------------------
+    atom_lines: list[str] = []
+    atom_removed_total = 0
+    atom_added_total = 0
+
+    for ci in range(n_common):
+        res_a = list(chains_a[ci].residues())
+        res_b = list(chains_b[ci].residues())
+        nres_c = min(len(res_a), len(res_b))
+        for ri in range(nres_c):
+            ra = res_a[ri]
+            rb = res_b[ri]
+            rna, _ = _res_counts(ra)
+            rnb, _ = _res_counts(rb)
+            if rna != rnb:
+                continue
+
+            ca = _res_atom_counts(ra)
+            cb = _res_atom_counts(rb)
+            if ca == cb:
+                continue
+
+            keys = sorted(set(ca) | set(cb))
+            removed: list[tuple[str, int]] = []
+            added: list[tuple[str, int]] = []
+
+            for k in keys:
+                da = int(ca.get(k, 0))
+                db = int(cb.get(k, 0))
+                if da > db:
+                    removed.append((k, da - db))
+                elif db > da:
+                    added.append((k, db - da))
+
+            for _, n in removed:
+                atom_removed_total += int(n)
+            for _, n in added:
+                atom_added_total += int(n)
+
+            # Pair removals with additions as renames when possible.
+            rpretty = rna.title() if rna else rna
+            removed = sorted(removed)
+            added = sorted(added)
+            i = 0
+            j = 0
+            while i < len(removed) and j < len(added):
+                old_name, n_old = removed[i]
+                new_name, n_new = added[j]
+                n = n_old if n_old < n_new else n_new
+
+                suf = f" x{n}" if n != 1 else ""
+                atom_lines.append(f"c{ci} r{ri} {rpretty}: {old_name}->{new_name}{suf}")
+
+                n_old -= n
+                n_new -= n
+                if n_old == 0:
+                    i += 1
+                else:
+                    removed[i] = (old_name, n_old)
+                if n_new == 0:
+                    j += 1
+                else:
+                    added[j] = (new_name, n_new)
+
+            # Leftovers are true additions/removals.
+            for k, n in removed[i:]:
+                suf = f" x{n}" if n != 1 else ""
+                atom_lines.append(f"- c{ci} r{ri} {rpretty}: {k}{suf}")
+            for k, n in added[j:]:
+                suf = f" x{n}" if n != 1 else ""
+                atom_lines.append(f"+ c{ci} r{ri} {rpretty}: {k}{suf}")
+
+    lines.append("\nAtoms (by name-count within matching residue names):")
+    lines.append(f"  removed={atom_removed_total}, added={atom_added_total}")
+
+    if not atom_lines:
+        lines.append("  (no atom-name differences)")
+    else:
+        shown = 0
+        for s in atom_lines:
+            if shown >= max_items:
+                break
+            lines.append(s)
+            shown += 1
+        if len(atom_lines) > max_items:
+            lines.append(f"  ... ({len(atom_lines) - max_items} more atom diffs not shown)")
+
+    # ---- Bonds ----------------------------------------------------------
+    labels_a = _atom_labels(top_a)
+    labels_b = _atom_labels(top_b)
+    bonds_a = _bond_set(top_a, labels_a)
+    bonds_b = _bond_set(top_b, labels_b)
+
+    bonds_removed = sorted(bonds_a - bonds_b)
+    bonds_added = sorted(bonds_b - bonds_a)
+
+    lines.append("\nBonds:")
+    lines.append(f"  removed={len(bonds_removed)}, added={len(bonds_added)}")
+
+    def _split_bond_str(b: str) -> tuple[str, str]:
+        parts = b.split(" -- ", 1)
+        if len(parts) != 2:
+            return b, b
+        return parts[0], parts[1]
+
+    def _parse_atom_path(p: str) -> tuple[int, int, str, str]:
+        parts = p.split(":")
+        if len(parts) != 4:
+            return -1, -1, "", p
+        try:
+            ci = int(parts[0][1:]) if parts[0].startswith("c") else int(parts[0])
+            ri = int(parts[1][1:]) if parts[1].startswith("r") else int(parts[1])
+        except (ValueError, IndexError):
+            return -1, -1, "", parts[3]
+        return ci, ri, parts[2], parts[3]
+
+    def _res_ctx(p: str) -> tuple[int, int, str]:
+        ci, ri, res, _ = _parse_atom_path(p)
+        return ci, ri, res
+
+    def _bond_ctx_desc(b: str) -> tuple[str, str]:
+        a, c = _split_bond_str(b)
+        ci1, ri1, r1, at1 = _parse_atom_path(a)
+        ci2, ri2, r2, at2 = _parse_atom_path(c)
+
+        key1 = (ci1, ri1, r1, at1)
+        key2 = (ci2, ri2, r2, at2)
+        if key2 < key1:
+            ci1, ri1, r1, at1, ci2, ri2, r2, at2 = (
+                ci2,
+                ri2,
+                r2,
+                at2,
+                ci1,
+                ri1,
+                r1,
+                at1,
+            )
+
+        if (ci1, ri1, r1) == (ci2, ri2, r2):
+            ctx = f"c{ci1} r{ri1} {r1.title()}"
+        else:
+            ctx = f"c{ci1} r{ri1} {r1.title()} <-> " f"c{ci2} r{ri2} {r2.title()}"
+        return ctx, f"{at1}--{at2}"
+
+    def _bond_key(a: str, c: str) -> tuple[tuple[int, int, str], tuple[int, int, str]]:
+        k1 = _res_ctx(a)
+        k2 = _res_ctx(c)
+        return (k1, k2) if k1 <= k2 else (k2, k1)
+
+    rem_items: list[tuple[str, str, str]] = []
+    for b in bonds_removed:
+        a, c = _split_bond_str(b)
+        rem_items.append((a, c, b))
+
+    add_items: list[tuple[str, str, str]] = []
+    add_by_ep: dict[str, list[int]] = {}
+    for i, b in enumerate(bonds_added):
+        a, c = _split_bond_str(b)
+        add_items.append((a, c, b))
+        add_by_ep.setdefault(a, []).append(i)
+        add_by_ep.setdefault(c, []).append(i)
+
+    used_add: set[int] = set()
+    paired: list[tuple[str, str]] = []
+    unpaired_rem: list[tuple[str, str, str]] = []
+
+    for ra, rb, rstr in rem_items:
+        match: Optional[int] = None
+        for shared, other_rem in ((ra, rb), (rb, ra)):
+            for j in add_by_ep.get(shared, []):
+                if j in used_add:
+                    continue
+                aa, ab, _ = add_items[j]
+                other_add = ab if aa == shared else aa
+                if other_add == other_rem:
+                    continue
+                if _res_ctx(other_add) != _res_ctx(other_rem):
+                    continue
+                match = j
+                break
+            if match is not None:
+                break
+
+        if match is None:
+            unpaired_rem.append((ra, rb, rstr))
+        else:
+            used_add.add(match)
+            paired.append((rstr, add_items[match][2]))
+
+    unpaired_add = [add_items[i] for i in range(len(add_items)) if i not in used_add]
+
+    rem_by_key = {}
+    add_by_key = {}
+
+    for ra, rb, rstr in unpaired_rem:
+        rem_by_key.setdefault(_bond_key(ra, rb), []).append((ra, rb, rstr))
+    for aa, ab, astr in unpaired_add:
+        add_by_key.setdefault(_bond_key(aa, ab), []).append((aa, ab, astr))
+
+    leftover_rem: list[str] = []
+    leftover_add: list[str] = []
+    for key in sorted(set(rem_by_key) | set(add_by_key)):
+        rlist = sorted(rem_by_key.get(key, []), key=lambda x: x[2])
+        alist = sorted(add_by_key.get(key, []), key=lambda x: x[2])
+
+        if rlist and alist and len(rlist) == len(alist):
+            for r_it, a_it in zip(rlist, alist):
+                paired.append((r_it[2], a_it[2]))
+        else:
+            leftover_rem.extend([x[2] for x in rlist])
+            leftover_add.extend([x[2] for x in alist])
+
+    bond_lines: list[str] = []
+    for old, new in paired:
+        ctx_old, desc_old = _bond_ctx_desc(old)
+        ctx_new, desc_new = _bond_ctx_desc(new)
+        if ctx_old == ctx_new:
+            bond_lines.append(f"{ctx_old}: {desc_old}->{desc_new}")
+        else:
+            bond_lines.append(f"{ctx_old}: {desc_old}->{ctx_new}: {desc_new}")
+
+    shown = 0
+    for s in bond_lines:
+        if shown >= max_items:
+            break
+        lines.append(s)
+        shown += 1
+
+    for b in sorted(leftover_rem):
+        if shown >= max_items:
+            break
+        ctx, desc = _bond_ctx_desc(b)
+        lines.append(f"- {ctx}: {desc}")
+        shown += 1
+
+    for b in sorted(leftover_add):
+        if shown >= max_items:
+            break
+        ctx, desc = _bond_ctx_desc(b)
+        lines.append(f"+ {ctx}: {desc}")
+        shown += 1
+
+    total_bond_diffs = len(bond_lines) + len(leftover_rem) + len(leftover_add)
+
+    if total_bond_diffs > max_items:
+        lines.append(f"  ... ({total_bond_diffs - max_items} more bond diffs not shown)")
 
     return "\n".join(lines)
