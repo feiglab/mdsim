@@ -6,6 +6,12 @@ from .allatom_simulation import (
     harmonic_energy_distance,
     harmonic_energy_xyz,
 )
+from .analysis import (
+    compare_topology,
+    ion_counts,
+    plane_normal,
+    summarize_topology,
+)
 from .molecule_data import (
     Atom,
     Chain,
@@ -16,9 +22,7 @@ from .molecule_data import (
     SelectionError,
     Structure,
     StructureSelector,
-    compare_topology,
     load_dcd,
-    summarize_topology,
 )
 from .solvation import (
     solvate,
@@ -40,7 +44,9 @@ __all__ = [
     "harmonic_energy_distance",
     "harmonic_energy_angle",
     "harmonic_energy_dihedral",
+    "ion_counts",
     "load_dcd",
+    "plane_normal",
     "solvate",
     "compare_topology",
     "summarize_topology",
