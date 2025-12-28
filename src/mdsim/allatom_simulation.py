@@ -17,6 +17,7 @@ from openmm import (
     LangevinIntegrator,
     MonteCarloBarostat,
     NonbondedForce,
+    OpenMMException,
     Platform,
     State,
     System,
@@ -179,7 +180,12 @@ class MDSim:
             self.set_dummy_topology()
 
         self.integrator = LangevinIntegrator(self.temperature, self.gamma, self.tstep)
-        self.platform = Platform.getPlatformByName(self.resources)
+
+        try:
+            self.platform = Platform.getPlatformByName(self.resources)
+        except OpenMMException:
+            self.platform = Platform.getPlatformByName("CPU")
+            self.resources = "CPU"
 
         if self.resources == "CUDA":
             if device:
