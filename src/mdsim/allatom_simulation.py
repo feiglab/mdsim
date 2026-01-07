@@ -95,6 +95,7 @@ class MDSim:
         self.topology = None
         self.positions = None
         self.velocities = None
+        self.parameters = None
         self.box = None
         self.box_vectors = None
         self.stype = None
@@ -212,6 +213,10 @@ class MDSim:
         if self.box_vectors:
             a, b, c = self.box_vectors
             self.simulation.context.setPeriodicBoxVectors(a, b, c)
+
+        if self.parameters:
+            for name, value in self.parameters.items():
+                self.simulation.context.setParameter(name, float(value))
 
     def get_positions(self):
         if self.simulation:
@@ -392,6 +397,10 @@ class MDSim:
             self.positions = state.getPositions()
             self.velocities = state.getVelocities()
             self.box_vectors = state.getPeriodicBoxVectors()
+            try:
+                self.parameters = dict(state.getParameters())
+            except Exception:
+                self.parameters = None
 
     def fix_topology(self, *, renamehis=False):
         if self.topology:
