@@ -215,8 +215,12 @@ class MDSim:
             self.simulation.context.setPeriodicBoxVectors(a, b, c)
 
         if self.parameters:
+            ctx = self.simulation.context
+            known = set(ctx.getParameters().keys())
             for name, value in self.parameters.items():
-                self.simulation.context.setParameter(name, float(value))
+                if name not in known:
+                    continue
+                ctx.setParameter(name, float(value))
 
     def get_positions(self):
         if self.simulation:
