@@ -3131,24 +3131,38 @@ def iter_dcd(
     stride: int = 1,
 ) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
     """
-    Stream a DCD trajectory in chunks.
+    Stream a CHARMM DCD trajectory as numpy arrays.
 
     Yields
     ------
-    coords_nm
-        Coordinates, shape (n_frames, n_atoms, 3), float64 in nm.
-    box_nm
-        Unit cell lengths, shape (n_frames, 3), float64 in nm, or None if absent.
+    coords_nm, box_lengths_nm
+        coords_nm is float64 with shape (n_frames, n_atoms, 3) in nm.
+        box_lengths_nm is float64 with shape (n_frames, 3) in nm, or None.
     """
     _, tmpl_model = _ensure_template_model(template)
-    top = md.Topology.from_openmm(tmpl_model.topology())
 
-    for traj in md.iterload(dcd_file, top=top, chunk=int(chunk), stride=int(stride)):
-        coords_nm = np.asarray(traj.xyz, dtype=np.float64)
-        box_nm = None
-        if traj.unitcell_lengths is not None:
-            box_nm = np.asarray(traj.unitcell_lengths, dtype=np.float64)
-        yield coords_nm, box_nm
+    top = md.Topology.from_openmm(tmpl_model.topology())
+    for traj in md.iterload(
+        dcd_file,
+        top=top,
+        chunk=int(chunk),
+        stride=int(stride),
+    ):
+        xyz = np.asarray(traj.xyz, dtype=np.float64)
+        box = getattr(traj, "unitcell_lengths", None)
+        if box is None:
+            yield xyz, None
+            continue
+
+        box_nm = np.asarray(box, dtype=np.float64)
+        if box_nm.ndim != 2 or box_nm.shape[1] != 3:
+            yield xyz, None
+            continue
+        if not np.all(np.isfinite(box_nm)) or np.any(box_nm <= 0.0):
+            yield xyz, None
+            continue
+
+        yield xyz, box_nm
 
 
 # ----------------------------- helpers ---------------------------------------

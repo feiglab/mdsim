@@ -1260,3 +1260,254 @@ def structure_factor_from_dcd(
         "n_particles": int(len(grp)),
         "rho_nm3": number_density_nm3(len(grp), box_ref),
     }
+
+
+class RdfAccumulator:
+    def __init__(self, r_edges_nm: np.ndarray, *, n_particles: int):
+        edges = np.asarray(r_edges_nm, dtype=np.float64)
+        if edges.ndim != 1 or edges.size < 2:
+            raise ValueError("r_edges_nm must be 1D with at least 2 entries")
+        if not np.all(np.isfinite(edges)):
+            raise ValueError("r_edges_nm must be finite")
+        if not np.all(np.diff(edges) > 0):
+            raise ValueError("r_edges_nm must be strictly increasing")
+
+        n = int(n_particles)
+        if n < 2:
+            raise ValueError("need at least 2 particles for RDF")
+
+        self.r_edges_nm = edges
+        self.n_particles = n
+        self.n_pairs = n * (n - 1) // 2
+
+        r0 = edges[:-1]
+        r1 = edges[1:]
+        self.shell_vol_nm3 = (4.0 * math.pi / 3.0) * (r1**3 - r0**3)
+
+        self.counts = np.zeros((edges.size - 1,), dtype=np.float64)
+        self.ideal = np.zeros((edges.size - 1,), dtype=np.float64)
+        self.n_frames = 0
+
+        self._pi, self._pj = np.triu_indices(n, k=1)
+
+    def r_nm(self) -> np.ndarray:
+        e = self.r_edges_nm
+        return 0.5 * (e[:-1] + e[1:])
+
+    def add(self, centers_nm: np.ndarray, box_nm: np.ndarray) -> None:
+        c = np.asarray(centers_nm, dtype=np.float64)
+        if c.ndim != 2 or c.shape[0] != self.n_particles or c.shape[1] != 3:
+            raise ValueError("centers_nm must have shape (n_particles, 3)")
+        b = np.asarray(box_nm, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(b)) or np.any(b <= 0.0):
+            raise ValueError("box_nm must be finite and positive")
+
+        d = c[self._pi] - c[self._pj]
+        d -= np.rint(d / b) * b
+        r = np.sqrt(np.sum(d * d, axis=1))
+
+        hist, _ = np.histogram(r, bins=self.r_edges_nm)
+        self.counts += hist.astype(np.float64, copy=False)
+
+        vol = float(b[0] * b[1] * b[2])
+        self.ideal += self.shell_vol_nm3 * (float(self.n_pairs) / vol)
+        self.n_frames += 1
+
+    def g_r(self) -> np.ndarray:
+        if self.n_frames <= 0:
+            raise ValueError("no frames accumulated")
+        if np.any(self.ideal <= 0.0):
+            raise ValueError("ideal counts are non-positive; check box sizes")
+        return self.counts / self.ideal
+
+
+def kb_integral_from_rdf_bins(r_edges_nm: np.ndarray, g_r: np.ndarray) -> np.ndarray:
+    """
+    Kirkwood-Buff integral G up to each RDF bin edge.
+
+    Returns G_nm3 with shape (n_bins,). Entry k is the integral up to
+    r_edges_nm[k+1].
+    """
+    edges = np.asarray(r_edges_nm, dtype=np.float64)
+    g = np.asarray(g_r, dtype=np.float64)
+    if edges.ndim != 1 or edges.size < 2:
+        raise ValueError("r_edges_nm must be 1D with at least 2 entries")
+    if g.ndim != 1 or g.size != edges.size - 1:
+        raise ValueError("g_r must have length len(r_edges_nm) - 1")
+    if not np.all(np.isfinite(edges)) or not np.all(np.isfinite(g)):
+        raise ValueError("r_edges_nm and g_r must be finite")
+    if not np.all(np.diff(edges) > 0):
+        raise ValueError("r_edges_nm must be strictly increasing")
+
+    r0 = edges[:-1]
+    r1 = edges[1:]
+    shell_vol_nm3 = (4.0 * math.pi / 3.0) * (r1**3 - r0**3)
+    dG = (g - 1.0) * shell_vol_nm3
+    return np.cumsum(dG)
+
+
+def b2_from_rdf_bins(
+    r_edges_nm: np.ndarray,
+    g_r: np.ndarray,
+    *,
+    r_cut_nm: Optional[float] = None,
+    tail_bins: int = 0,
+) -> float:
+    """
+    B2 (nm^3) from a binned RDF:
+
+      B2 = -0.5 * sum_k (g_k - 1) * ΔV_k
+
+    tail_bins: if >0, shift g so mean(g[-tail_bins:]) == 1.
+    """
+    edges = np.asarray(r_edges_nm, dtype=np.float64)
+    g = np.asarray(g_r, dtype=np.float64)
+    if edges.ndim != 1 or edges.size < 2:
+        raise ValueError("r_edges_nm must be 1D with at least 2 entries")
+    if g.ndim != 1 or g.size != edges.size - 1:
+        raise ValueError("g_r must have length len(r_edges_nm) - 1")
+
+    if tail_bins > 0:
+        tb = int(tail_bins)
+        if tb >= g.size:
+            raise ValueError("tail_bins must be smaller than len(g_r)")
+        g = g - (float(np.mean(g[-tb:])) - 1.0)
+
+    r0 = edges[:-1]
+    r1 = edges[1:]
+    shell_vol = (4.0 * math.pi / 3.0) * (r1**3 - r0**3)
+
+    if r_cut_nm is not None:
+        rc = float(r_cut_nm)
+        if rc <= float(edges[0]):
+            raise ValueError("r_cut_nm must be greater than the first edge")
+        if rc < float(edges[-1]):
+            k = int(np.searchsorted(edges, rc, side="right") - 1)
+            if k < 0 or k >= g.size:
+                raise ValueError("r_cut_nm out of range")
+            shell_vol = shell_vol[: k + 1].copy()
+            g = g[: k + 1].copy()
+            shell_vol[-1] = (4.0 * math.pi / 3.0) * (rc**3 - float(edges[k]) ** 3)
+
+    G = float(np.sum((g - 1.0) * shell_vol))
+    return float(-0.5 * G)
+
+
+def rdf_from_dcd(
+    dcd_file: Any,
+    template: Any,
+    *,
+    group_spec: str = "protein",
+    groups: Optional[Sequence[Sequence[int]]] = None,
+    center: str = "com",
+    unwrap: bool = True,
+    r_max_nm: Optional[float] = None,
+    dr_nm: float = 0.02,
+    stride: int = 1,
+    chunk: int = 200,
+    box_nm: Any = None,
+    tail_bins: int = 0,
+) -> dict[str, Any]:
+    """
+    Solute-solute RDF g(r) and B2 from a DCD.
+
+    Uses your PDBReader and iter_dcd(). Solute copies are group centers (COM by
+    default). Valid for r <= 0.5 * min(box_lengths) for orthorhombic PBC.
+    """
+    from .molecule_data import Model, PDBReader, Structure, iter_dcd
+
+    if isinstance(template, Model):
+        tmpl = template
+    elif isinstance(template, Structure):
+        tmpl = template.model
+    else:
+        tmpl = PDBReader(template).model
+
+    if groups is None:
+        grp = solute_groups(tmpl, group_spec=group_spec)
+    else:
+        grp = [np.asarray(g, dtype=np.int64) for g in groups]
+
+    if len(grp) < 2:
+        raise ValueError("need at least 2 solute groups for an RDF")
+
+    masses = _atom_masses(tmpl)
+    it = iter_dcd(dcd_file, tmpl, chunk=int(chunk), stride=int(stride))
+    try:
+        coords0, boxes0 = next(it)
+    except StopIteration as exc:
+        raise ValueError("empty DCD stream") from exc
+
+    if box_nm is not None:
+        box_ref = _box_lengths_nm(box_nm)
+    elif boxes0 is not None:
+        box_ref = np.mean(boxes0, axis=0).astype(np.float64, copy=False)
+    else:
+        raise ValueError("box_nm must be provided (DCD has no unit cell)")
+
+    r_safe = 0.5 * float(np.min(box_ref))
+    r_max = float(r_max_nm) if r_max_nm is not None else r_safe
+    if r_max <= 0.0:
+        raise ValueError("r_max_nm must be positive")
+    if r_max > r_safe:
+        raise ValueError(f"r_max_nm={r_max} exceeds 0.5*min(box)={r_safe}")
+    if dr_nm <= 0:
+        raise ValueError("dr_nm must be positive")
+
+    n_bins = int(math.ceil(r_max / float(dr_nm)))
+    if n_bins < 1:
+        raise ValueError("dr_nm too large for chosen r_max_nm")
+
+    r_edges = np.linspace(0.0, r_max, n_bins + 1, dtype=np.float64)
+    acc = RdfAccumulator(r_edges, n_particles=len(grp))
+
+    def add_chunk(coords: np.ndarray, boxes: Optional[np.ndarray]) -> None:
+        centers = group_centers_nm(
+            coords,
+            grp,
+            masses=masses,
+            box_nm=box_ref,
+            boxes_nm=boxes,
+            center=center,
+            unwrap=unwrap,
+            wrap=True,
+        )
+        n_frames = int(centers.shape[0])
+        for fi in range(n_frames):
+            b = boxes[fi] if boxes is not None else box_ref
+            if float(np.min(b)) < 2.0 * float(acc.r_edges_nm[-1]):
+                continue
+            acc.add(centers[fi], b)
+
+    add_chunk(coords0, boxes0)
+    for coords, boxes in it:
+        add_chunk(coords, boxes)
+
+    r = acc.r_nm()
+    g = acc.g_r()
+    b2 = b2_from_rdf_bins(acc.r_edges_nm, g, tail_bins=int(tail_bins))
+    G = kb_integral_from_rdf_bins(acc.r_edges_nm, g)
+
+    return {
+        "box_nm": box_ref,
+        "r_edges_nm": acc.r_edges_nm,
+        "r_nm": r,
+        "g_r": g,
+        "counts": acc.counts.copy(),
+        "ideal": acc.ideal.copy(),
+        "kb_nm3": G,
+        "b2_nm3": float(b2),
+        "n_frames": int(acc.n_frames),
+        "n_particles": int(acc.n_particles),
+        "rho_nm3": number_density_nm3(int(acc.n_particles), box_ref),
+    }
+
+
+def nm3_to_cm3_per_mol(x_nm3: float) -> float:
+    n_a = 6.02214076e23
+    return float(x_nm3) * n_a * 1e-21
+
+
+def nm3_to_L_per_mol(x_nm3: float) -> float:
+    n_a = 6.02214076e23
+    return float(x_nm3) * n_a * 1e-24
