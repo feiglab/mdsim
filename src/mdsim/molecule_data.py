@@ -3124,45 +3124,80 @@ def load_dcd(
 
 
 def iter_dcd(
-    dcd_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
     template: Union[Structure, Model, FileLike],
     *,
-    chunk: int = 200,
+    chunk: int = 500,
     stride: int = 1,
+    atom_indices: Optional[Sequence[int]] = None,
 ) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
     """
-    Stream a CHARMM DCD trajectory as numpy arrays.
+    Iterate over one or more CHARMM/NAMD-style DCD files.
+
+    This is a streaming alternative to load_dcd() that avoids loading the full
+    trajectory into memory. Frames are yielded as:
+
+      (xyz_nm, box_lengths_nm)
+
+    where:
+      - xyz_nm has shape (n_atoms, 3) and units nm (float64)
+      - box_lengths_nm is a (3,) array in nm if present in the DCD, else None
+
+    Parameters
+    ----------
+    dcd_files
+        Path(s) or file-like objects MDTraj can read. If a single FileLike is
+        given, it is treated as one trajectory.
+    template
+        Reference topology with the same atom order as the DCD.
+        Accepts Structure, Model, or a PDB-like FileLike read via PDBReader.
+    chunk
+        Number of frames per MDTraj chunk.
+    stride
+        Frame stride passed to MDTraj.
+    atom_indices
+        Optional subset of atoms to load (0-based indices in the template order).
 
     Yields
     ------
-    coords_nm, box_lengths_nm
-        coords_nm is float64 with shape (n_frames, n_atoms, 3) in nm.
-        box_lengths_nm is float64 with shape (n_frames, 3) in nm, or None.
+    (xyz_nm, box_lengths_nm)
     """
+    if stride <= 0:
+        raise ValueError("stride must be >= 1")
+    if chunk <= 0:
+        raise ValueError("chunk must be >= 1")
+
     _, tmpl_model = _ensure_template_model(template)
-
     top = md.Topology.from_openmm(tmpl_model.topology())
-    for traj in md.iterload(
-        dcd_file,
-        top=top,
-        chunk=int(chunk),
-        stride=int(stride),
-    ):
-        xyz = np.asarray(traj.xyz, dtype=np.float64)
-        box = getattr(traj, "unitcell_lengths", None)
-        if box is None:
-            yield xyz, None
-            continue
 
-        box_nm = np.asarray(box, dtype=np.float64)
-        if box_nm.ndim != 2 or box_nm.shape[1] != 3:
-            yield xyz, None
-            continue
-        if not np.all(np.isfinite(box_nm)) or np.any(box_nm <= 0.0):
-            yield xyz, None
-            continue
+    if isinstance(dcd_files, (str, Path, io.BytesIO, io.StringIO)):
+        files = [dcd_files]
+    else:
+        files = list(dcd_files)
 
-        yield xyz, box_nm
+    atom_idx = None if atom_indices is None else [int(i) for i in atom_indices]
+
+    for dcd_file in files:
+        for traj in md.iterload(
+            dcd_file,
+            top=top,
+            chunk=int(chunk),
+            stride=int(stride),
+            atom_indices=atom_idx,
+        ):
+            xyz = np.asarray(traj.xyz, dtype=np.float64)  # (n_frames, n_atoms, 3) nm
+            boxes = (
+                None
+                if traj.unitcell_lengths is None
+                else np.asarray(traj.unitcell_lengths, dtype=np.float64)
+            )
+
+            if boxes is None:
+                for i in range(xyz.shape[0]):
+                    yield xyz[i], None
+            else:
+                for i in range(xyz.shape[0]):
+                    yield xyz[i], boxes[i]
 
 
 # ----------------------------- helpers ---------------------------------------
