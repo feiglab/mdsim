@@ -695,3 +695,568 @@ def plane_normal_quantity(points: Sequence[Any], **kwargs: Any) -> Quantity:
     """Same as plane_normal, but returns a Quantity with length units (nm)."""
     n = plane_normal(points, **kwargs)
     return Quantity(n, nanometer)
+
+
+# --- structure factors and virial coefficients -------------------------------
+
+
+def _box_lengths_nm(box: Any) -> np.ndarray:
+    """
+    Return orthorhombic box lengths (Lx, Ly, Lz) in nm as float64.
+
+    Accepts:
+      - (3,) sequence of floats in nm
+      - OpenMM Quantity of shape (3,) in length units
+      - OpenMM periodic box vectors (3x3) as Quantity or array-like (orthorhombic only)
+    """
+    if box is None:
+        raise ValueError("box must be provided")
+
+    if isinstance(box, Quantity):
+        arr = np.asarray(box.value_in_unit(nanometer), dtype=float)
+    else:
+        arr = np.asarray(box, dtype=float)
+
+    arr = np.asarray(arr, dtype=float)
+
+    if arr.shape == (3,):
+        return arr.astype(np.float64, copy=False)
+
+    if arr.shape == (3, 3):
+        # interpret as box vectors; require orthorhombic
+        off = arr.copy()
+        off[np.diag_indices(3)] = 0.0
+        if float(np.max(np.abs(off))) > 1.0e-6:
+            raise ValueError("triclinic boxes are not supported (need orthorhombic)")
+        return np.abs(np.diag(arr)).astype(np.float64, copy=False)
+
+    raise ValueError(f"box has shape {arr.shape}; expected (3,) or (3,3)")
+
+
+def _unwrap_group_nm(x_nm: np.ndarray, box_nm: np.ndarray) -> np.ndarray:
+    """
+    Unwrap a single molecule/group into a contiguous image (orthorhombic PBC).
+
+    x_nm
+        Coordinates for this group, shape (n, 3), nm.
+    box_nm
+        Box lengths (Lx, Ly, Lz), shape (3,), nm.
+    """
+    ref = x_nm[0]
+    d = x_nm - ref
+    d -= np.rint(d / box_nm) * box_nm
+    return ref + d
+
+
+def _center_group_nm(
+    xyz_nm: np.ndarray,
+    idx: np.ndarray,
+    *,
+    masses: Optional[np.ndarray],
+    center: str,
+    box_nm: Optional[np.ndarray],
+    unwrap: bool,
+) -> np.ndarray:
+    if idx.size == 0:
+        raise ValueError("group is empty")
+
+    x = xyz_nm[idx, :].astype(np.float64, copy=False)
+
+    if unwrap:
+        if box_nm is None:
+            raise ValueError("unwrap=True requires a box")
+        x = _unwrap_group_nm(x, box_nm)
+
+    mode = (center or "com").lower()
+    if mode == "cog":
+        return x.mean(axis=0)
+
+    if mode != "com":
+        raise ValueError("center must be 'com' or 'cog'")
+
+    if masses is None:
+        w = np.ones((idx.size,), dtype=np.float64)
+    else:
+        w = masses[idx].astype(np.float64, copy=False)
+        if not np.all(np.isfinite(w)):
+            raise ValueError("non-finite masses encountered")
+        if float(np.sum(w)) <= 0.0:
+            raise ValueError("total mass is zero")
+
+    return (x * w[:, None]).sum(axis=0) / float(np.sum(w))
+
+
+def solute_groups(
+    template: Any,
+    *,
+    group_spec: str = "protein",
+    model_index: int = 0,
+) -> list[np.ndarray]:
+    """
+    Build solute atom-index groups (0-based) using your StructureSelector.
+
+    Typical use:
+      - group_spec="protein" -> one group per chain containing protein residues.
+      - group_spec=["A:B.protein", "C:D.protein"] -> explicit groups for multi-chain proteins.
+    """
+    from .molecule_data import Model, PDBReader, Structure, StructureSelector
+
+    if isinstance(template, Model):
+        model = template
+    elif isinstance(template, Structure):
+        model = template.get_model(model_index)
+    else:
+        model = PDBReader(template).get_model(model_index)
+
+    groups = StructureSelector(group_spec).atom_lists(model)
+    out = [np.asarray(g, dtype=np.int64) for g in groups if len(g) > 0]
+    if not out:
+        raise ValueError(f"group_spec={group_spec!r} produced no atoms")
+    return out
+
+
+def _atom_masses(template: Any, *, model_index: int = 0) -> np.ndarray:
+    from .molecule_data import Model, PDBReader, Structure
+
+    if isinstance(template, Model):
+        model = template
+    elif isinstance(template, Structure):
+        model = template.get_model(model_index)
+    else:
+        model = PDBReader(template).get_model(model_index)
+
+    masses = np.empty((model.natoms(),), dtype=np.float64)
+    for i, a in enumerate(model.atoms):
+        m = getattr(a, "mass", None)
+        masses[i] = float(m) if m is not None else 0.0
+    return masses
+
+
+def group_centers_nm(
+    coords_nm: np.ndarray,
+    groups: Sequence[np.ndarray],
+    *,
+    masses: Optional[np.ndarray] = None,
+    box_nm: Optional[np.ndarray] = None,
+    boxes_nm: Optional[np.ndarray] = None,
+    center: str = "com",
+    unwrap: bool = True,
+    wrap: bool = True,
+) -> np.ndarray:
+    """
+    Compute per-frame centers for multiple groups.
+
+    Parameters
+    ----------
+    coords_nm
+        Shape (n_frames, n_atoms, 3) in nm.
+    groups
+        List of index arrays (one per solute copy).
+    masses
+        Optional per-atom masses (dalton-like), shape (n_atoms,). Required for COM.
+    box_nm
+        Constant box lengths in nm, shape (3,). Used if boxes_nm is None.
+    boxes_nm
+        Optional per-frame box lengths in nm, shape (n_frames, 3).
+    center
+        "com" or "cog".
+    unwrap
+        If True, unwrap each group under PBC before computing the center.
+    wrap
+        If True and a box is available, wrap output centers back into [0,L).
+    """
+    coords_nm = np.asarray(coords_nm, dtype=np.float64)
+    if coords_nm.ndim != 3 or coords_nm.shape[2] != 3:
+        raise ValueError("coords_nm must have shape (n_frames, n_atoms, 3)")
+
+    n_frames = int(coords_nm.shape[0])
+    n_groups = len(groups)
+    out = np.empty((n_frames, n_groups, 3), dtype=np.float64)
+
+    if boxes_nm is not None:
+        boxes_nm = np.asarray(boxes_nm, dtype=np.float64)
+        if boxes_nm.shape != (n_frames, 3):
+            raise ValueError("boxes_nm must have shape (n_frames, 3)")
+
+    if unwrap and boxes_nm is None and box_nm is None:
+        raise ValueError("unwrap=True requires box_nm or boxes_nm")
+
+    if box_nm is not None:
+        box_nm = np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    for fi in range(n_frames):
+        xyz = coords_nm[fi]
+        b = boxes_nm[fi] if boxes_nm is not None else box_nm
+        for gi, idx in enumerate(groups):
+            c = _center_group_nm(
+                xyz,
+                idx,
+                masses=masses,
+                center=center,
+                box_nm=b,
+                unwrap=unwrap,
+            )
+            if wrap and b is not None:
+                c = c - np.floor(c / b) * b
+            out[fi, gi, :] = c
+
+    return out
+
+
+def q_vectors_orthorhombic(
+    box_nm: Any,
+    *,
+    q_max: Optional[float] = None,
+    n_max: Optional[Sequence[int]] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Enumerate reciprocal-space wavevectors for an orthorhombic box.
+
+    q = 2*pi*(nx/Lx, ny/Ly, nz/Lz), excluding (0,0,0)
+
+    Parameters
+    ----------
+    box_nm
+        Box lengths (Lx,Ly,Lz) in nm.
+    q_max
+        Optional upper bound on |q| (1/nm). If provided, filters vectors by magnitude.
+    n_max
+        Optional integer triplet (nx_max, ny_max, nz_max). If omitted:
+          - if q_max is provided, derived from q_max and box lengths
+          - else defaults to (8, 8, 8)
+
+    Returns
+    -------
+    q_vec
+        (n_q, 3) float64 in 1/nm.
+    q_mag
+        (n_q,) float64 magnitudes in 1/nm.
+    """
+    box = _box_lengths_nm(box_nm)
+    if np.any(box <= 0):
+        raise ValueError("box lengths must be positive")
+
+    two_pi = float(2.0 * np.pi)
+
+    if n_max is None:
+        if q_max is None:
+            n_max = (8, 8, 8)
+        else:
+            q_max_f = float(q_max)
+            n_max = tuple(int(np.ceil(q_max_f * float(L) / two_pi)) for L in box)
+    if len(n_max) != 3:
+        raise ValueError("n_max must be a 3-tuple")
+
+    nx = np.arange(-int(n_max[0]), int(n_max[0]) + 1, dtype=np.int32)
+    ny = np.arange(-int(n_max[1]), int(n_max[1]) + 1, dtype=np.int32)
+    nz = np.arange(-int(n_max[2]), int(n_max[2]) + 1, dtype=np.int32)
+
+    g = np.stack(np.meshgrid(nx, ny, nz, indexing="ij"), axis=-1).reshape(-1, 3)
+    g = g[np.any(g != 0, axis=1)]
+
+    q = (two_pi * g.astype(np.float64)) / box.reshape(1, 3)
+    q_mag = np.linalg.norm(q, axis=1)
+
+    if q_max is not None:
+        keep = q_mag <= float(q_max) + 1.0e-12
+        q = q[keep]
+        q_mag = q_mag[keep]
+
+    order = np.argsort(q_mag, kind="mergesort")
+    return q[order], q_mag[order]
+
+
+class SqAccumulator:
+    """
+    Incremental accumulator for S(q) over frames.
+
+    S(q) = < |sum_j exp(i q·r_j)|^2 / N >
+    """
+
+    def __init__(self, q_vec: np.ndarray):
+        q_vec = np.asarray(q_vec, dtype=np.float64)
+        if q_vec.ndim != 2 or q_vec.shape[1] != 3:
+            raise ValueError("q_vec must have shape (n_q, 3)")
+        self.q_vec = q_vec
+        self.sum_sq = np.zeros((q_vec.shape[0],), dtype=np.float64)
+        self.sum_sq2 = np.zeros((q_vec.shape[0],), dtype=np.float64)
+        self.n_frames = 0
+
+    def add(self, centers_nm: np.ndarray) -> None:
+        centers_nm = np.asarray(centers_nm, dtype=np.float64)
+        if centers_nm.ndim == 2:
+            centers_nm = centers_nm.reshape(1, *centers_nm.shape)
+
+        if centers_nm.ndim != 3 or centers_nm.shape[2] != 3:
+            raise ValueError("centers_nm must have shape (n_frames, n_particles, 3)")
+
+        n_frames = int(centers_nm.shape[0])
+        n_part = int(centers_nm.shape[1])
+        if n_part <= 0:
+            raise ValueError("need at least one particle center per frame")
+
+        phase = np.einsum("fpc,qc->fpq", centers_nm, self.q_vec, optimize=True)
+        re = np.cos(phase).sum(axis=1)
+        im = np.sin(phase).sum(axis=1)
+        sq = (re * re + im * im) / float(n_part)
+
+        self.sum_sq += sq.sum(axis=0)
+        self.sum_sq2 += (sq * sq).sum(axis=0)
+        self.n_frames += n_frames
+
+    def mean(self) -> np.ndarray:
+        if self.n_frames <= 0:
+            raise ValueError("no frames accumulated")
+        return self.sum_sq / float(self.n_frames)
+
+    def stderr(self) -> np.ndarray:
+        if self.n_frames <= 1:
+            return np.full_like(self.sum_sq, np.nan)
+        n = float(self.n_frames)
+        mean = self.sum_sq / n
+        mean2 = self.sum_sq2 / n
+        var = np.maximum(0.0, mean2 - mean * mean)
+        return np.sqrt(var / n)
+
+
+def radial_average_sq(
+    q_mag: np.ndarray,
+    sq: np.ndarray,
+    *,
+    dq: float,
+) -> dict[str, np.ndarray]:
+    """
+    Radially average S(q) into bins of width dq.
+    """
+    q_mag = np.asarray(q_mag, dtype=np.float64).reshape(-1)
+    sq = np.asarray(sq, dtype=np.float64).reshape(-1)
+    if q_mag.shape != sq.shape:
+        raise ValueError("q_mag and sq must have the same shape")
+    if float(dq) <= 0:
+        raise ValueError("dq must be positive")
+
+    q_max = float(np.max(q_mag)) if q_mag.size else 0.0
+    n_bins = int(np.floor(q_max / float(dq))) + 1
+    if n_bins <= 0:
+        raise ValueError("no bins")
+
+    idx = np.floor(q_mag / float(dq)).astype(np.int64)
+    idx = np.clip(idx, 0, n_bins - 1)
+
+    sums = np.zeros((n_bins,), dtype=np.float64)
+    counts = np.zeros((n_bins,), dtype=np.int64)
+    np.add.at(sums, idx, sq)
+    np.add.at(counts, idx, 1)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        avg = sums / counts
+
+    q_cent = (np.arange(n_bins, dtype=np.float64) + 0.5) * float(dq)
+    mask = counts > 0
+    return {
+        "q": q_cent[mask],
+        "sq": avg[mask],
+        "counts": counts[mask],
+    }
+
+
+def fit_s0_ornstein_zernike(
+    q: np.ndarray,
+    sq: np.ndarray,
+    *,
+    q_max: Optional[float] = None,
+    min_points: int = 4,
+) -> dict[str, float]:
+    """
+    Estimate S(0) via Ornstein-Zernike: 1/S(q) = a + b q^2.
+
+    Returns S0=1/a and xi=sqrt(b/a) (nm) when b,a>0.
+    """
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    sq = np.asarray(sq, dtype=np.float64).reshape(-1)
+    if q.shape != sq.shape:
+        raise ValueError("q and sq must have the same shape")
+
+    mask = np.isfinite(q) & np.isfinite(sq) & (q > 0) & (sq > 0)
+    if q_max is not None:
+        mask &= q <= float(q_max)
+
+    qf = q[mask]
+    sf = sq[mask]
+    if qf.size < int(min_points):
+        raise ValueError("not enough points for fit")
+
+    x = qf * qf
+    y = 1.0 / sf
+
+    A = np.stack([np.ones_like(x), x], axis=1)
+    coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+    a = float(coef[0])
+    b = float(coef[1])
+    if a <= 0.0:
+        raise ValueError("fit produced non-positive intercept (cannot compute S0)")
+
+    s0 = 1.0 / a
+    xi = float(np.sqrt(b / a)) if b > 0.0 else float("nan")
+    return {"s0": float(s0), "xi_nm": xi, "a": a, "b": b}
+
+
+def number_density_nm3(n_particles: int, box_nm: Any) -> float:
+    """
+    Number density rho in 1/nm^3 from N particles in a box (orthorhombic).
+    """
+    box = _box_lengths_nm(box_nm)
+    vol = float(box[0] * box[1] * box[2])
+    if vol <= 0.0:
+        raise ValueError("box volume must be positive")
+    return float(n_particles) / vol
+
+
+def b2_from_s0(rho_nm3: float, s0: float) -> float:
+    """
+    Osmotic second virial coefficient B2 (nm^3) from S(0) and rho.
+
+    Uses: 1/S(0) = 1 + 2 B2 rho + O(rho^2)
+    """
+    rho = float(rho_nm3)
+    if rho <= 0.0:
+        raise ValueError("rho must be positive")
+    s0f = float(s0)
+    if s0f <= 0.0:
+        raise ValueError("S0 must be positive")
+    return (1.0 / s0f - 1.0) / (2.0 * rho)
+
+
+def fit_virial_coefficients_from_s0(
+    rho_nm3: Sequence[float],
+    s0: Sequence[float],
+    *,
+    max_order: int = 3,
+) -> dict[str, float]:
+    """
+    Fit virial coefficients from S(0) vs density using:
+
+      1/S0 = 1 + 2 B2 rho + 3 B3 rho^2 + 4 B4 rho^3 + ...
+
+    Returns B2..Bmax_order in nm^(3*(k-1)).
+    """
+    rho = np.asarray(rho_nm3, dtype=np.float64).reshape(-1)
+    s0a = np.asarray(s0, dtype=np.float64).reshape(-1)
+    if rho.shape != s0a.shape:
+        raise ValueError("rho and s0 must have the same length")
+    if int(max_order) < 2:
+        raise ValueError("max_order must be >= 2")
+
+    y = 1.0 / s0a - 1.0
+    cols = []
+    names = []
+    for k in range(2, int(max_order) + 1):
+        cols.append(float(k) * (rho ** (k - 1)))
+        names.append(f"B{k}")
+
+    X = np.stack(cols, axis=1)
+    coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+
+    out: dict[str, float] = {}
+    for name, c in zip(names, coef):
+        out[name] = float(c)
+    return out
+
+
+def structure_factor_from_dcd(
+    dcd_file: Any,
+    template: Any,
+    *,
+    group_spec: str = "protein",
+    groups: Optional[Sequence[Sequence[int]]] = None,
+    center: str = "com",
+    unwrap: bool = True,
+    q_max: float = 3.0,
+    dq: float = 0.05,
+    n_max: Optional[Sequence[int]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    box_nm: Any = None,
+) -> dict[str, Any]:
+    """
+    Compute solute structure factor S(q) from a DCD trajectory.
+
+    - Reads the template via your PDBReader when `template` is a file/path.
+    - Streams the DCD via your iter_dcd() (mdtraj backend).
+    - Groups solute copies using StructureSelector(group_spec) unless `groups` is provided.
+    - Uses orthorhombic reciprocal vectors, radially averaged with bin width dq.
+    """
+    from .molecule_data import Model, PDBReader, Structure, iter_dcd
+
+    if isinstance(template, Model):
+        tmpl = template
+    elif isinstance(template, Structure):
+        tmpl = template.model
+    else:
+        tmpl = PDBReader(template).model
+
+    if groups is None:
+        grp = solute_groups(tmpl, group_spec=group_spec)
+    else:
+        grp = [np.asarray(g, dtype=np.int64) for g in groups]
+
+    masses = _atom_masses(tmpl)
+
+    it = iter_dcd(dcd_file, tmpl, chunk=int(chunk), stride=int(stride))
+    try:
+        coords0, boxes0 = next(it)
+    except StopIteration as exc:
+        raise ValueError("empty DCD stream") from exc
+
+    if box_nm is not None:
+        box_ref = _box_lengths_nm(box_nm)
+    elif boxes0 is not None:
+        box_ref = np.mean(boxes0, axis=0).astype(np.float64, copy=False)
+    else:
+        raise ValueError("box_nm must be provided (DCD has no unit cell)")
+
+    q_vec, q_mag = q_vectors_orthorhombic(box_ref, q_max=float(q_max), n_max=n_max)
+    acc = SqAccumulator(q_vec)
+
+    c0 = group_centers_nm(
+        coords0,
+        grp,
+        masses=masses,
+        box_nm=box_ref,
+        boxes_nm=boxes0,
+        center=center,
+        unwrap=unwrap,
+        wrap=True,
+    )
+    acc.add(c0)
+
+    for coords, boxes in it:
+        cc = group_centers_nm(
+            coords,
+            grp,
+            masses=masses,
+            box_nm=box_ref,
+            boxes_nm=boxes,
+            center=center,
+            unwrap=unwrap,
+            wrap=True,
+        )
+        acc.add(cc)
+
+    sq = acc.mean()
+    err = acc.stderr()
+    binned = radial_average_sq(q_mag, sq, dq=float(dq))
+
+    return {
+        "box_nm": box_ref,
+        "q_vec": q_vec,
+        "q_mag": q_mag,
+        "sq": sq,
+        "sq_stderr": err,
+        "q_bin": binned["q"],
+        "sq_bin": binned["sq"],
+        "counts_bin": binned["counts"],
+        "n_frames": int(acc.n_frames),
+        "n_particles": int(len(grp)),
+        "rho_nm3": number_density_nm3(len(grp), box_ref),
+    }

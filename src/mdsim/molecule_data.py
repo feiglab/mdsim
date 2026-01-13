@@ -1318,6 +1318,9 @@ class Structure:
     # Optional trajectory coordinates (nm), shape (n_models, n_atoms, 3)
     _coords_nm: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
 
+    # Optional unit cell lengths per frame (nm), shape (n_models, 3)
+    _box_nm: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+
     def __getitem__(self, idx: Union[int, slice]) -> Union[Model, list[Model]]:
         return self.models[idx]
 
@@ -3092,8 +3095,13 @@ def load_dcd(
 
     coords_nm = np.asarray(traj.xyz, dtype=np.float64)
 
+    box_nm = None
+    if traj.unitcell_lengths is not None:
+        box_nm = np.asarray(traj.unitcell_lengths, dtype=np.float64)
+
     s = Structure()
     s._coords_nm = coords_nm
+    s._box_nm = box_nm
 
     # Share topology across all models; no per-frame copies of chains/residues/atoms
     base_chain = tmpl_model.chain
@@ -3113,6 +3121,34 @@ def load_dcd(
         s.models.append(m)
 
     return s
+
+
+def iter_dcd(
+    dcd_file: FileLike,
+    template: Union[Structure, Model, FileLike],
+    *,
+    chunk: int = 200,
+    stride: int = 1,
+) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
+    """
+    Stream a DCD trajectory in chunks.
+
+    Yields
+    ------
+    coords_nm
+        Coordinates, shape (n_frames, n_atoms, 3), float64 in nm.
+    box_nm
+        Unit cell lengths, shape (n_frames, 3), float64 in nm, or None if absent.
+    """
+    _, tmpl_model = _ensure_template_model(template)
+    top = md.Topology.from_openmm(tmpl_model.topology())
+
+    for traj in md.iterload(dcd_file, top=top, chunk=int(chunk), stride=int(stride)):
+        coords_nm = np.asarray(traj.xyz, dtype=np.float64)
+        box_nm = None
+        if traj.unitcell_lengths is not None:
+            box_nm = np.asarray(traj.unitcell_lengths, dtype=np.float64)
+        yield coords_nm, box_nm
 
 
 # ----------------------------- helpers ---------------------------------------
