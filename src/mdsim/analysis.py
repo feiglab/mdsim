@@ -1232,6 +1232,119 @@ def _sq_single_dcd(
     return acc / float(n_frames), int(n_frames)
 
 
+def _q_vectors_cubic_or_ortho(box_nm: np.ndarray, q_max_nm1: float):
+    Lx, Ly, Lz = [float(x) for x in box_nm]
+    # integer bounds
+    nx_max = int(math.floor(q_max_nm1 * Lx / (2.0 * math.pi)))
+    ny_max = int(math.floor(q_max_nm1 * Ly / (2.0 * math.pi)))
+    nz_max = int(math.floor(q_max_nm1 * Lz / (2.0 * math.pi)))
+
+    qvecs = []
+    qmag = []
+    for nx in range(-nx_max, nx_max + 1):
+        for ny in range(-ny_max, ny_max + 1):
+            for nz in range(-nz_max, nz_max + 1):
+                if nx == 0 and ny == 0 and nz == 0:
+                    continue
+                qx = 2.0 * math.pi * nx / Lx
+                qy = 2.0 * math.pi * ny / Ly
+                qz = 2.0 * math.pi * nz / Lz
+                qm = math.sqrt(qx * qx + qy * qy + qz * qz)
+                if qm <= q_max_nm1:
+                    qvecs.append((qx, qy, qz))
+                    qmag.append(qm)
+    qvecs = np.asarray(qvecs, dtype=np.float64)  # (nq,3)
+    qmag = np.asarray(qmag, dtype=np.float64)  # (nq,)
+    return qvecs, qmag
+
+
+def _sq_single_dcd_recip(
+    dcd_file,
+    template_model,
+    *,
+    atom_indices,
+    groups,
+    masses,
+    center,
+    unwrap,
+    q_max_nm1,
+    dq_nm1,
+    stride,
+    chunk,
+    frame_start,
+    frame_stop,
+    box_nm,
+):
+    n_groups = int(len(groups))
+    if n_groups < 2:
+        raise ValueError("need >=2 groups to compute S(q)")
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    # Accumulate in q-shell bins
+    q_bins = np.arange(0.0, float(q_max_nm1) + float(dq_nm1), float(dq_nm1), dtype=np.float64)
+    q_cent = 0.5 * (q_bins[:-1] + q_bins[1:])
+    acc = np.zeros_like(q_cent, dtype=np.float64)
+    cnt = np.zeros_like(q_cent, dtype=np.int64)
+
+    n_frames = 0
+
+    for fi, (xyz_nm, box_frame_nm) in enumerate(
+        iter_dcd(
+            dcd_file,
+            template_model,
+            chunk=int(chunk),
+            stride=int(stride),
+            atom_indices=atom_indices,
+        )
+    ):
+        if fi < int(frame_start):
+            continue
+        if frame_stop is not None and fi >= int(frame_stop):
+            break
+
+        if box_frame_nm is None:
+            if box_fallback is None:
+                raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+            b = box_fallback
+        else:
+            b = np.asarray(box_frame_nm, dtype=np.float64).reshape(3)
+
+        if np.any(b <= 0.0):
+            raise ValueError("box lengths must be positive")
+
+        # group centers in [0,L)
+        centers = group_centers_nm(
+            xyz_nm, groups, masses=masses, box_nm=b, center=center, unwrap=bool(unwrap), wrap=True
+        )  # (n_groups,3)
+
+        # Build q-vectors for THIS frame's box (important for NPT)
+        qvecs, qmag = _q_vectors_cubic_or_ortho(b, float(q_max_nm1))  # (nq,3), (nq,)
+
+        # Compute rho(q) = sum_j exp(i q·r_j)
+        # Phase matrix: (nq, n_groups)
+        phase = qvecs @ centers.T
+        rho_re = np.sum(np.cos(phase), axis=1)
+        rho_im = np.sum(np.sin(phase), axis=1)
+        sq_qvec = (rho_re * rho_re + rho_im * rho_im) / float(n_groups)  # (nq,)
+
+        # Bin by |q|
+        bin_idx = np.searchsorted(q_bins, qmag, side="right") - 1
+        ok = (bin_idx >= 0) & (bin_idx < acc.size)
+        np.add.at(acc, bin_idx[ok], sq_qvec[ok])
+        np.add.at(cnt, bin_idx[ok], 1)
+
+        n_frames += 1
+
+    if n_frames <= 0:
+        raise ValueError("no frames selected for S(q) computation")
+
+    # average over q-vectors and frames
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sq = acc / np.maximum(cnt, 1)
+    return q_cent, sq, cnt, n_frames
+
+
 def structure_factor_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
@@ -1405,3 +1518,137 @@ def structure_factor_from_dcd_npt_debye(
         frame_stop=None,
         box_nm=box_nm,
     )
+
+
+def structure_factor_from_dcd_reciprocal(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    selection: Union[str, Sequence[Sequence[int]]] = "protein",
+    center: str = "cog",
+    unwrap: bool = True,
+    q_nm1: Optional[np.ndarray] = None,
+    q_min_nm1: Optional[float] = None,
+    q_max_nm1: float = 20.0,
+    n_q: int = 200,
+    stride: int = 1,
+    chunk: int = 500,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    box_nm: Optional[Sequence[float]] = None,
+) -> dict[str, Any]:
+    """Isotropically averaged S(q) from solute-group centers (Debye formula).
+
+    Uncertainties
+    -------------
+    - If multiple DCDs are provided: stderr across DCDs (treating each as a replicate).
+    - If only one DCD: uncertainties are returned as 0.
+    """
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    center_mode = str(center).strip().lower()
+    if center_mode not in {"cog", "com"}:
+        raise ValueError("center must be 'cog' or 'com'")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    if isinstance(selection, str):
+        groups_global = StructureSelector(selection).atom_lists(tmpl)
+    else:
+        groups_global = [[int(i) for i in g] for g in selection]
+
+    groups_global = [g for g in groups_global if g]
+    if len(groups_global) < 2:
+        raise ValueError("selection must yield >=2 non-empty groups")
+
+    atom_set: set[int] = set()
+    for g in groups_global:
+        atom_set.update(int(i) for i in g)
+    atom_indices = sorted(atom_set)
+
+    idx_map = {old: new for new, old in enumerate(atom_indices)}
+    groups = [np.asarray([idx_map[int(i)] for i in g], dtype=np.int32) for g in groups_global]
+
+    masses_sel = None
+    if center_mode == "com":
+        masses_all = atom_masses(tmpl_model)
+        masses_sel = np.asarray(masses_all[atom_indices], dtype=np.float64)
+
+    if q_nm1 is None:
+        b0 = _peek_first_box_nm(
+            dcd_list[0],
+            tmpl_model,
+            atom_indices,
+            int(stride),
+            box_nm=box_nm,
+        )
+        q0 = 2.0 * math.pi / float(np.min(b0))
+        qmin = float(q0 if q_min_nm1 is None else q_min_nm1)
+        qmax = float(q_max_nm1)
+        if int(n_q) < 2:
+            raise ValueError("n_q must be >= 2")
+        if qmax <= qmin:
+            raise ValueError("q_max_nm1 must be > q_min_nm1")
+        q = np.linspace(qmin, qmax, int(n_q), dtype=np.float64)
+        q_info = {"q_box_min_nm1": float(q0)}
+    else:
+        q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+        if q.size < 1:
+            raise ValueError("q_nm1 must be non-empty")
+        q_info = {}
+
+    sq_blocks: list[np.ndarray] = []
+    frames_per_block: list[int] = []
+
+    for dcd in dcd_list:
+        sq, n_frames = _sq_single_dcd_recip(
+            dcd,
+            tmpl_model,
+            atom_indices=atom_indices,
+            groups=groups,
+            masses=masses_sel,
+            center=center_mode,
+            unwrap=bool(unwrap),
+            q_nm1=q,
+            stride=int(stride),
+            chunk=int(chunk),
+            frame_start=int(frame_start),
+            frame_stop=frame_stop,
+            box_nm=box_nm,
+        )
+        sq_blocks.append(sq)
+        frames_per_block.append(int(n_frames))
+
+    sq_arr = np.stack(sq_blocks, axis=0)
+    sq_mean = np.mean(sq_arr, axis=0)
+
+    n_blocks = int(sq_arr.shape[0])
+    if n_blocks < 2:
+        sq_err = np.zeros_like(sq_mean)
+    else:
+        sq_err = np.std(sq_arr, axis=0, ddof=1) / math.sqrt(float(n_blocks))
+
+    out: dict[str, Any] = {
+        "q_nm1": q,
+        "q": q,  # alias
+        "sq": sq_mean,
+        "sq_err": sq_err,
+        "sq_stderr": sq_err,  # alias
+        "n_blocks": n_blocks,
+        "frames_per_block": np.asarray(frames_per_block, dtype=np.int64),
+        "selection": selection,
+        "center": center_mode,
+        "unwrap": bool(unwrap),
+        "stride": int(stride),
+    }
+    out.update(q_info)
+    return out
