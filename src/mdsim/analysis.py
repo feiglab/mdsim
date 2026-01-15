@@ -1258,93 +1258,6 @@ def _q_vectors_cubic_or_ortho(box_nm: np.ndarray, q_max_nm1: float):
     return qvecs, qmag
 
 
-def _sq_single_dcd_recip(
-    dcd_file,
-    template_model,
-    *,
-    atom_indices,
-    groups,
-    masses,
-    center,
-    unwrap,
-    q_max_nm1,
-    dq_nm1,
-    stride,
-    chunk,
-    frame_start,
-    frame_stop,
-    box_nm,
-):
-    n_groups = int(len(groups))
-    if n_groups < 2:
-        raise ValueError("need >=2 groups to compute S(q)")
-
-    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
-
-    # Accumulate in q-shell bins
-    q_bins = np.arange(0.0, float(q_max_nm1) + float(dq_nm1), float(dq_nm1), dtype=np.float64)
-    q_cent = 0.5 * (q_bins[:-1] + q_bins[1:])
-    acc = np.zeros_like(q_cent, dtype=np.float64)
-    cnt = np.zeros_like(q_cent, dtype=np.int64)
-
-    n_frames = 0
-
-    for fi, (xyz_nm, box_frame_nm) in enumerate(
-        iter_dcd(
-            dcd_file,
-            template_model,
-            chunk=int(chunk),
-            stride=int(stride),
-            atom_indices=atom_indices,
-        )
-    ):
-        if fi < int(frame_start):
-            continue
-        if frame_stop is not None and fi >= int(frame_stop):
-            break
-
-        if box_frame_nm is None:
-            if box_fallback is None:
-                raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
-            b = box_fallback
-        else:
-            b = np.asarray(box_frame_nm, dtype=np.float64).reshape(3)
-
-        if np.any(b <= 0.0):
-            raise ValueError("box lengths must be positive")
-
-        # group centers in [0,L)
-        centers = group_centers_nm(
-            xyz_nm, groups, masses=masses, box_nm=b, center=center, unwrap=bool(unwrap), wrap=True
-        )  # (n_groups,3)
-
-        # Build q-vectors for THIS frame's box (important for NPT)
-        qvecs, qmag = _q_vectors_cubic_or_ortho(b, float(q_max_nm1))  # (nq,3), (nq,)
-
-        # Compute rho(q) = sum_j exp(i q·r_j)
-        # Phase matrix: (nq, n_groups)
-        phase = qvecs @ centers.T
-        rho_re = np.sum(np.cos(phase), axis=1)
-        rho_im = np.sum(np.sin(phase), axis=1)
-        sq_qvec = (rho_re * rho_re + rho_im * rho_im) / float(n_groups)  # (nq,)
-
-        # Bin by |q|
-        bin_idx = np.searchsorted(q_bins, qmag, side="right") - 1
-        ok = (bin_idx >= 0) & (bin_idx < acc.size)
-        np.add.at(acc, bin_idx[ok], sq_qvec[ok])
-        np.add.at(cnt, bin_idx[ok], 1)
-
-        n_frames += 1
-
-    if n_frames <= 0:
-        raise ValueError("no frames selected for S(q) computation")
-
-    # average over q-vectors and frames
-    with np.errstate(invalid="ignore", divide="ignore"):
-        sq = acc / np.maximum(cnt, 1)
-    return q_cent, sq, cnt, n_frames
-
-
 def structure_factor_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
@@ -1520,6 +1433,151 @@ def structure_factor_from_dcd_npt_debye(
     )
 
 
+def _sq_single_dcd_recip(
+    dcd_file: FileLike,
+    template_model: Any,
+    *,
+    atom_indices: Sequence[int],
+    groups: Sequence[np.ndarray],
+    masses: Optional[np.ndarray],
+    center: str,
+    unwrap: bool,
+    q_nm1: np.ndarray,
+    stride: int,
+    chunk: int,
+    frame_start: int,
+    frame_stop: Optional[int],
+    box_nm: Optional[Sequence[float]],
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Reciprocal-space S(q) estimator for a periodic box:
+
+        S(q) = < |sum_j exp(i q·r_j)|^2 / N >  (binned isotropically by |q|)
+
+    Parameters
+    ----------
+    q_nm1
+        1D array of *bin centers* in nm^-1. Binning is done using midpoints between
+        centers as bin edges; values outside the edge range are ignored.
+
+    Returns
+    -------
+    sq_nm1 : (n_q,) float
+        S(q) at the provided bin centers.
+    n_qvec_per_bin : (n_q,) int
+        Number of reciprocal vectors accumulated into each bin (summed across frames).
+        Useful for diagnosing noisy low-q bins.
+    n_frames : int
+        Number of frames used.
+    """
+    n_groups = int(len(groups))
+    if n_groups < 2:
+        raise ValueError("need >=2 groups to compute S(q)")
+
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    if q.size < 1:
+        raise ValueError("q_nm1 must be non-empty")
+    if np.any(~np.isfinite(q)):
+        raise ValueError("q_nm1 contains non-finite values")
+
+    # Enforce strictly increasing bin centers (required for robust edge construction).
+    if np.any(np.diff(q) <= 0.0):
+        raise ValueError("q_nm1 must be strictly increasing for reciprocal binning")
+
+    # Construct bin edges from centers:
+    # edges[0] = q0 - dq0/2 ; edges[i] = (q[i-1]+q[i])/2 ; edges[-1] = q[-1] + dqlast/2
+    mid = 0.5 * (q[:-1] + q[1:])
+    left = q[0] - 0.5 * (q[1] - q[0])
+    right = q[-1] + 0.5 * (q[-1] - q[-2]) if q.size > 1 else q[-1] + 1e-6
+    q_edges = np.concatenate(([left], mid, [right])).astype(np.float64)
+
+    # Guard against non-positive left edge due to user q starting very near 0
+    # (not mathematically illegal, but it makes binning more intuitive).
+    if q_edges[0] < 0.0:
+        q_edges[0] = 0.0
+
+    acc = np.zeros_like(q, dtype=np.float64)
+    cnt = np.zeros_like(q, dtype=np.int64)  # counts of q-vectors accumulated (across frames)
+    n_frames = 0
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    for fi, (xyz_nm, box_frame_nm) in enumerate(
+        iter_dcd(
+            dcd_file,
+            template_model,
+            chunk=int(chunk),
+            stride=int(stride),
+            atom_indices=atom_indices,
+        )
+    ):
+        if fi < int(frame_start):
+            continue
+        if frame_stop is not None and fi >= int(frame_stop):
+            break
+
+        if box_frame_nm is None:
+            if box_fallback is None:
+                raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+            b = box_fallback
+        else:
+            b = np.asarray(box_frame_nm, dtype=np.float64).reshape(3)
+
+        if np.any(b <= 0.0):
+            raise ValueError("box lengths must be positive")
+
+        # One position per group (protein) in [0, L)
+        centers = group_centers_nm(
+            xyz_nm,
+            groups,
+            masses=masses,
+            box_nm=b,
+            center=center,
+            unwrap=bool(unwrap),
+            wrap=True,
+        )  # (n_groups, 3)
+
+        # Build allowed reciprocal vectors for this frame's box (NPT-safe)
+        qvecs, qmag = _q_vectors_cubic_or_ortho(b, float(q_edges[-1]))  # include up to max edge
+        if qvecs.size == 0:
+            n_frames += 1
+            continue
+
+        # Keep only vectors within the bin edge range
+        m = (qmag >= float(q_edges[0])) & (qmag < float(q_edges[-1]))
+        if not np.any(m):
+            n_frames += 1
+            continue
+        qvecs = qvecs[m]
+        qmag = qmag[m]
+
+        # rho(q) = sum_j exp(i q·r_j)
+        phase = qvecs @ centers.T  # (nq, n_groups)
+        rho_re = np.sum(np.cos(phase), axis=1)
+        rho_im = np.sum(np.sin(phase), axis=1)
+        sq_qvec = (rho_re * rho_re + rho_im * rho_im) / float(n_groups)  # (nq,)
+
+        # Bin by |q| to the provided q centers
+        bin_idx = np.searchsorted(q_edges, qmag, side="right") - 1
+        ok = (bin_idx >= 0) & (bin_idx < acc.size)
+        np.add.at(acc, bin_idx[ok], sq_qvec[ok])
+        np.add.at(cnt, bin_idx[ok], 1)
+
+        n_frames += 1
+
+    if n_frames <= 0:
+        raise ValueError("no frames selected for S(q) computation")
+
+    # Average over all q-vectors accumulated (across all frames) per bin.
+    # This is equivalent to averaging per-frame then across frames only if each frame
+    # has the same set of q-vectors; in NPT the set can change slightly, and this
+    # weighted average is typically what you want.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sq = acc / np.maximum(cnt, 1)
+
+    return sq, cnt, int(n_frames)
+
+
 def structure_factor_from_dcd_reciprocal(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
@@ -1537,12 +1595,21 @@ def structure_factor_from_dcd_reciprocal(
     frame_stop: Optional[int] = None,
     box_nm: Optional[Sequence[float]] = None,
 ) -> dict[str, Any]:
-    """Isotropically averaged S(q) from solute-group centers (Debye formula).
+    """
+    Isotropically averaged S(q) from solute-group centers using the *reciprocal-space*
+    estimator appropriate for periodic boundary conditions.
+
+    Callable like structure_factor_from_dcd().
 
     Uncertainties
     -------------
     - If multiple DCDs are provided: stderr across DCDs (treating each as a replicate).
     - If only one DCD: uncertainties are returned as 0.
+
+    Notes
+    -----
+    - q_nm1 is interpreted as desired *bin centers* (must be strictly increasing).
+    - If q_nm1 is None: a linear grid is constructed like structure_factor_from_dcd().
     """
     dcd_list = _as_file_list(dcd_files)
     if not dcd_list:
@@ -1583,6 +1650,7 @@ def structure_factor_from_dcd_reciprocal(
         masses_all = atom_masses(tmpl_model)
         masses_sel = np.asarray(masses_all[atom_indices], dtype=np.float64)
 
+    # Build the requested q grid exactly like structure_factor_from_dcd()
     if q_nm1 is None:
         b0 = _peek_first_box_nm(
             dcd_list[0],
@@ -1606,11 +1674,13 @@ def structure_factor_from_dcd_reciprocal(
             raise ValueError("q_nm1 must be non-empty")
         q_info = {}
 
+    # Replicate-by-replicate (DCD-by-DCD)
     sq_blocks: list[np.ndarray] = []
+    cnt_blocks: list[np.ndarray] = []
     frames_per_block: list[int] = []
 
     for dcd in dcd_list:
-        sq, n_frames = _sq_single_dcd_recip(
+        sq, cnt, n_frames = _sq_single_dcd_recip(
             dcd,
             tmpl_model,
             atom_indices=atom_indices,
@@ -1626,6 +1696,7 @@ def structure_factor_from_dcd_reciprocal(
             box_nm=box_nm,
         )
         sq_blocks.append(sq)
+        cnt_blocks.append(cnt)
         frames_per_block.append(int(n_frames))
 
     sq_arr = np.stack(sq_blocks, axis=0)
@@ -1636,6 +1707,9 @@ def structure_factor_from_dcd_reciprocal(
         sq_err = np.zeros_like(sq_mean)
     else:
         sq_err = np.std(sq_arr, axis=0, ddof=1) / math.sqrt(float(n_blocks))
+
+    # Diagnostics: average number of q-vectors per bin (across replicates).
+    cnt_mean = np.mean(np.stack(cnt_blocks, axis=0).astype(np.float64), axis=0)
 
     out: dict[str, Any] = {
         "q_nm1": q,
@@ -1649,6 +1723,7 @@ def structure_factor_from_dcd_reciprocal(
         "center": center_mode,
         "unwrap": bool(unwrap),
         "stride": int(stride),
+        "qvecs_per_bin_mean": cnt_mean,
     }
     out.update(q_info)
     return out
