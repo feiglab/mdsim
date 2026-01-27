@@ -2155,6 +2155,9 @@ def clusters_from_dcd(
     frames_used = 0
 
     for dcd in dcd_list:
+        if progress:
+            _progress_print(f"reading dcd: {dcd}", stream=progress_stream)
+
         box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
 
         for fi, (xyz_nm, box_frame_nm) in enumerate(
