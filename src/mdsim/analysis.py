@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import math
+import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1730,6 +1732,23 @@ def structure_factor_from_dcd_reciprocal(
     return out
 
 
+def _fmt_hms(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds - 3600 * h) // 60)
+    s = seconds - 3600 * h - 60 * m
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:04.1f}"
+    return f"{m:d}:{s:04.1f}"
+
+
+def _progress_print(msg: str, *, stream=None) -> None:
+    if stream is None:
+        stream = sys.stderr
+    stream.write(msg + "\n")
+    stream.flush()
+
+
 # ---- clustering by heavy-atom contacts -------------------------------------
 
 
@@ -2014,6 +2033,10 @@ def clusters_from_dcd(
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
     box_nm: Optional[Sequence[float]] = None,
+    progress: bool = False,
+    progress_every: int = 200,
+    progress_min_interval_s: float = 10.0,
+    progress_stream=None,
 ) -> dict[str, Any]:
     """
     Identify transient clusters of solute copies (typically proteins) based on
@@ -2060,6 +2083,17 @@ def clusters_from_dcd(
         raise ValueError("chunk must be >= 1")
     if int(frame_start) < 0:
         raise ValueError("frame_start must be >= 0")
+
+    t0 = time.time()
+    last_print = t0
+
+    if progress:
+        _progress_print(
+            f"[clusters] start: n_dcd={len(dcd_list)} stride={stride} chunk={chunk} "
+            f"frame_start={frame_start} frame_stop={frame_stop} "
+            f"cutoff_nm={dist_cutoff_nm} contacts>={contact_threshold}",
+            stream=progress_stream,
+        )
 
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
@@ -2172,6 +2206,48 @@ def clusters_from_dcd(
             frac_in_clusters_by_frame.append(frac)
 
             frames_used += 1
+
+            if progress:
+                now = time.time()
+                do_frame_print = (progress_every > 0) and (frames_used % int(progress_every) == 0)
+                do_time_print = (progress_min_interval_s > 0.0) and (
+                    (now - last_print) >= float(progress_min_interval_s)
+                )
+
+                if do_frame_print or do_time_print:
+                    elapsed = now - t0
+                    rate = frames_used / elapsed if elapsed > 0 else float("nan")
+
+                    # Best-effort total estimate (only if we can infer it)
+                    # If your iter_dcd provides a known number of frames, plug it here.
+                    frames_total_est = None  # leave None unless you can compute it reliably
+
+                    if frames_total_est is not None and frames_total_est > 0 and frames_used > 0:
+                        remaining = max(0, int(frames_total_est) - frames_used)
+                        eta_s = remaining / rate if rate > 0 else float("inf")
+                        _progress_print(
+                            f"[clusters] frames={frames_used}/{frames_total_est} "
+                            f"elapsed={_fmt_hms(elapsed)} rate={rate:6.2f} f/s "
+                            + f"ETA={_fmt_hms(eta_s)}",
+                            stream=progress_stream,
+                        )
+                    else:
+                        _progress_print(
+                            f"[clusters] frames={frames_used} elapsed={_fmt_hms(elapsed)} "
+                            + f"rate={rate:6.2f} f/s",
+                            stream=progress_stream,
+                        )
+
+                    last_print = now
+
+    if progress:
+        dt = time.time() - t0
+        rate = frames_used / dt if dt > 0 else float("nan")
+        _progress_print(
+            f"[clusters] done. frames={frames_used}  elapsed={_fmt_hms(dt)}  "
+            + f"rate={rate:6.2f} frames/s",
+            stream=progress_stream,
+        )
 
     return {
         "clusters_by_frame": clusters_by_frame,
