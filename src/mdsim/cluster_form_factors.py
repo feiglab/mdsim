@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 import numpy as np
 
@@ -226,6 +226,179 @@ def debye_intensity_nm(
     return out
 
 
+# ---------------------------
+# Parallel frame processing
+# ---------------------------
+
+# The ProcessPoolExecutor initializer stores these read-only objects in each worker.
+_G_PROT_GROUPS_SEL: Optional[list[np.ndarray]] = None
+_G_PROT_LENS: Optional[np.ndarray] = None
+_G_W_SEL: Optional[np.ndarray] = None
+_G_Q: Optional[np.ndarray] = None
+_G_ATOM_BLOCK: int = 512
+_G_Q_BLOCK: int = 64
+_G_BLAS_THREADS: int = 1
+
+
+def _init_frame_worker(
+    prot_groups_sel: list[np.ndarray],
+    prot_lens: np.ndarray,
+    w_sel: np.ndarray,
+    q_nm1: np.ndarray,
+    atom_block: int,
+    q_block: int,
+    blas_threads: int,
+) -> None:
+    global _G_PROT_GROUPS_SEL, _G_PROT_LENS, _G_W_SEL, _G_Q
+    global _G_ATOM_BLOCK, _G_Q_BLOCK, _G_BLAS_THREADS
+
+    _G_PROT_GROUPS_SEL = prot_groups_sel
+    _G_PROT_LENS = np.asarray(prot_lens, dtype=np.int64)
+    _G_W_SEL = np.asarray(w_sel, dtype=np.float64)
+    _G_Q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    _G_ATOM_BLOCK = int(atom_block)
+    _G_Q_BLOCK = int(q_block)
+    _G_BLAS_THREADS = int(blas_threads)
+
+
+def _process_frame_batch_core(
+    xyz_batch_nm: np.ndarray,
+    box_batch_nm: np.ndarray,
+    clusters_batch: list[list[list[int]]],
+    prot_groups_sel: list[np.ndarray],
+    prot_lens: np.ndarray,
+    w_sel: np.ndarray,
+    q_nm1: np.ndarray,
+    *,
+    atom_block: int,
+    q_block: int,
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
+    """
+    Compute partial accumulators for a batch of frames.
+
+    Returns:
+        sums[m]  = sum over cluster-instances of size m of (I(q)/m)
+        sums2[m] = sum over cluster-instances of size m of (I(q)/m)^2
+        counts[m]= number of cluster-instances of size m
+    """
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+
+    sums: dict[int, np.ndarray] = defaultdict(lambda: np.zeros_like(q))
+    sums2: dict[int, np.ndarray] = defaultdict(lambda: np.zeros_like(q))
+    counts: dict[int, int] = defaultdict(int)
+
+    xyz_batch_nm = np.asarray(xyz_batch_nm)
+    box_batch_nm = np.asarray(box_batch_nm, dtype=np.float64)
+
+    if xyz_batch_nm.ndim != 3 or xyz_batch_nm.shape[-1] != 3:
+        raise ValueError("xyz_batch_nm must have shape (n_frames, n_atoms, 3)")
+    if box_batch_nm.ndim != 2 or box_batch_nm.shape[-1] != 3:
+        raise ValueError("box_batch_nm must have shape (n_frames, 3)")
+    if xyz_batch_nm.shape[0] != box_batch_nm.shape[0]:
+        raise ValueError("xyz_batch_nm and box_batch_nm must have the same n_frames")
+
+    n_frames = int(xyz_batch_nm.shape[0])
+    n_prot = int(len(prot_groups_sel))
+
+    for fi in range(n_frames):
+        b = _box_lengths_nm(box_batch_nm[fi])
+        xyz_wr = _wrap_nm(np.asarray(xyz_batch_nm[fi], dtype=np.float64), b)
+
+        # Protein centers from wrapped coords (COG is sufficient for minimum-image shifts)
+        centers = np.empty((n_prot, 3), dtype=np.float64)
+        for pid, idx in enumerate(prot_groups_sel):
+            centers[pid] = xyz_wr[idx].mean(axis=0)
+
+        frame_clusters = clusters_batch[fi]
+        for cl in frame_clusters:
+            if not cl:
+                continue
+
+            prot_ids = np.asarray(cl, dtype=np.int32)
+            m = int(prot_ids.size)
+            if m < 1:
+                continue
+
+            c = centers[prot_ids]  # (m,3)
+            ref = c[0:1]
+            disp = c - ref
+            disp = _min_image_disp_nm(disp, b)
+            # shift per protein: centers_unwrapped - centers_wrapped
+            shifts = (ref + disp) - c  # (m,3)
+
+            n_atoms_cl = int(np.sum(prot_lens[prot_ids], dtype=np.int64))
+            if n_atoms_cl < 1:
+                continue
+
+            x_cl = np.empty((n_atoms_cl, 3), dtype=np.float64)
+            w_cl = np.empty((n_atoms_cl,), dtype=np.float64)
+
+            pos = 0
+            for k, pid in enumerate(prot_ids.tolist()):
+                idx = prot_groups_sel[int(pid)]
+                n_i = int(idx.size)
+                x_cl[pos : pos + n_i] = xyz_wr[idx] + shifts[k]
+                w_cl[pos : pos + n_i] = w_sel[idx]
+                pos += n_i
+
+            i_q = debye_intensity_nm(
+                x_cl,
+                q,
+                w_cl,
+                atom_block=atom_block,
+                q_block=q_block,
+            )
+            i_per = i_q / float(m)
+
+            sums[m] += i_per
+            sums2[m] += i_per * i_per
+            counts[m] += 1
+
+    return sums, sums2, counts
+
+
+def _process_frame_batch_worker(
+    xyz_batch_nm: np.ndarray,
+    box_batch_nm: np.ndarray,
+    clusters_batch: list[list[list[int]]],
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
+    """Worker entry point (requires _init_frame_worker to have run)."""
+    if _G_PROT_GROUPS_SEL is None or _G_PROT_LENS is None or _G_W_SEL is None or _G_Q is None:
+        raise RuntimeError("worker globals not initialized")
+
+    try:
+        from threadpoolctl import threadpool_limits
+    except Exception:  # pragma: no cover
+        threadpool_limits = None  # type: ignore[assignment]
+
+    if threadpool_limits is None:
+        return _process_frame_batch_core(
+            xyz_batch_nm,
+            box_batch_nm,
+            clusters_batch,
+            _G_PROT_GROUPS_SEL,
+            _G_PROT_LENS,
+            _G_W_SEL,
+            _G_Q,
+            atom_block=_G_ATOM_BLOCK,
+            q_block=_G_Q_BLOCK,
+        )
+
+    # Limit BLAS/OpenMP threads inside each worker to avoid oversubscription.
+    with threadpool_limits(limits=max(1, int(_G_BLAS_THREADS))):
+        return _process_frame_batch_core(
+            xyz_batch_nm,
+            box_batch_nm,
+            clusters_batch,
+            _G_PROT_GROUPS_SEL,
+            _G_PROT_LENS,
+            _G_W_SEL,
+            _G_Q,
+            atom_block=_G_ATOM_BLOCK,
+            q_block=_G_Q_BLOCK,
+        )
+
+
 @dataclass
 class ClusterFFResult:
     q_nm1: np.ndarray
@@ -251,15 +424,24 @@ def cluster_form_factors_from_dcd(
     weights: str = "unity",
     atom_block: int = 512,
     q_block: int = 64,
+    # Parallelism
+    parallel: Literal["none", "frames"] = "none",
     n_workers: int = 1,
+    frames_per_task: int = 2,
+    use_processes: bool = True,
+    blas_threads: int = 1,
+    max_pending_tasks: Optional[int] = None,
     verbose: bool = False,
 ) -> ClusterFFResult:
     """
-    For each frame: for each cluster, unwrap cluster, compute I(q), normalize by m.
-    Accumulate mean +/- stderr across all cluster *instances* of a given size.
+    For each frame: for each cluster, build a contiguous cluster by minimum-image shifts,
+    compute I(q) via the Debye sum, normalize by cluster size m.
 
-    clusters must be the dict returned by clusters_from_dcd(), with matching
-    dcd_files/stride/frame selection (same frame order).
+    Accumulates mean +/- stderr across all cluster *instances* of a given size.
+
+    Parallelization:
+        If parallel == "frames" and n_workers > 1, frames are processed in parallel
+        (recommended when you have few clusters per frame).
     """
     dcd_list = [dcd_files] if isinstance(dcd_files, (str, Path)) else list(dcd_files)
     clusters_by_frame = clusters.get("clusters_by_frame")
@@ -280,11 +462,8 @@ def cluster_form_factors_from_dcd(
     if int(clusters.get("n_proteins", n_prot)) != n_prot:
         raise ValueError("clusters n_proteins does not match selection-derived protein count")
 
+    prot_lens = np.asarray([int(g.size) for g in prot_groups_sel], dtype=np.int64)
     w_sel = _atomic_weights_for_selection(tmpl_model, atom_indices_full, weights=weights)
-
-    # Pre-cast protein atom index lists once (avoids repeated astype inside tight loops)
-    prot_groups_i64: list[np.ndarray] = [g.astype(np.int64, copy=False) for g in prot_groups_sel]
-    prot_n_atoms = np.asarray([g.size for g in prot_groups_i64], dtype=np.int32)
 
     if q_nm1 is None:
         if int(n_q) < 2:
@@ -299,113 +478,201 @@ def cluster_form_factors_from_dcd(
     sums2: dict[int, np.ndarray] = defaultdict(lambda: np.zeros_like(q))
     counts: dict[int, int] = defaultdict(int)
 
+    def _merge_partials(
+        psums: dict[int, np.ndarray],
+        psums2: dict[int, np.ndarray],
+        pcounts: dict[int, int],
+    ) -> None:
+        for m, v in psums.items():
+            sums[int(m)] += np.asarray(v, dtype=np.float64)
+        for m, v in psums2.items():
+            sums2[int(m)] += np.asarray(v, dtype=np.float64)
+        for m, c in pcounts.items():
+            counts[int(m)] += int(c)
+
     fi_global = 0
     box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
 
-    use_threads = int(n_workers) > 1
-    pool = ThreadPoolExecutor(max_workers=int(n_workers)) if use_threads else None
-
-    for dcd in dcd_list:
-        if verbose:
-            print(f"reading from {dcd}")
-        for fi_local, (xyz_sel_nm, box_frame_nm) in enumerate(
-            iter_dcd(
-                dcd,
-                tmpl_model,
-                chunk=chunk,
-                stride=stride,
-                atom_indices=atom_indices_full,
-            )
-        ):
-            if fi_local < frame_start:
-                continue
-            if frame_stop is not None and fi_local >= int(frame_stop):
-                break
-
+    do_parallel = (str(parallel).lower() == "frames") and int(n_workers) > 1
+    if not do_parallel:
+        # Sequential streaming
+        for dcd in dcd_list:
             if verbose:
-                print(f"frame {fi_local}")
-
-            if fi_global >= len(clusters_by_frame):
-                raise ValueError("clusters_by_frame shorter than trajectory frames")
-
-            b = box_fallback if box_frame_nm is None else _box_lengths_nm(box_frame_nm)
-            if b is None:
-                raise ValueError("no unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
-
-            # Wrap coordinates once per frame (the old code did this once *per cluster*)
-            xyz_wrapped = _wrap_nm(np.asarray(xyz_sel_nm, dtype=np.float64), b)
-
-            # Precompute protein centers once per frame
-            centers_all = np.empty((n_prot, 3), dtype=np.float64)
-            for pid in range(n_prot):
-                idx = prot_groups_i64[pid]
-                centers_all[pid] = xyz_wrapped[idx].mean(axis=0)
-
-            frame_clusters = clusters_by_frame[fi_global]
-
-            def _one_cluster(cl: Any) -> tuple[int, Optional[np.ndarray]]:
-                prot_ids = np.asarray([int(x) for x in cl], dtype=np.int64)
-                m = int(prot_ids.size)
-                if m < 1:
-                    return 0, None
-
-                centers = centers_all[prot_ids]
-                ref = centers[0:1]
-                delta = centers - ref
-                disp = _min_image_disp_nm(delta, b)
-                shifts = disp - delta  # shift to add to each protein to make the cluster contiguous
-
-                total_atoms = int(np.sum(prot_n_atoms[prot_ids]))
-                x_cl = np.empty((total_atoms, 3), dtype=np.float64)
-                w_cl = np.empty((total_atoms,), dtype=np.float64)
-
-                off = 0
-                # Keep a deterministic atom ordering
-                for k, pid in enumerate(prot_ids.tolist()):
-                    idx = prot_groups_i64[pid]
-                    n_a = int(idx.size)
-                    x_cl[off : off + n_a] = xyz_wrapped[idx] + shifts[k]
-                    w_cl[off : off + n_a] = w_sel[idx]
-                    off += n_a
-
-                i_q = debye_intensity_nm(
-                    x_cl,
-                    q,
-                    w_cl,
-                    atom_block=atom_block,
-                    q_block=q_block,
+                print(f"reading from {dcd}")
+            for fi_local, (xyz_sel_nm, box_frame_nm) in enumerate(
+                iter_dcd(
+                    dcd,
+                    tmpl_model,
+                    chunk=chunk,
+                    stride=stride,
+                    atom_indices=atom_indices_full,
                 )
-                return m, i_q
+            ):
+                if fi_local < frame_start:
+                    continue
+                if frame_stop is not None and fi_local >= int(frame_stop):
+                    break
 
-            if pool is not None and len(frame_clusters) > 1:
-                # Threaded over clusters within the frame.
-                # Threading works here because the heavy work is in NumPy ufuncs (GIL released).
-                for m, i_q in pool.map(_one_cluster, frame_clusters):
-                    if m < 1 or i_q is None:
+                if fi_global >= len(clusters_by_frame):
+                    raise ValueError("clusters_by_frame shorter than trajectory frames")
+
+                b = box_fallback if box_frame_nm is None else _box_lengths_nm(box_frame_nm)
+                if b is None:
+                    raise ValueError("no unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+
+                frame_clusters = clusters_by_frame[fi_global]
+
+                ps, ps2, pc = _process_frame_batch_core(
+                    np.asarray(xyz_sel_nm)[None, :, :],
+                    np.asarray(b, dtype=np.float64)[None, :],
+                    [frame_clusters],
+                    prot_groups_sel,
+                    prot_lens,
+                    w_sel,
+                    q,
+                    atom_block=int(atom_block),
+                    q_block=int(q_block),
+                )
+                _merge_partials(ps, ps2, pc)
+                fi_global += 1
+    else:
+        # Parallel over frames (batching a small number of frames per task)
+        fw = max(1, int(n_workers))
+        fpt = max(1, int(frames_per_task))
+        max_pending = int(max_pending_tasks) if max_pending_tasks is not None else (2 * fw)
+
+        if use_processes:
+            executor = ProcessPoolExecutor(
+                max_workers=fw,
+                initializer=_init_frame_worker,
+                initargs=(
+                    prot_groups_sel,
+                    prot_lens,
+                    w_sel,
+                    q,
+                    int(atom_block),
+                    int(q_block),
+                    int(blas_threads),
+                ),
+            )
+            submit_fn = _process_frame_batch_worker
+        else:
+            # Thread backend (no pickling overhead, but can be limited by the GIL)
+            executor = ThreadPoolExecutor(max_workers=fw)
+
+            def submit_fn(  # type: ignore[misc]
+                xyz_batch_nm: np.ndarray,
+                box_batch_nm: np.ndarray,
+                clusters_batch: list[list[list[int]]],
+            ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
+                try:
+                    from threadpoolctl import threadpool_limits
+                except Exception:
+                    threadpool_limits = None  # type: ignore[assignment]
+
+                if threadpool_limits is None:
+                    return _process_frame_batch_core(
+                        xyz_batch_nm,
+                        box_batch_nm,
+                        clusters_batch,
+                        prot_groups_sel,
+                        prot_lens,
+                        w_sel,
+                        q,
+                        atom_block=int(atom_block),
+                        q_block=int(q_block),
+                    )
+                with threadpool_limits(limits=max(1, int(blas_threads))):
+                    return _process_frame_batch_core(
+                        xyz_batch_nm,
+                        box_batch_nm,
+                        clusters_batch,
+                        prot_groups_sel,
+                        prot_lens,
+                        w_sel,
+                        q,
+                        atom_block=int(atom_block),
+                        q_block=int(q_block),
+                    )
+
+        futures = []
+        batch_xyz: list[np.ndarray] = []
+        batch_box: list[np.ndarray] = []
+        batch_clusters: list[list[list[int]]] = []
+
+        def _submit_current_batch() -> None:
+            nonlocal batch_xyz, batch_box, batch_clusters, futures
+            if not batch_xyz:
+                return
+            xyz_b = np.ascontiguousarray(np.stack(batch_xyz, axis=0), dtype=np.float32)
+            box_b = np.ascontiguousarray(np.stack(batch_box, axis=0), dtype=np.float64)
+            cl_b = batch_clusters
+            futures.append(executor.submit(submit_fn, xyz_b, box_b, cl_b))
+            batch_xyz = []
+            batch_box = []
+            batch_clusters = []
+
+        try:
+            for dcd in dcd_list:
+                if verbose:
+                    print(f"reading from {dcd}")
+                for fi_local, (xyz_sel_nm, box_frame_nm) in enumerate(
+                    iter_dcd(
+                        dcd,
+                        tmpl_model,
+                        chunk=chunk,
+                        stride=stride,
+                        atom_indices=atom_indices_full,
+                    )
+                ):
+                    if fi_local < frame_start:
                         continue
-                    i_per = i_q / float(m)
-                    sums[m] += i_per
-                    sums2[m] += i_per * i_per
-                    counts[m] += 1
-            else:
-                for cl in frame_clusters:
-                    m, i_q = _one_cluster(cl)
-                    if m < 1 or i_q is None:
-                        continue
-                    i_per = i_q / float(m)
-                    sums[m] += i_per
-                    sums2[m] += i_per * i_per
-                    counts[m] += 1
+                    if frame_stop is not None and fi_local >= int(frame_stop):
+                        break
 
-            fi_global += 1
+                    if fi_global >= len(clusters_by_frame):
+                        raise ValueError("clusters_by_frame shorter than trajectory frames")
 
-    if pool is not None:
-        pool.shutdown(wait=True)
+                    b = box_fallback if box_frame_nm is None else _box_lengths_nm(box_frame_nm)
+                    if b is None:
+                        raise ValueError("no unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+
+                    frame_clusters = clusters_by_frame[fi_global]
+
+                    batch_xyz.append(np.asarray(xyz_sel_nm))
+                    batch_box.append(np.asarray(b, dtype=np.float64))
+                    batch_clusters.append(frame_clusters)
+
+                    fi_global += 1
+
+                    if len(batch_xyz) >= fpt:
+                        _submit_current_batch()
+
+                    # Keep the number of in-flight tasks bounded (limits RAM)
+                    if len(futures) >= max_pending:
+                        done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                        futures = list(not_done)
+                        for fut in done:
+                            ps, ps2, pc = fut.result()
+                            _merge_partials(ps, ps2, pc)
+
+            # Submit any remaining frames
+            _submit_current_batch()
+
+            # Drain remaining tasks
+            while futures:
+                done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                futures = list(not_done)
+                for fut in done:
+                    ps, ps2, pc = fut.result()
+                    _merge_partials(ps, ps2, pc)
+        finally:
+            executor.shutdown(wait=True)
 
     if fi_global != len(clusters_by_frame):
-        # ok if clusters had extra frames from other DCDs mismatch; fail safe:
         if fi_global < len(clusters_by_frame):
             raise ValueError("trajectory shorter than clusters_by_frame")
+        raise ValueError("trajectory longer than clusters_by_frame")
 
     sizes = np.array(sorted(counts.keys()), dtype=np.int64)
     i_mean = np.zeros((sizes.size, q.size), dtype=np.float64)
