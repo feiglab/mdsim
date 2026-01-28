@@ -251,7 +251,6 @@ def _init_frame_worker(
 ) -> None:
     global _G_PROT_GROUPS_SEL, _G_PROT_LENS, _G_W_SEL, _G_Q
     global _G_ATOM_BLOCK, _G_Q_BLOCK, _G_BLAS_THREADS
-
     _G_PROT_GROUPS_SEL = prot_groups_sel
     _G_PROT_LENS = np.asarray(prot_lens, dtype=np.int64)
     _G_W_SEL = np.asarray(w_sel, dtype=np.float64)
@@ -283,9 +282,12 @@ def _process_frame_batch_core(
     """
     q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
 
-    sums: dict[int, np.ndarray] = defaultdict(lambda: np.zeros_like(q))
-    sums2: dict[int, np.ndarray] = defaultdict(lambda: np.zeros_like(q))
-    counts: dict[int, int] = defaultdict(int)
+    # IMPORTANT: these dicts are returned from worker processes.
+    # Do NOT use defaultdict(lambda: ...) here: lambdas are not picklable and will
+    # crash ProcessPoolExecutor result serialization.
+    sums: dict[int, np.ndarray] = {}
+    sums2: dict[int, np.ndarray] = {}
+    counts: dict[int, int] = {}
 
     xyz_batch_nm = np.asarray(xyz_batch_nm)
     box_batch_nm = np.asarray(box_batch_nm, dtype=np.float64)
@@ -350,6 +352,10 @@ def _process_frame_batch_core(
             )
             i_per = i_q / float(m)
 
+            if m not in sums:
+                sums[m] = np.zeros_like(q)
+                sums2[m] = np.zeros_like(q)
+                counts[m] = 0
             sums[m] += i_per
             sums2[m] += i_per * i_per
             counts[m] += 1
