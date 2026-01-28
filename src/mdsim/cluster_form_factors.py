@@ -296,6 +296,7 @@ def cluster_form_factors_from_dcd(
     box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
 
     for dcd in dcd_list:
+        print(f"reading from {dcd}")
         for fi_local, (xyz_sel_nm, box_frame_nm) in enumerate(
             iter_dcd(
                 dcd,
@@ -309,6 +310,8 @@ def cluster_form_factors_from_dcd(
                 continue
             if frame_stop is not None and fi_local >= int(frame_stop):
                 break
+
+            print(f"frame {fi_local}")
 
             if fi_global >= len(clusters_by_frame):
                 raise ValueError("clusters_by_frame shorter than trajectory frames")
