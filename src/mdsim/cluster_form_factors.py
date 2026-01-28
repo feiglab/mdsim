@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -250,6 +251,8 @@ def cluster_form_factors_from_dcd(
     weights: str = "unity",
     atom_block: int = 512,
     q_block: int = 64,
+    n_workers: int = 1,
+    verbose: bool = False,
 ) -> ClusterFFResult:
     """
     For each frame: for each cluster, unwrap cluster, compute I(q), normalize by m.
@@ -279,6 +282,10 @@ def cluster_form_factors_from_dcd(
 
     w_sel = _atomic_weights_for_selection(tmpl_model, atom_indices_full, weights=weights)
 
+    # Pre-cast protein atom index lists once (avoids repeated astype inside tight loops)
+    prot_groups_i64: list[np.ndarray] = [g.astype(np.int64, copy=False) for g in prot_groups_sel]
+    prot_n_atoms = np.asarray([g.size for g in prot_groups_i64], dtype=np.int32)
+
     if q_nm1 is None:
         if int(n_q) < 2:
             raise ValueError("n_q must be >= 2")
@@ -295,8 +302,12 @@ def cluster_form_factors_from_dcd(
     fi_global = 0
     box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
 
+    use_threads = int(n_workers) > 1
+    pool = ThreadPoolExecutor(max_workers=int(n_workers)) if use_threads else None
+
     for dcd in dcd_list:
-        print(f"reading from {dcd}")
+        if verbose:
+            print(f"reading from {dcd}")
         for fi_local, (xyz_sel_nm, box_frame_nm) in enumerate(
             iter_dcd(
                 dcd,
@@ -311,7 +322,8 @@ def cluster_form_factors_from_dcd(
             if frame_stop is not None and fi_local >= int(frame_stop):
                 break
 
-            print(f"frame {fi_local}")
+            if verbose:
+                print(f"frame {fi_local}")
 
             if fi_global >= len(clusters_by_frame):
                 raise ValueError("clusters_by_frame shorter than trajectory frames")
@@ -320,21 +332,41 @@ def cluster_form_factors_from_dcd(
             if b is None:
                 raise ValueError("no unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
 
+            # Wrap coordinates once per frame (the old code did this once *per cluster*)
+            xyz_wrapped = _wrap_nm(np.asarray(xyz_sel_nm, dtype=np.float64), b)
+
+            # Precompute protein centers once per frame
+            centers_all = np.empty((n_prot, 3), dtype=np.float64)
+            for pid in range(n_prot):
+                idx = prot_groups_i64[pid]
+                centers_all[pid] = xyz_wrapped[idx].mean(axis=0)
+
             frame_clusters = clusters_by_frame[fi_global]
-            for cl in frame_clusters:
-                prot_ids = [int(x) for x in cl]
-                m = int(len(prot_ids))
+
+            def _one_cluster(cl: Any) -> tuple[int, Optional[np.ndarray]]:
+                prot_ids = np.asarray([int(x) for x in cl], dtype=np.int64)
+                m = int(prot_ids.size)
                 if m < 1:
-                    continue
+                    return 0, None
 
-                xyz_unw = _cluster_unwrap_coords_nm(xyz_sel_nm, b, prot_groups_sel, prot_ids)
+                centers = centers_all[prot_ids]
+                ref = centers[0:1]
+                delta = centers - ref
+                disp = _min_image_disp_nm(delta, b)
+                shifts = disp - delta  # shift to add to each protein to make the cluster contiguous
 
-                atom_mask = np.zeros(xyz_unw.shape[0], dtype=bool)
-                for pid in prot_ids:
-                    atom_mask[prot_groups_sel[int(pid)].astype(np.int64)] = True
+                total_atoms = int(np.sum(prot_n_atoms[prot_ids]))
+                x_cl = np.empty((total_atoms, 3), dtype=np.float64)
+                w_cl = np.empty((total_atoms,), dtype=np.float64)
 
-                x_cl = xyz_unw[atom_mask]
-                w_cl = w_sel[atom_mask]
+                off = 0
+                # Keep a deterministic atom ordering
+                for k, pid in enumerate(prot_ids.tolist()):
+                    idx = prot_groups_i64[pid]
+                    n_a = int(idx.size)
+                    x_cl[off : off + n_a] = xyz_wrapped[idx] + shifts[k]
+                    w_cl[off : off + n_a] = w_sel[idx]
+                    off += n_a
 
                 i_q = debye_intensity_nm(
                     x_cl,
@@ -343,13 +375,32 @@ def cluster_form_factors_from_dcd(
                     atom_block=atom_block,
                     q_block=q_block,
                 )
+                return m, i_q
 
-                i_per = i_q / float(m)
-                sums[m] += i_per
-                sums2[m] += i_per * i_per
-                counts[m] += 1
+            if pool is not None and len(frame_clusters) > 1:
+                # Threaded over clusters within the frame.
+                # Threading works here because the heavy work is in NumPy ufuncs (GIL released).
+                for m, i_q in pool.map(_one_cluster, frame_clusters):
+                    if m < 1 or i_q is None:
+                        continue
+                    i_per = i_q / float(m)
+                    sums[m] += i_per
+                    sums2[m] += i_per * i_per
+                    counts[m] += 1
+            else:
+                for cl in frame_clusters:
+                    m, i_q = _one_cluster(cl)
+                    if m < 1 or i_q is None:
+                        continue
+                    i_per = i_q / float(m)
+                    sums[m] += i_per
+                    sums2[m] += i_per * i_per
+                    counts[m] += 1
 
             fi_global += 1
+
+    if pool is not None:
+        pool.shutdown(wait=True)
 
     if fi_global != len(clusters_by_frame):
         # ok if clusters had extra frames from other DCDs mismatch; fail safe:
