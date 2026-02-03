@@ -177,6 +177,59 @@ def _protein_groups_from_selection(
     return tmpl_model, groups_sel, atom_indices, {"n_proteins": n_prot}
 
 
+def element_counts_for_selection(
+    pdb_file: FileLike,
+    selection: Union[str, list[list[int]]] = "protein",
+) -> dict[str, int]:
+    """
+    Diagnostic: count elements in the selected atoms (after union over groups).
+
+    Uses atom.element when present; missing/blank elements are counted as "UNK".
+    """
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    if isinstance(selection, str):
+        groups_full = StructureSelector(selection).atom_lists(tmpl)
+    else:
+        groups_full = [[int(i) for i in g] for g in selection]
+
+    groups_full = [g for g in groups_full if g]
+    if not groups_full:
+        raise ValueError("selection produced no atoms")
+
+    atom_set: set[int] = set()
+    for g in groups_full:
+        atom_set.update(int(i) for i in g)
+    atom_indices = sorted(atom_set)
+
+    counts: dict[str, int] = {}
+    for ai in atom_indices:
+        el = getattr(tmpl_model.atoms[int(ai)], "element", "") or ""
+        key = str(el).strip().upper() or "UNK"
+        counts[key] = counts.get(key, 0) + 1
+
+    # deterministic ordering for printing
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def print_element_counts(
+    pdb_file: FileLike,
+    selection: Union[str, list[list[int]]] = "protein",
+    *,
+    top_n: int | None = None,
+) -> None:
+    counts = element_counts_for_selection(pdb_file, selection=selection)
+    items = list(counts.items())
+    if top_n is not None:
+        items = items[: int(top_n)]
+
+    total = sum(counts.values())
+    print(f"Selected atoms: {total}")
+    for el, n in items:
+        print(f"{el:>4s}  {n:>8d}  ({n/total:6.2%})")
+
+
 def debye_intensity_nm(
     xyz_nm: np.ndarray,
     q_nm1: np.ndarray,
@@ -268,12 +321,8 @@ def debye_intensity_nm_xray(
     Debye sum with q-dependent atomic form factors:
         I(q) = sum_i sum_j f_i(q) f_j(q) sinc(q r_ij)
 
-    Inputs
-    ------
-    el_id : (n_atoms,) int
-        Element id per atom (indexes first axis of f_el_q).
-    f_el_q : (n_el, n_q) float
-        f(element, q) in electrons.
+    el_id: (n_atoms,) int indexes element table
+    f_el_q: (n_el, n_q) f(element, q) in electrons
     """
     x = np.asarray(xyz_nm, dtype=np.float64)
     q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
@@ -296,7 +345,7 @@ def debye_intensity_nm_xray(
     ab = max(32, int(atom_block))
     qb = max(16, int(q_block))
 
-    # i==j term: sum_i f_i(q)^2, accumulated in q-blocks
+    # i==j term: sum_i f_i(q)^2 (accumulate in q-blocks)
     for q0 in range(0, nq, qb):
         q1 = min(nq, q0 + qb)
         fi = ftab[el, q0:q1]  # (n_atoms, qb)
@@ -328,11 +377,12 @@ def debye_intensity_nm_xray(
                     qr = r[:, None] * q[q0:q1][None, :]
                     out[q0:q1] += 2.0 * np.sum(wp * _sinc(qr), axis=0)
 
-        # cross blocks: avoid repeat/tile element arrays
+        # cross blocks: avoid repeat/tile allocations
         for j0 in range(i1, n, ab):
             j1 = min(n, j0 + ab)
             xj = x[j0:j1]
             elj = el[j0:j1]
+            bj = j1 - j0
 
             d = xi[:, None, :] - xj[None, :, :]
             d2 = np.einsum("ijk,ijk->ij", d, d)
@@ -342,8 +392,6 @@ def debye_intensity_nm_xray(
 
             for ii in range(bi):
                 ri = r[ii]  # (bj,)
-                if ri.size == 0:
-                    continue
                 eli_i = int(eli[ii])
 
                 for q0 in range(0, nq, qb):
@@ -353,6 +401,9 @@ def debye_intensity_nm_xray(
                     wp = fj * fi[None, :]  # (bj, qb)
                     qr = ri[:, None] * q[q0:q1][None, :]
                     out[q0:q1] += 2.0 * np.sum(wp * _sinc(qr), axis=0)
+
+            # bj is used implicitly via shapes; keep it for clarity
+            _ = bj
 
     return out
 
@@ -405,8 +456,6 @@ def _process_frame_batch_core(
     q_block: int,
 ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
     """
-    Compute partial accumulators for a batch of frames.
-
     Returns:
         sums[m]  = sum over cluster-instances of size m of (I(q)/m)
         sums2[m] = sum over cluster-instances of size m of (I(q)/m)^2
@@ -428,6 +477,7 @@ def _process_frame_batch_core(
     if xyz_batch_nm.shape[0] != box_batch_nm.shape[0]:
         raise ValueError("xyz_batch_nm and box_batch_nm must have the same n_frames")
 
+    # Hoist weight tables out of inner loops
     if wspec.mode == "scalar":
         if wspec.w_sel is None:
             raise ValueError("wspec.w_sel is None for scalar mode")
@@ -452,135 +502,7 @@ def _process_frame_batch_core(
         for pid, idx in enumerate(prot_groups_sel):
             centers[pid] = xyz_wr[idx].mean(axis=0)
 
-        frame_clusters = clusters_batch[fi]
-        for cl in frame_clusters:
-            if not cl:
-                continue
-
-            prot_ids = np.asarray(cl, dtype=np.int32)
-            m = int(prot_ids.size)
-            if m < 1:
-                continue
-
-            c = centers[prot_ids]
-            ref = c[0:1]
-            disp = _min_image_disp_nm(c - ref, b)
-            shifts = (ref + disp) - c
-
-            n_atoms_cl = int(np.sum(prot_lens[prot_ids], dtype=np.int64))
-            if n_atoms_cl < 1:
-                continue
-
-            x_cl = np.empty((n_atoms_cl, 3), dtype=np.float64)
-            if wspec.mode == "scalar":
-                w_cl = np.empty((n_atoms_cl,), dtype=np.float64)
-            else:
-                el_cl = np.empty((n_atoms_cl,), dtype=np.int32)
-
-            pos = 0
-            for k, pid in enumerate(prot_ids.tolist()):
-                idx = prot_groups_sel[int(pid)]
-                n_i = int(idx.size)
-                x_cl[pos : pos + n_i] = xyz_wr[idx] + shifts[k]
-                if wspec.mode == "scalar":
-                    w_cl[pos : pos + n_i] = w_sel[idx]  # type: ignore[index]
-                else:
-                    el_cl[pos : pos + n_i] = el_sel[idx]  # type: ignore[index]
-                pos += n_i
-
-            if wspec.mode == "scalar":
-                i_q = debye_intensity_nm(
-                    x_cl,
-                    q,
-                    w_cl,  # type: ignore[arg-type]
-                    atom_block=atom_block,
-                    q_block=q_block,
-                )
-            else:
-                i_q = debye_intensity_nm_xray(
-                    x_cl,
-                    q,
-                    el_cl,  # type: ignore[arg-type]
-                    f_el_q,  # type: ignore[arg-type]
-                    atom_block=atom_block,
-                    q_block=q_block,
-                )
-
-            i_per = i_q / float(m)
-
-            if m not in sums:
-                sums[m] = np.zeros_like(q)
-                sums2[m] = np.zeros_like(q)
-                counts[m] = 0
-            sums[m] += i_per
-            sums2[m] += i_per * i_per
-            counts[m] += 1
-
-    return sums, sums2, counts
-
-
-def _process_frame_batch_core(
-    xyz_batch_nm: np.ndarray,
-    box_batch_nm: np.ndarray,
-    clusters_batch: list[list[list[int]]],
-    prot_groups_sel: list[np.ndarray],
-    prot_lens: np.ndarray,
-    wspec: _WeightSpec,
-    q_nm1: np.ndarray,
-    *,
-    atom_block: int,
-    q_block: int,
-) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
-    """
-    Compute partial accumulators for a batch of frames.
-
-    Returns:
-        sums[m]  = sum over cluster-instances of size m of (I(q)/m)
-        sums2[m] = sum over cluster-instances of size m of (I(q)/m)^2
-        counts[m]= number of cluster-instances of size m
-    """
-    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
-
-    sums: dict[int, np.ndarray] = {}
-    sums2: dict[int, np.ndarray] = {}
-    counts: dict[int, int] = {}
-
-    xyz_batch_nm = np.asarray(xyz_batch_nm)
-    box_batch_nm = np.asarray(box_batch_nm, dtype=np.float64)
-
-    if xyz_batch_nm.ndim != 3 or xyz_batch_nm.shape[-1] != 3:
-        raise ValueError("xyz_batch_nm must have shape (n_frames, n_atoms, 3)")
-    if box_batch_nm.ndim != 2 or box_batch_nm.shape[-1] != 3:
-        raise ValueError("box_batch_nm must have shape (n_frames, 3)")
-    if xyz_batch_nm.shape[0] != box_batch_nm.shape[0]:
-        raise ValueError("xyz_batch_nm and box_batch_nm must have the same n_frames")
-
-    if wspec.mode == "scalar":
-        if wspec.w_sel is None:
-            raise ValueError("wspec.w_sel is None for scalar mode")
-        w_sel = np.asarray(wspec.w_sel, dtype=np.float64)
-        el_sel = None
-        f_el_q = None
-    else:
-        if wspec.el_id_sel is None or wspec.f_el_q is None:
-            raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
-        el_sel = np.asarray(wspec.el_id_sel, dtype=np.int32)
-        f_el_q = np.asarray(wspec.f_el_q, dtype=np.float64)
-        w_sel = None
-
-    n_frames = int(xyz_batch_nm.shape[0])
-    n_prot = int(len(prot_groups_sel))
-
-    for fi in range(n_frames):
-        b = _box_lengths_nm(box_batch_nm[fi])
-        xyz_wr = _wrap_nm(np.asarray(xyz_batch_nm[fi], dtype=np.float64), b)
-
-        centers = np.empty((n_prot, 3), dtype=np.float64)
-        for pid, idx in enumerate(prot_groups_sel):
-            centers[pid] = xyz_wr[idx].mean(axis=0)
-
-        frame_clusters = clusters_batch[fi]
-        for cl in frame_clusters:
+        for cl in clusters_batch[fi]:
             if not cl:
                 continue
 
