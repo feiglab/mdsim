@@ -408,6 +408,190 @@ def debye_intensity_nm_xray(
     return out
 
 
+def _min_image_disp_nm_3d(d: np.ndarray, box_nm: np.ndarray) -> np.ndarray:
+    b = np.asarray(box_nm, dtype=np.float64).reshape(1, 1, 3)
+    return d - np.rint(d / b) * b
+
+
+def debye_intensity_nm_pbc(
+    xyz_nm: np.ndarray,
+    q_nm1: np.ndarray,
+    weights: np.ndarray,
+    box_nm: np.ndarray,
+    *,
+    atom_block: int = 512,
+    q_block: int = 64,
+) -> np.ndarray:
+    """
+    Debye sum with orthorhombic PBC (minimum image):
+        I(q) = sum_i sum_j w_i w_j sinc(q r_ij)
+    """
+    x = np.asarray(xyz_nm, dtype=np.float64)
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    if x.ndim != 2 or x.shape[1] != 3:
+        raise ValueError("xyz_nm must have shape (n_atoms, 3)")
+    if x.shape[0] != w.shape[0]:
+        raise ValueError("weights length must match number of atoms")
+    if q.size < 1:
+        raise ValueError("q_nm1 must be non-empty")
+    if np.any(box <= 0.0):
+        raise ValueError("box lengths must be positive")
+
+    n = int(x.shape[0])
+    nq = int(q.size)
+    out = np.zeros(nq, dtype=np.float64)
+
+    out += float(np.sum(w * w))
+    if n < 2:
+        return out
+
+    ab = max(32, int(atom_block))
+    qb = max(16, int(q_block))
+
+    for i0 in range(0, n, ab):
+        i1 = min(n, i0 + ab)
+        xi = x[i0:i1]
+        wi = w[i0:i1]
+        bi = i1 - i0
+
+        if bi >= 2:
+            di = xi[:, None, :] - xi[None, :, :]
+            di = _min_image_disp_nm_3d(di, box)
+            d2 = np.einsum("ijk,ijk->ij", di, di)
+            iu, ju = np.triu_indices(bi, k=1)
+            r = np.sqrt(d2[iu, ju])
+            wp = wi[iu] * wi[ju]
+            if r.size:
+                for q0 in range(0, nq, qb):
+                    q1 = min(nq, q0 + qb)
+                    qr = r[:, None] * q[q0:q1][None, :]
+                    out[q0:q1] += 2.0 * np.sum(wp[:, None] * _sinc(qr), axis=0)
+
+        for j0 in range(i1, n, ab):
+            j1 = min(n, j0 + ab)
+            xj = x[j0:j1]
+            wj = w[j0:j1]
+
+            d = xi[:, None, :] - xj[None, :, :]
+            d = _min_image_disp_nm_3d(d, box)
+            d2 = np.einsum("ijk,ijk->ij", d, d)
+            r = np.sqrt(d2).reshape(-1)
+            wp = (wi[:, None] * wj[None, :]).reshape(-1)
+
+            if r.size == 0:
+                continue
+            for q0 in range(0, nq, qb):
+                q1 = min(nq, q0 + qb)
+                qr = r[:, None] * q[q0:q1][None, :]
+                out[q0:q1] += 2.0 * np.sum(wp[:, None] * _sinc(qr), axis=0)
+
+    return out
+
+
+def debye_intensity_nm_xray_pbc(
+    xyz_nm: np.ndarray,
+    q_nm1: np.ndarray,
+    el_id: np.ndarray,
+    f_el_q: np.ndarray,
+    box_nm: np.ndarray,
+    *,
+    atom_block: int = 512,
+    q_block: int = 64,
+) -> np.ndarray:
+    """
+    Debye sum with q-dependent atomic form factors + orthorhombic PBC (minimum image):
+        I(q) = sum_i sum_j f_i(q) f_j(q) sinc(q r_ij)
+    """
+    x = np.asarray(xyz_nm, dtype=np.float64)
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    el = np.asarray(el_id, dtype=np.int32).reshape(-1)
+    ftab = np.asarray(f_el_q, dtype=np.float64)
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    if x.ndim != 2 or x.shape[1] != 3:
+        raise ValueError("xyz_nm must have shape (n_atoms, 3)")
+    if x.shape[0] != el.shape[0]:
+        raise ValueError("el_id length must match number of atoms")
+    if q.size < 1:
+        raise ValueError("q_nm1 must be non-empty")
+    if ftab.ndim != 2 or ftab.shape[1] != q.size:
+        raise ValueError("f_el_q must have shape (n_el, n_q) matching q_nm1")
+    if np.any(box <= 0.0):
+        raise ValueError("box lengths must be positive")
+
+    n = int(x.shape[0])
+    nq = int(q.size)
+    out = np.zeros(nq, dtype=np.float64)
+
+    ab = max(32, int(atom_block))
+    qb = max(16, int(q_block))
+
+    # i==j: sum_i f_i(q)^2
+    for q0 in range(0, nq, qb):
+        q1 = min(nq, q0 + qb)
+        fi = ftab[el, q0:q1]
+        out[q0:q1] += np.sum(fi * fi, axis=0)
+
+    if n < 2:
+        return out
+
+    for i0 in range(0, n, ab):
+        i1 = min(n, i0 + ab)
+        xi = x[i0:i1]
+        eli = el[i0:i1]
+        bi = i1 - i0
+
+        if bi >= 2:
+            di = xi[:, None, :] - xi[None, :, :]
+            di = _min_image_disp_nm_3d(di, box)
+            d2 = np.einsum("ijk,ijk->ij", di, di)
+            iu, ju = np.triu_indices(bi, k=1)
+            r = np.sqrt(d2[iu, ju])
+            if r.size:
+                el_i = eli[iu]
+                el_j = eli[ju]
+                for q0 in range(0, nq, qb):
+                    q1 = min(nq, q0 + qb)
+                    fi = ftab[el_i, q0:q1]
+                    fj = ftab[el_j, q0:q1]
+                    wp = fi * fj
+                    qr = r[:, None] * q[q0:q1][None, :]
+                    out[q0:q1] += 2.0 * np.sum(wp * _sinc(qr), axis=0)
+
+        for j0 in range(i1, n, ab):
+            j1 = min(n, j0 + ab)
+            xj = x[j0:j1]
+            elj = el[j0:j1]
+            bj = j1 - j0
+
+            d = xi[:, None, :] - xj[None, :, :]
+            d = _min_image_disp_nm_3d(d, box)
+            d2 = np.einsum("ijk,ijk->ij", d, d)
+            r = np.sqrt(d2)  # (bi, bj)
+            if r.size == 0:
+                continue
+
+            # Avoid repeat/tile allocations: loop small bi, vectorize over bj
+            for ii in range(bi):
+                ri = r[ii]
+                eli_i = int(eli[ii])
+
+                for q0 in range(0, nq, qb):
+                    q1 = min(nq, q0 + qb)
+                    fi = ftab[eli_i, q0:q1]
+                    fj = ftab[elj, q0:q1]
+                    wp = fj * fi[None, :]
+                    qr = ri[:, None] * q[q0:q1][None, :]
+                    out[q0:q1] += 2.0 * np.sum(wp * _sinc(qr), axis=0)
+
+            _ = bj  # keep if you want; remove if Ruff flags it
+
+    return out
+
+
 # ---------------------------
 # Parallel frame processing
 # ---------------------------
@@ -927,6 +1111,217 @@ def cluster_form_factors_from_dcd(
         i_per_protein_stderr=i_stderr,
         counts=np.array([counts[int(m)] for m in sizes.tolist()], dtype=np.int64),
     )
+
+
+@dataclass
+class FullDebyeResult:
+    q_nm1: np.ndarray
+    i_mean: np.ndarray
+    i_stderr: np.ndarray
+    n_frames: int
+
+
+def full_debye_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, list[FileLike]],
+    *,
+    selection: Union[str, list[list[int]]] = "protein",
+    q_nm1: Optional[np.ndarray] = None,
+    q_min_nm1: float = 0.2,
+    q_max_nm1: float = 20.0,
+    n_q: int = 200,
+    box_nm: Optional[list[float]] = None,
+    weights: str = "unity",
+    atom_block: int = 512,
+    q_block: int = 64,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    parallel: Literal["none", "frames"] = "none",
+    n_workers: int = 1,
+    frames_per_task: int = 1,
+    use_processes: bool = True,
+    blas_threads: int = 1,
+    max_pending_tasks: Optional[int] = None,
+    verbose: bool = False,
+) -> FullDebyeResult:
+    """
+    Full-system Debye intensity from selected atoms (includes inter-cluster correlations).
+
+    Computes per-frame I(q) using minimum-image distances in an orthorhombic box, then
+    returns mean +/- stderr across frames.
+    """
+    dcd_list = [dcd_files] if isinstance(dcd_files, (str, Path)) else list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    if isinstance(selection, str):
+        groups_full = StructureSelector(selection).atom_lists(tmpl)
+    else:
+        groups_full = [[int(i) for i in g] for g in selection]
+    groups_full = [g for g in groups_full if g]
+    if not groups_full:
+        raise ValueError("selection produced no atoms")
+
+    atom_set: set[int] = set()
+    for g in groups_full:
+        atom_set.update(int(i) for i in g)
+    atom_indices_full = sorted(atom_set)
+
+    # Build q grid first (needed for weights="xray")
+    if q_nm1 is None:
+        if int(n_q) < 2:
+            raise ValueError("n_q must be >= 2")
+        q = np.linspace(float(q_min_nm1), float(q_max_nm1), int(n_q), dtype=np.float64)
+    else:
+        q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+        if q.size < 1:
+            raise ValueError("q_nm1 must be non-empty")
+
+    wspec = _atomic_weights_for_selection(
+        tmpl_model,
+        atom_indices_full,
+        weights=weights,
+        q_nm1=q,
+    )
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    def _frame_iter():
+        for dcd in dcd_list:
+            if verbose:
+                print(f"reading from {dcd}")
+            for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+                iter_dcd(
+                    dcd,
+                    tmpl_model,
+                    chunk=int(chunk),
+                    stride=int(stride),
+                    atom_indices=atom_indices_full,
+                )
+            ):
+                if fi < int(frame_start):
+                    continue
+                if frame_stop is not None and fi >= int(frame_stop):
+                    break
+
+                if box_frame_nm is None:
+                    if box_fallback is None:
+                        raise ValueError("no unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+                    b = box_fallback
+                else:
+                    b = _box_lengths_nm(box_frame_nm)
+                yield np.asarray(xyz_sel_nm, dtype=np.float64), np.asarray(b, dtype=np.float64)
+
+    # Per-frame computation
+    do_parallel = (str(parallel).lower() == "frames") and int(n_workers) > 1
+
+    def _one_frame(xyz_nm: np.ndarray, b_nm: np.ndarray) -> np.ndarray:
+        # wrap to [0,L)
+        xyz_wr = _wrap_nm(xyz_nm, b_nm)
+        if wspec.mode == "scalar":
+            w_sel = np.asarray(wspec.w_sel, dtype=np.float64)  # type: ignore[arg-type]
+            return debye_intensity_nm_pbc(
+                xyz_wr,
+                q,
+                w_sel,
+                b_nm,
+                atom_block=int(atom_block),
+                q_block=int(q_block),
+            )
+        el_sel = np.asarray(wspec.el_id_sel, dtype=np.int32)  # type: ignore[arg-type]
+        f_el_q = np.asarray(wspec.f_el_q, dtype=np.float64)  # type: ignore[arg-type]
+        return debye_intensity_nm_xray_pbc(
+            xyz_wr,
+            q,
+            el_sel,
+            f_el_q,
+            b_nm,
+            atom_block=int(atom_block),
+            q_block=int(q_block),
+        )
+
+    frames: list[np.ndarray] = []
+
+    if not do_parallel:
+        for xyz_nm, b_nm in _frame_iter():
+            frames.append(_one_frame(xyz_nm, b_nm))
+    else:
+        fw = max(1, int(n_workers))
+        fpt = max(1, int(frames_per_task))
+        max_pending = int(max_pending_tasks) if max_pending_tasks is not None else (2 * fw)
+
+        if use_processes:
+            ex = ProcessPoolExecutor(max_workers=fw)
+        else:
+            ex = ThreadPoolExecutor(max_workers=fw)
+
+        futures = []
+        batch_xyz: list[np.ndarray] = []
+        batch_box: list[np.ndarray] = []
+
+        def _submit() -> None:
+            nonlocal batch_xyz, batch_box, futures
+            if not batch_xyz:
+                return
+
+            xyz_b = np.stack(batch_xyz, axis=0)
+            box_b = np.stack(batch_box, axis=0)
+
+            def _batch_job(xyz_batch, box_batch):
+                out = []
+                for i in range(xyz_batch.shape[0]):
+                    out.append(_one_frame(xyz_batch[i], box_batch[i]))
+                return out
+
+            futures.append(ex.submit(_batch_job, xyz_b, box_b))
+            batch_xyz = []
+            batch_box = []
+
+        try:
+            for xyz_nm, b_nm in _frame_iter():
+                batch_xyz.append(xyz_nm)
+                batch_box.append(b_nm)
+                if len(batch_xyz) >= fpt:
+                    _submit()
+
+                if len(futures) >= max_pending:
+                    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                    futures = list(not_done)
+                    for fut in done:
+                        frames.extend(fut.result())
+
+            _submit()
+            while futures:
+                done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                futures = list(not_done)
+                for fut in done:
+                    frames.extend(fut.result())
+        finally:
+            ex.shutdown(wait=True)
+
+    if not frames:
+        raise ValueError("no frames selected")
+
+    arr = np.stack(frames, axis=0)  # (n_frames, n_q)
+    i_mean = np.mean(arr, axis=0)
+    n_frames = int(arr.shape[0])
+    if n_frames >= 2:
+        i_stderr = np.std(arr, axis=0, ddof=1) / math.sqrt(float(n_frames))
+    else:
+        i_stderr = np.zeros_like(i_mean)
+
+    return FullDebyeResult(q_nm1=q, i_mean=i_mean, i_stderr=i_stderr, n_frames=n_frames)
 
 
 def _sq_single_dcd(
