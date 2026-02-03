@@ -48,26 +48,103 @@ _Z_BY_EL = {
     "NI": 28,
 }
 
+try:
+    # Optional dependency; fastest path is to precompute per-element f(q).
+    from periodictable import cromermann as _pt_cm  # type: ignore
+except Exception:  # pragma: no cover
+    _pt_cm = None  # type: ignore
+
+
+@dataclass(frozen=True)
+class _WeightSpec:
+    mode: str  # "scalar" or "xray"
+    w_sel: Optional[np.ndarray] = None  # (n_atoms,)
+    el_id_sel: Optional[np.ndarray] = None  # (n_atoms,) int
+    f_el_q: Optional[np.ndarray] = None  # (n_el, n_q) float
+
+
+def _element_key(el: str) -> str:
+    s = (el or "").strip().upper()
+    if not s:
+        return "C"
+    # Normalize common PDB quirks
+    if s == "CL":
+        return "CL"
+    if s == "NA":
+        return "NA"
+    return s
+
+
+def _build_xray_tables_for_selection(
+    template_model: Any,
+    atom_indices_full: list[int],
+    q_nm1: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      el_id_sel : (n_atoms,) int
+      f_el_q    : (n_el, n_q) float
+    """
+    if _pt_cm is None:
+        raise ImportError(
+            "weights='xray' requires 'periodictable'. " "Install with: pip install periodictable"
+        )
+
+    # Collect element keys per selected atom
+    keys: list[str] = []
+    for ai in atom_indices_full:
+        el = getattr(template_model.atoms[int(ai)], "element", "") or ""
+        keys.append(_element_key(str(el)))
+
+    uniq = sorted(set(keys))
+    key_to_id = {k: i for i, k in enumerate(uniq)}
+    el_id = np.asarray([key_to_id[k] for k in keys], dtype=np.int32)
+
+    # periodictable expects s = sin(theta)/lambda in 1/Angstrom
+    # Your q is in nm^-1 and q = 4*pi*s, with s in 1/nm.
+    # Convert: s(1/A) = (q / (4*pi)) * (1 nm^-1 -> 0.1 A^-1) = q / (40*pi)
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    stol = q / (40.0 * math.pi)
+
+    f_el_q = np.empty((len(uniq), q.size), dtype=np.float64)
+    for k, i in key_to_id.items():
+        # fxrayatstol returns electrons (real f0)
+        f_el_q[int(i)] = np.asarray(_pt_cm.fxrayatstol(k, stol), dtype=np.float64)
+
+    return el_id, f_el_q
+
 
 def _atomic_weights_for_selection(
     template_model: Any,
     atom_indices_full: list[int],
     *,
     weights: str,
-) -> np.ndarray:
+    q_nm1: Optional[np.ndarray] = None,
+) -> _WeightSpec:
     mode = str(weights).strip().lower()
-    if mode not in {"unity", "z"}:
-        raise ValueError("weights must be 'unity' or 'z'")
+    if mode not in {"unity", "z", "xray"}:
+        raise ValueError("weights must be 'unity', 'z', or 'xray'")
+
+    if mode == "xray":
+        if q_nm1 is None:
+            raise ValueError("q_nm1 is required when weights='xray'")
+        el_id, f_el_q = _build_xray_tables_for_selection(
+            template_model,
+            atom_indices_full,
+            np.asarray(q_nm1, dtype=np.float64).reshape(-1),
+        )
+        return _WeightSpec(mode="xray", el_id_sel=el_id, f_el_q=f_el_q)
 
     if mode == "unity":
-        return np.ones(len(atom_indices_full), dtype=np.float64)
+        w = np.ones(len(atom_indices_full), dtype=np.float64)
+        return _WeightSpec(mode="scalar", w_sel=w)
 
     w = np.empty(len(atom_indices_full), dtype=np.float64)
     for i, ai in enumerate(atom_indices_full):
         el = getattr(template_model.atoms[int(ai)], "element", "") or ""
-        key = str(el).strip().upper()
+        key = _element_key(str(el))
         w[i] = float(_Z_BY_EL.get(key, 6))
-    return w
+    return _WeightSpec(mode="scalar", w_sel=w)
 
 
 def _protein_groups_from_selection(
@@ -178,6 +255,108 @@ def debye_intensity_nm(
     return out
 
 
+def debye_intensity_nm_xray(
+    xyz_nm: np.ndarray,
+    q_nm1: np.ndarray,
+    el_id: np.ndarray,
+    f_el_q: np.ndarray,
+    *,
+    atom_block: int = 512,
+    q_block: int = 64,
+) -> np.ndarray:
+    """
+    Debye sum with q-dependent atomic form factors:
+        I(q) = sum_i sum_j f_i(q) f_j(q) sinc(q r_ij)
+
+    Inputs
+    ------
+    el_id : (n_atoms,) int
+        Element id per atom (indexes first axis of f_el_q).
+    f_el_q : (n_el, n_q) float
+        f(element, q) in electrons.
+    """
+    x = np.asarray(xyz_nm, dtype=np.float64)
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    el = np.asarray(el_id, dtype=np.int32).reshape(-1)
+    ftab = np.asarray(f_el_q, dtype=np.float64)
+
+    if x.ndim != 2 or x.shape[1] != 3:
+        raise ValueError("xyz_nm must have shape (n_atoms, 3)")
+    if x.shape[0] != el.shape[0]:
+        raise ValueError("el_id length must match number of atoms")
+    if q.size < 1:
+        raise ValueError("q_nm1 must be non-empty")
+    if ftab.ndim != 2 or ftab.shape[1] != q.size:
+        raise ValueError("f_el_q must have shape (n_el, n_q) matching q_nm1")
+
+    n = int(x.shape[0])
+    nq = int(q.size)
+    out = np.zeros(nq, dtype=np.float64)
+
+    ab = max(32, int(atom_block))
+    qb = max(16, int(q_block))
+
+    # i==j term: sum_i f_i(q)^2, accumulated in q-blocks
+    for q0 in range(0, nq, qb):
+        q1 = min(nq, q0 + qb)
+        fi = ftab[el, q0:q1]  # (n_atoms, qb)
+        out[q0:q1] += np.sum(fi * fi, axis=0)
+
+    if n < 2:
+        return out
+
+    for i0 in range(0, n, ab):
+        i1 = min(n, i0 + ab)
+        xi = x[i0:i1]
+        eli = el[i0:i1]
+        bi = i1 - i0
+
+        # within-block upper triangle
+        if bi >= 2:
+            di = xi[:, None, :] - xi[None, :, :]
+            d2 = np.einsum("ijk,ijk->ij", di, di)
+            iu, ju = np.triu_indices(bi, k=1)
+            r = np.sqrt(d2[iu, ju])
+            if r.size:
+                el_i = eli[iu]
+                el_j = eli[ju]
+                for q0 in range(0, nq, qb):
+                    q1 = min(nq, q0 + qb)
+                    fi = ftab[el_i, q0:q1]
+                    fj = ftab[el_j, q0:q1]
+                    wp = fi * fj  # (n_pairs, qb)
+                    qr = r[:, None] * q[q0:q1][None, :]
+                    out[q0:q1] += 2.0 * np.sum(wp * _sinc(qr), axis=0)
+
+        # cross blocks: avoid repeat/tile element arrays
+        for j0 in range(i1, n, ab):
+            j1 = min(n, j0 + ab)
+            xj = x[j0:j1]
+            elj = el[j0:j1]
+
+            d = xi[:, None, :] - xj[None, :, :]
+            d2 = np.einsum("ijk,ijk->ij", d, d)
+            r = np.sqrt(d2)  # (bi, bj)
+            if r.size == 0:
+                continue
+
+            for ii in range(bi):
+                ri = r[ii]  # (bj,)
+                if ri.size == 0:
+                    continue
+                eli_i = int(eli[ii])
+
+                for q0 in range(0, nq, qb):
+                    q1 = min(nq, q0 + qb)
+                    fi = ftab[eli_i, q0:q1]  # (qb,)
+                    fj = ftab[elj, q0:q1]  # (bj, qb)
+                    wp = fj * fi[None, :]  # (bj, qb)
+                    qr = ri[:, None] * q[q0:q1][None, :]
+                    out[q0:q1] += 2.0 * np.sum(wp * _sinc(qr), axis=0)
+
+    return out
+
+
 # ---------------------------
 # Parallel frame processing
 # ---------------------------
@@ -185,27 +364,28 @@ def debye_intensity_nm(
 # The ProcessPoolExecutor initializer stores these read-only objects in each worker.
 _G_PROT_GROUPS_SEL: Optional[list[np.ndarray]] = None
 _G_PROT_LENS: Optional[np.ndarray] = None
-_G_W_SEL: Optional[np.ndarray] = None
 _G_Q: Optional[np.ndarray] = None
 _G_ATOM_BLOCK: int = 512
 _G_Q_BLOCK: int = 64
 _G_BLAS_THREADS: int = 1
 
+_G_WSPEC: Optional[_WeightSpec] = None
+
 
 def _init_frame_worker(
     prot_groups_sel: list[np.ndarray],
     prot_lens: np.ndarray,
-    w_sel: np.ndarray,
+    wspec: _WeightSpec,
     q_nm1: np.ndarray,
     atom_block: int,
     q_block: int,
     blas_threads: int,
 ) -> None:
-    global _G_PROT_GROUPS_SEL, _G_PROT_LENS, _G_W_SEL, _G_Q
+    global _G_PROT_GROUPS_SEL, _G_PROT_LENS, _G_WSPEC, _G_Q
     global _G_ATOM_BLOCK, _G_Q_BLOCK, _G_BLAS_THREADS
     _G_PROT_GROUPS_SEL = prot_groups_sel
     _G_PROT_LENS = np.asarray(prot_lens, dtype=np.int64)
-    _G_W_SEL = np.asarray(w_sel, dtype=np.float64)
+    _G_WSPEC = wspec
     _G_Q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
     _G_ATOM_BLOCK = int(atom_block)
     _G_Q_BLOCK = int(q_block)
@@ -218,7 +398,7 @@ def _process_frame_batch_core(
     clusters_batch: list[list[list[int]]],
     prot_groups_sel: list[np.ndarray],
     prot_lens: np.ndarray,
-    w_sel: np.ndarray,
+    wspec: _WeightSpec,
     q_nm1: np.ndarray,
     *,
     atom_block: int,
@@ -234,9 +414,6 @@ def _process_frame_batch_core(
     """
     q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
 
-    # IMPORTANT: these dicts are returned from worker processes.
-    # Do NOT use defaultdict(lambda: ...) here: lambdas are not picklable and will
-    # crash ProcessPoolExecutor result serialization.
     sums: dict[int, np.ndarray] = {}
     sums2: dict[int, np.ndarray] = {}
     counts: dict[int, int] = {}
@@ -251,6 +428,19 @@ def _process_frame_batch_core(
     if xyz_batch_nm.shape[0] != box_batch_nm.shape[0]:
         raise ValueError("xyz_batch_nm and box_batch_nm must have the same n_frames")
 
+    if wspec.mode == "scalar":
+        if wspec.w_sel is None:
+            raise ValueError("wspec.w_sel is None for scalar mode")
+        w_sel = np.asarray(wspec.w_sel, dtype=np.float64)
+        el_sel = None
+        f_el_q = None
+    else:
+        if wspec.el_id_sel is None or wspec.f_el_q is None:
+            raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
+        el_sel = np.asarray(wspec.el_id_sel, dtype=np.int32)
+        f_el_q = np.asarray(wspec.f_el_q, dtype=np.float64)
+        w_sel = None
+
     n_frames = int(xyz_batch_nm.shape[0])
     n_prot = int(len(prot_groups_sel))
 
@@ -258,7 +448,6 @@ def _process_frame_batch_core(
         b = _box_lengths_nm(box_batch_nm[fi])
         xyz_wr = _wrap_nm(np.asarray(xyz_batch_nm[fi], dtype=np.float64), b)
 
-        # Protein centers from wrapped coords (COG is sufficient for minimum-image shifts)
         centers = np.empty((n_prot, 3), dtype=np.float64)
         for pid, idx in enumerate(prot_groups_sel):
             centers[pid] = xyz_wr[idx].mean(axis=0)
@@ -273,35 +462,177 @@ def _process_frame_batch_core(
             if m < 1:
                 continue
 
-            c = centers[prot_ids]  # (m,3)
+            c = centers[prot_ids]
             ref = c[0:1]
-            disp = c - ref
-            disp = _min_image_disp_nm(disp, b)
-            # shift per protein: centers_unwrapped - centers_wrapped
-            shifts = (ref + disp) - c  # (m,3)
+            disp = _min_image_disp_nm(c - ref, b)
+            shifts = (ref + disp) - c
 
             n_atoms_cl = int(np.sum(prot_lens[prot_ids], dtype=np.int64))
             if n_atoms_cl < 1:
                 continue
 
             x_cl = np.empty((n_atoms_cl, 3), dtype=np.float64)
-            w_cl = np.empty((n_atoms_cl,), dtype=np.float64)
+            if wspec.mode == "scalar":
+                w_cl = np.empty((n_atoms_cl,), dtype=np.float64)
+            else:
+                el_cl = np.empty((n_atoms_cl,), dtype=np.int32)
 
             pos = 0
             for k, pid in enumerate(prot_ids.tolist()):
                 idx = prot_groups_sel[int(pid)]
                 n_i = int(idx.size)
                 x_cl[pos : pos + n_i] = xyz_wr[idx] + shifts[k]
-                w_cl[pos : pos + n_i] = w_sel[idx]
+                if wspec.mode == "scalar":
+                    w_cl[pos : pos + n_i] = w_sel[idx]  # type: ignore[index]
+                else:
+                    el_cl[pos : pos + n_i] = el_sel[idx]  # type: ignore[index]
                 pos += n_i
 
-            i_q = debye_intensity_nm(
-                x_cl,
-                q,
-                w_cl,
-                atom_block=atom_block,
-                q_block=q_block,
-            )
+            if wspec.mode == "scalar":
+                i_q = debye_intensity_nm(
+                    x_cl,
+                    q,
+                    w_cl,  # type: ignore[arg-type]
+                    atom_block=atom_block,
+                    q_block=q_block,
+                )
+            else:
+                i_q = debye_intensity_nm_xray(
+                    x_cl,
+                    q,
+                    el_cl,  # type: ignore[arg-type]
+                    f_el_q,  # type: ignore[arg-type]
+                    atom_block=atom_block,
+                    q_block=q_block,
+                )
+
+            i_per = i_q / float(m)
+
+            if m not in sums:
+                sums[m] = np.zeros_like(q)
+                sums2[m] = np.zeros_like(q)
+                counts[m] = 0
+            sums[m] += i_per
+            sums2[m] += i_per * i_per
+            counts[m] += 1
+
+    return sums, sums2, counts
+
+
+def _process_frame_batch_core(
+    xyz_batch_nm: np.ndarray,
+    box_batch_nm: np.ndarray,
+    clusters_batch: list[list[list[int]]],
+    prot_groups_sel: list[np.ndarray],
+    prot_lens: np.ndarray,
+    wspec: _WeightSpec,
+    q_nm1: np.ndarray,
+    *,
+    atom_block: int,
+    q_block: int,
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
+    """
+    Compute partial accumulators for a batch of frames.
+
+    Returns:
+        sums[m]  = sum over cluster-instances of size m of (I(q)/m)
+        sums2[m] = sum over cluster-instances of size m of (I(q)/m)^2
+        counts[m]= number of cluster-instances of size m
+    """
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+
+    sums: dict[int, np.ndarray] = {}
+    sums2: dict[int, np.ndarray] = {}
+    counts: dict[int, int] = {}
+
+    xyz_batch_nm = np.asarray(xyz_batch_nm)
+    box_batch_nm = np.asarray(box_batch_nm, dtype=np.float64)
+
+    if xyz_batch_nm.ndim != 3 or xyz_batch_nm.shape[-1] != 3:
+        raise ValueError("xyz_batch_nm must have shape (n_frames, n_atoms, 3)")
+    if box_batch_nm.ndim != 2 or box_batch_nm.shape[-1] != 3:
+        raise ValueError("box_batch_nm must have shape (n_frames, 3)")
+    if xyz_batch_nm.shape[0] != box_batch_nm.shape[0]:
+        raise ValueError("xyz_batch_nm and box_batch_nm must have the same n_frames")
+
+    if wspec.mode == "scalar":
+        if wspec.w_sel is None:
+            raise ValueError("wspec.w_sel is None for scalar mode")
+        w_sel = np.asarray(wspec.w_sel, dtype=np.float64)
+        el_sel = None
+        f_el_q = None
+    else:
+        if wspec.el_id_sel is None or wspec.f_el_q is None:
+            raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
+        el_sel = np.asarray(wspec.el_id_sel, dtype=np.int32)
+        f_el_q = np.asarray(wspec.f_el_q, dtype=np.float64)
+        w_sel = None
+
+    n_frames = int(xyz_batch_nm.shape[0])
+    n_prot = int(len(prot_groups_sel))
+
+    for fi in range(n_frames):
+        b = _box_lengths_nm(box_batch_nm[fi])
+        xyz_wr = _wrap_nm(np.asarray(xyz_batch_nm[fi], dtype=np.float64), b)
+
+        centers = np.empty((n_prot, 3), dtype=np.float64)
+        for pid, idx in enumerate(prot_groups_sel):
+            centers[pid] = xyz_wr[idx].mean(axis=0)
+
+        frame_clusters = clusters_batch[fi]
+        for cl in frame_clusters:
+            if not cl:
+                continue
+
+            prot_ids = np.asarray(cl, dtype=np.int32)
+            m = int(prot_ids.size)
+            if m < 1:
+                continue
+
+            c = centers[prot_ids]
+            ref = c[0:1]
+            disp = _min_image_disp_nm(c - ref, b)
+            shifts = (ref + disp) - c
+
+            n_atoms_cl = int(np.sum(prot_lens[prot_ids], dtype=np.int64))
+            if n_atoms_cl < 1:
+                continue
+
+            x_cl = np.empty((n_atoms_cl, 3), dtype=np.float64)
+            if wspec.mode == "scalar":
+                w_cl = np.empty((n_atoms_cl,), dtype=np.float64)
+            else:
+                el_cl = np.empty((n_atoms_cl,), dtype=np.int32)
+
+            pos = 0
+            for k, pid in enumerate(prot_ids.tolist()):
+                idx = prot_groups_sel[int(pid)]
+                n_i = int(idx.size)
+                x_cl[pos : pos + n_i] = xyz_wr[idx] + shifts[k]
+                if wspec.mode == "scalar":
+                    w_cl[pos : pos + n_i] = w_sel[idx]  # type: ignore[index]
+                else:
+                    el_cl[pos : pos + n_i] = el_sel[idx]  # type: ignore[index]
+                pos += n_i
+
+            if wspec.mode == "scalar":
+                i_q = debye_intensity_nm(
+                    x_cl,
+                    q,
+                    w_cl,  # type: ignore[arg-type]
+                    atom_block=atom_block,
+                    q_block=q_block,
+                )
+            else:
+                i_q = debye_intensity_nm_xray(
+                    x_cl,
+                    q,
+                    el_cl,  # type: ignore[arg-type]
+                    f_el_q,  # type: ignore[arg-type]
+                    atom_block=atom_block,
+                    q_block=q_block,
+                )
+
             i_per = i_q / float(m)
 
             if m not in sums:
@@ -321,7 +652,7 @@ def _process_frame_batch_worker(
     clusters_batch: list[list[list[int]]],
 ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
     """Worker entry point (requires _init_frame_worker to have run)."""
-    if _G_PROT_GROUPS_SEL is None or _G_PROT_LENS is None or _G_W_SEL is None or _G_Q is None:
+    if _G_PROT_GROUPS_SEL is None or _G_PROT_LENS is None or _G_WSPEC is None or _G_Q is None:
         raise RuntimeError("worker globals not initialized")
 
     try:
@@ -336,7 +667,7 @@ def _process_frame_batch_worker(
             clusters_batch,
             _G_PROT_GROUPS_SEL,
             _G_PROT_LENS,
-            _G_W_SEL,
+            _G_WSPEC,
             _G_Q,
             atom_block=_G_ATOM_BLOCK,
             q_block=_G_Q_BLOCK,
@@ -350,7 +681,7 @@ def _process_frame_batch_worker(
             clusters_batch,
             _G_PROT_GROUPS_SEL,
             _G_PROT_LENS,
-            _G_W_SEL,
+            _G_WSPEC,
             _G_Q,
             atom_block=_G_ATOM_BLOCK,
             q_block=_G_Q_BLOCK,
@@ -421,7 +752,6 @@ def cluster_form_factors_from_dcd(
         raise ValueError("clusters n_proteins does not match selection-derived protein count")
 
     prot_lens = np.asarray([int(g.size) for g in prot_groups_sel], dtype=np.int64)
-    w_sel = _atomic_weights_for_selection(tmpl_model, atom_indices_full, weights=weights)
 
     if q_nm1 is None:
         if int(n_q) < 2:
@@ -431,6 +761,13 @@ def cluster_form_factors_from_dcd(
         q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
         if q.size < 1:
             raise ValueError("q_nm1 must be non-empty")
+
+    wspec = _atomic_weights_for_selection(
+        tmpl_model,
+        atom_indices_full,
+        weights=weights,
+        q_nm1=q,
+    )
 
     sums: dict[int, np.ndarray] = {}
     sums2: dict[int, np.ndarray] = {}
@@ -494,7 +831,7 @@ def cluster_form_factors_from_dcd(
                     [frame_clusters],
                     prot_groups_sel,
                     prot_lens,
-                    w_sel,
+                    wspec,
                     q,
                     atom_block=int(atom_block),
                     q_block=int(q_block),
@@ -514,7 +851,7 @@ def cluster_form_factors_from_dcd(
                 initargs=(
                     prot_groups_sel,
                     prot_lens,
-                    w_sel,
+                    wspec,
                     q,
                     int(atom_block),
                     int(q_block),
@@ -543,7 +880,7 @@ def cluster_form_factors_from_dcd(
                         clusters_batch,
                         prot_groups_sel,
                         prot_lens,
-                        w_sel,
+                        wspec,
                         q,
                         atom_block=int(atom_block),
                         q_block=int(q_block),
@@ -555,7 +892,7 @@ def cluster_form_factors_from_dcd(
                         clusters_batch,
                         prot_groups_sel,
                         prot_lens,
-                        w_sel,
+                        wspec,
                         q,
                         atom_block=int(atom_block),
                         q_block=int(q_block),
