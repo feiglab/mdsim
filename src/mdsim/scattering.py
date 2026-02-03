@@ -603,8 +603,67 @@ _G_Q: Optional[np.ndarray] = None
 _G_ATOM_BLOCK: int = 512
 _G_Q_BLOCK: int = 64
 _G_BLAS_THREADS: int = 1
-
 _G_WSPEC: Optional[_WeightSpec] = None
+
+# --- Full-system Debye: process worker globals -----------------------------
+
+_G_FULL_Q: Optional[np.ndarray] = None
+_G_FULL_WSPEC: Optional[_WeightSpec] = None
+_G_FULL_ATOM_BLOCK: int = 512
+_G_FULL_Q_BLOCK: int = 64
+
+
+def _init_full_debye_worker(
+    q_nm1: np.ndarray,
+    wspec: _WeightSpec,
+    atom_block: int,
+    q_block: int,
+) -> None:
+    global _G_FULL_Q, _G_FULL_WSPEC, _G_FULL_ATOM_BLOCK, _G_FULL_Q_BLOCK
+    _G_FULL_Q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    _G_FULL_WSPEC = wspec
+    _G_FULL_ATOM_BLOCK = int(atom_block)
+    _G_FULL_Q_BLOCK = int(q_block)
+
+
+def _full_debye_one_frame_worker(
+    xyz_sel_nm: np.ndarray,
+    box_nm: np.ndarray,
+) -> np.ndarray:
+    if _G_FULL_Q is None or _G_FULL_WSPEC is None:
+        raise RuntimeError("full debye worker globals not initialized")
+
+    q = _G_FULL_Q
+    wspec = _G_FULL_WSPEC
+    b = _box_lengths_nm(np.asarray(box_nm, dtype=np.float64).reshape(3))
+    xyz_wr = _wrap_nm(np.asarray(xyz_sel_nm, dtype=np.float64), b)
+
+    if wspec.mode == "scalar":
+        if wspec.w_sel is None:
+            raise ValueError("wspec.w_sel is None for scalar mode")
+        w = np.asarray(wspec.w_sel, dtype=np.float64)
+        return debye_intensity_nm_pbc(
+            xyz_wr,
+            q,
+            w,
+            b,
+            atom_block=_G_FULL_ATOM_BLOCK,
+            q_block=_G_FULL_Q_BLOCK,
+        )
+
+    if wspec.el_id_sel is None or wspec.f_el_q is None:
+        raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
+    el = np.asarray(wspec.el_id_sel, dtype=np.int32)
+    ftab = np.asarray(wspec.f_el_q, dtype=np.float64)
+    return debye_intensity_nm_xray_pbc(
+        xyz_wr,
+        q,
+        el,
+        ftab,
+        b,
+        atom_block=_G_FULL_ATOM_BLOCK,
+        q_block=_G_FULL_Q_BLOCK,
+    )
 
 
 def _init_frame_worker(
@@ -1140,7 +1199,6 @@ def full_debye_from_dcd(
     frame_stop: Optional[int] = None,
     parallel: Literal["none", "frames"] = "none",
     n_workers: int = 1,
-    frames_per_task: int = 1,
     use_processes: bool = True,
     blas_threads: int = 1,
     max_pending_tasks: Optional[int] = None,
@@ -1151,7 +1209,17 @@ def full_debye_from_dcd(
 
     Computes per-frame I(q) using minimum-image distances in an orthorhombic box, then
     returns mean +/- stderr across frames.
+
+    Notes
+    -----
+    - For parallel="frames" + use_processes=True, this requires module-scope worker
+      functions (_init_full_debye_worker, _full_debye_one_frame_worker) to avoid
+      pickling closures.
+    - blas_threads is accepted for API symmetry; this function does not call BLAS-heavy
+      ops by default, so it is currently unused.
     """
+    del blas_threads
+
     dcd_list = [dcd_files] if isinstance(dcd_files, (str, Path)) else list(dcd_files)
     if not dcd_list:
         raise ValueError("no DCD files provided")
@@ -1169,6 +1237,7 @@ def full_debye_from_dcd(
         groups_full = StructureSelector(selection).atom_lists(tmpl)
     else:
         groups_full = [[int(i) for i in g] for g in selection]
+
     groups_full = [g for g in groups_full if g]
     if not groups_full:
         raise ValueError("selection produced no atoms")
@@ -1217,40 +1286,42 @@ def full_debye_from_dcd(
 
                 if box_frame_nm is None:
                     if box_fallback is None:
-                        raise ValueError("no unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+                        raise ValueError("DCD has no unit cell; pass box_nm=(Lx,Ly,Lz) in nm")
                     b = box_fallback
                 else:
                     b = _box_lengths_nm(box_frame_nm)
                 yield np.asarray(xyz_sel_nm, dtype=np.float64), np.asarray(b, dtype=np.float64)
 
-    # Per-frame computation
-    do_parallel = (str(parallel).lower() == "frames") and int(n_workers) > 1
-
     def _one_frame(xyz_nm: np.ndarray, b_nm: np.ndarray) -> np.ndarray:
-        # wrap to [0,L)
         xyz_wr = _wrap_nm(xyz_nm, b_nm)
         if wspec.mode == "scalar":
-            w_sel = np.asarray(wspec.w_sel, dtype=np.float64)  # type: ignore[arg-type]
+            if wspec.w_sel is None:
+                raise ValueError("wspec.w_sel is None for scalar mode")
+            w = np.asarray(wspec.w_sel, dtype=np.float64)
             return debye_intensity_nm_pbc(
                 xyz_wr,
                 q,
-                w_sel,
+                w,
                 b_nm,
                 atom_block=int(atom_block),
                 q_block=int(q_block),
             )
-        el_sel = np.asarray(wspec.el_id_sel, dtype=np.int32)  # type: ignore[arg-type]
-        f_el_q = np.asarray(wspec.f_el_q, dtype=np.float64)  # type: ignore[arg-type]
+
+        if wspec.el_id_sel is None or wspec.f_el_q is None:
+            raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
+        el = np.asarray(wspec.el_id_sel, dtype=np.int32)
+        ftab = np.asarray(wspec.f_el_q, dtype=np.float64)
         return debye_intensity_nm_xray_pbc(
             xyz_wr,
             q,
-            el_sel,
-            f_el_q,
+            el,
+            ftab,
             b_nm,
             atom_block=int(atom_block),
             q_block=int(q_block),
         )
 
+    do_parallel = (str(parallel).lower() == "frames") and int(n_workers) > 1
     frames: list[np.ndarray] = []
 
     if not do_parallel:
@@ -1258,62 +1329,53 @@ def full_debye_from_dcd(
             frames.append(_one_frame(xyz_nm, b_nm))
     else:
         fw = max(1, int(n_workers))
-        fpt = max(1, int(frames_per_task))
         max_pending = int(max_pending_tasks) if max_pending_tasks is not None else (2 * fw)
 
-        if use_processes:
-            ex = ProcessPoolExecutor(max_workers=fw)
-        else:
+        if not use_processes:
             ex = ThreadPoolExecutor(max_workers=fw)
-
-        futures = []
-        batch_xyz: list[np.ndarray] = []
-        batch_box: list[np.ndarray] = []
-
-        def _submit() -> None:
-            nonlocal batch_xyz, batch_box, futures
-            if not batch_xyz:
-                return
-
-            xyz_b = np.stack(batch_xyz, axis=0)
-            box_b = np.stack(batch_box, axis=0)
-
-            def _batch_job(xyz_batch, box_batch):
-                out = []
-                for i in range(xyz_batch.shape[0]):
-                    out.append(_one_frame(xyz_batch[i], box_batch[i]))
-                return out
-
-            futures.append(ex.submit(_batch_job, xyz_b, box_b))
-            batch_xyz = []
-            batch_box = []
-
-        try:
-            for xyz_nm, b_nm in _frame_iter():
-                batch_xyz.append(xyz_nm)
-                batch_box.append(b_nm)
-                if len(batch_xyz) >= fpt:
-                    _submit()
-
-                if len(futures) >= max_pending:
+            try:
+                futures = []
+                for xyz_nm, b_nm in _frame_iter():
+                    futures.append(ex.submit(_one_frame, xyz_nm, b_nm))
+                    if len(futures) >= max_pending:
+                        done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                        futures = list(not_done)
+                        for fut in done:
+                            frames.append(fut.result())
+                while futures:
                     done, not_done = wait(futures, return_when=FIRST_COMPLETED)
                     futures = list(not_done)
                     for fut in done:
-                        frames.extend(fut.result())
-
-            _submit()
-            while futures:
-                done, not_done = wait(futures, return_when=FIRST_COMPLETED)
-                futures = list(not_done)
-                for fut in done:
-                    frames.extend(fut.result())
-        finally:
-            ex.shutdown(wait=True)
+                        frames.append(fut.result())
+            finally:
+                ex.shutdown(wait=True)
+        else:
+            ex = ProcessPoolExecutor(
+                max_workers=fw,
+                initializer=_init_full_debye_worker,
+                initargs=(q, wspec, int(atom_block), int(q_block)),
+            )
+            try:
+                futures = []
+                for xyz_nm, b_nm in _frame_iter():
+                    futures.append(ex.submit(_full_debye_one_frame_worker, xyz_nm, b_nm))
+                    if len(futures) >= max_pending:
+                        done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                        futures = list(not_done)
+                        for fut in done:
+                            frames.append(fut.result())
+                while futures:
+                    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                    futures = list(not_done)
+                    for fut in done:
+                        frames.append(fut.result())
+            finally:
+                ex.shutdown(wait=True)
 
     if not frames:
         raise ValueError("no frames selected")
 
-    arr = np.stack(frames, axis=0)  # (n_frames, n_q)
+    arr = np.stack(frames, axis=0)
     i_mean = np.mean(arr, axis=0)
     n_frames = int(arr.shape[0])
     if n_frames >= 2:
