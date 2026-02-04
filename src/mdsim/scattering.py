@@ -612,6 +612,13 @@ _G_FULL_WSPEC: Optional[_WeightSpec] = None
 _G_FULL_ATOM_BLOCK: int = 512
 _G_FULL_Q_BLOCK: int = 64
 
+# --- Reciprocal full intensity: worker globals --------------------------------
+
+_G_RECIP_Q: Optional[np.ndarray] = None
+_G_RECIP_QEDGES: Optional[np.ndarray] = None
+_G_RECIP_WSPEC: Optional[_WeightSpec] = None
+_G_RECIP_QVEC_BLOCK: int = 512
+
 
 def _init_full_debye_worker(
     q_nm1: np.ndarray,
@@ -1384,6 +1391,338 @@ def full_debye_from_dcd(
         i_stderr = np.zeros_like(i_mean)
 
     return FullDebyeResult(q_nm1=q, i_mean=i_mean, i_stderr=i_stderr, n_frames=n_frames)
+
+
+# --- Reciprocal full intensity  --------------------------------
+
+
+def _q_edges_from_centers(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    if q.size < 1:
+        raise ValueError("q_nm1 must be non-empty")
+    if q.size == 1:
+        left = max(0.0, float(q[0]) - 1e-6)
+        return np.array([left, float(q[0]) + 1e-6], dtype=np.float64)
+    if np.any(np.diff(q) <= 0.0):
+        raise ValueError("q_nm1 must be strictly increasing")
+
+    mid = 0.5 * (q[:-1] + q[1:])
+    left = q[0] - 0.5 * (q[1] - q[0])
+    right = q[-1] + 0.5 * (q[-1] - q[-2])
+    edges = np.concatenate(([left], mid, [right])).astype(np.float64)
+    edges[0] = max(0.0, float(edges[0]))
+    return edges
+
+
+def _init_full_recip_worker(
+    q_nm1: np.ndarray,
+    wspec: _WeightSpec,
+    qvec_block: int,
+) -> None:
+    global _G_RECIP_Q, _G_RECIP_QEDGES, _G_RECIP_WSPEC, _G_RECIP_QVEC_BLOCK
+    q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    _G_RECIP_Q = q
+    _G_RECIP_QEDGES = _q_edges_from_centers(q)
+    _G_RECIP_WSPEC = wspec
+    _G_RECIP_QVEC_BLOCK = int(qvec_block)
+
+
+def _full_recip_one_frame_worker(
+    xyz_sel_nm: np.ndarray,
+    box_nm: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns per-bin (sum |rho(qvec)|^2) and per-bin qvec counts for ONE frame.
+    Caller can form per-bin averages by sum/count.
+    """
+    if _G_RECIP_Q is None or _G_RECIP_QEDGES is None or _G_RECIP_WSPEC is None:
+        raise RuntimeError("reciprocal worker globals not initialized")
+
+    q = _G_RECIP_Q
+    q_edges = _G_RECIP_QEDGES
+    wspec = _G_RECIP_WSPEC
+    qb = max(64, int(_G_RECIP_QVEC_BLOCK))
+
+    b = _box_lengths_nm(np.asarray(box_nm, dtype=np.float64).reshape(3))
+    x = _wrap_nm(np.asarray(xyz_sel_nm, dtype=np.float64), b)
+
+    qvecs, qmag = _q_vectors_cubic_or_ortho(b, float(q_edges[-1]))
+    if qvecs.size == 0:
+        return np.zeros_like(q), np.zeros_like(q, dtype=np.int64)
+
+    m = (qmag >= float(q_edges[0])) & (qmag < float(q_edges[-1]))
+    if not np.any(m):
+        return np.zeros_like(q), np.zeros_like(q, dtype=np.int64)
+    qvecs = qvecs[m]
+    qmag = qmag[m]
+
+    bin_idx = np.searchsorted(q_edges, qmag, side="right") - 1
+    ok = (bin_idx >= 0) & (bin_idx < q.size)
+    if not np.any(ok):
+        return np.zeros_like(q), np.zeros_like(q, dtype=np.int64)
+    qvecs = qvecs[ok]
+    bin_idx = bin_idx[ok].astype(np.int64, copy=False)
+
+    acc = np.zeros_like(q, dtype=np.float64)
+    cnt = np.zeros_like(q, dtype=np.int64)
+
+    if wspec.mode == "scalar":
+        if wspec.w_sel is None:
+            raise ValueError("wspec.w_sel is None for scalar mode")
+        w = np.asarray(wspec.w_sel, dtype=np.float64).reshape(-1)
+
+        for k0 in range(0, qvecs.shape[0], qb):
+            k1 = min(qvecs.shape[0], k0 + qb)
+            qv = qvecs[k0:k1]
+            bidx = bin_idx[k0:k1]
+
+            ph = qv @ x.T
+            rho_re = np.cos(ph) @ w
+            rho_im = np.sin(ph) @ w
+            i_qv = rho_re * rho_re + rho_im * rho_im
+
+            np.add.at(acc, bidx, i_qv)
+            np.add.at(cnt, bidx, 1)
+
+        return acc, cnt
+
+    if wspec.el_id_sel is None or wspec.f_el_q is None:
+        raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
+
+    el = np.asarray(wspec.el_id_sel, dtype=np.int32).reshape(-1)
+    ftab = np.asarray(wspec.f_el_q, dtype=np.float64)
+
+    # Group q-vectors by bin so weights are constant within that group.
+    order = np.argsort(bin_idx, kind="mergesort")
+    qvecs = qvecs[order]
+    bin_idx = bin_idx[order]
+
+    start = 0
+    while start < bin_idx.size:
+        bi = int(bin_idx[start])
+        end = start + 1
+        while end < bin_idx.size and int(bin_idx[end]) == bi:
+            end += 1
+
+        w = ftab[el, bi].astype(np.float64, copy=False)
+        qg = qvecs[start:end]
+
+        # Block within this bin-group.
+        for k0 in range(0, qg.shape[0], qb):
+            k1 = min(qg.shape[0], k0 + qb)
+            qv = qg[k0:k1]
+            ph = qv @ x.T
+            rho_re = np.cos(ph) @ w
+            rho_im = np.sin(ph) @ w
+            i_qv = rho_re * rho_re + rho_im * rho_im
+            acc[bi] += float(np.sum(i_qv))
+            cnt[bi] += int(i_qv.size)
+
+        start = end
+
+    return acc, cnt
+
+
+def full_debye_reciprocal_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, list[FileLike]],
+    *,
+    selection: Union[str, list[list[int]]] = "protein",
+    q_nm1: Optional[np.ndarray] = None,
+    q_min_nm1: Optional[float] = 0.2,
+    q_max_nm1: float = 20.0,
+    n_q: int = 200,
+    box_nm: Optional[list[float]] = None,
+    weights: str = "unity",
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    qvec_block: int = 512,
+    min_qvecs_per_bin: int = 1,
+    parallel: Literal["none", "frames"] = "none",
+    n_workers: int = 1,
+    use_processes: bool = True,
+    max_pending_tasks: Optional[int] = None,
+    verbose: bool = False,
+) -> FullDebyeResult:
+    """
+    Full-system periodic intensity using reciprocal-space estimator, frame-parallel.
+
+    NPT note:
+      Box fluctuates, so q-vectors per bin vary by frame. This function averages
+      per-frame bin means (equal frame weighting). Bins with <min_qvecs_per_bin
+      q-vectors in a frame are ignored for that frame.
+    """
+    dcd_list = [dcd_files] if isinstance(dcd_files, (str, Path)) else list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+    if int(min_qvecs_per_bin) < 1:
+        raise ValueError("min_qvecs_per_bin must be >= 1")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    if isinstance(selection, str):
+        groups_full = StructureSelector(selection).atom_lists(tmpl)
+    else:
+        groups_full = [[int(i) for i in g] for g in selection]
+    groups_full = [g for g in groups_full if g]
+    if not groups_full:
+        raise ValueError("selection produced no atoms")
+
+    atom_set: set[int] = set()
+    for g in groups_full:
+        atom_set.update(int(i) for i in g)
+    atom_indices_full = sorted(atom_set)
+
+    if q_nm1 is None:
+        if int(n_q) < 2:
+            raise ValueError("n_q must be >= 2")
+        if q_min_nm1 is None:
+            b0 = _peek_first_box_nm(
+                dcd_list[0],
+                tmpl_model,
+                atom_indices_full,
+                int(stride),
+                box_nm=box_nm,
+            )
+            q0 = 2.0 * math.pi / float(np.min(b0))
+            qmin = float(q0)
+        else:
+            qmin = float(q_min_nm1)
+        qmax = float(q_max_nm1)
+        if qmax <= qmin:
+            raise ValueError("q_max_nm1 must be > q_min_nm1")
+        q = np.linspace(qmin, qmax, int(n_q), dtype=np.float64)
+    else:
+        q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+        if q.size < 1:
+            raise ValueError("q_nm1 must be non-empty")
+
+    wspec = _atomic_weights_for_selection(
+        tmpl_model,
+        atom_indices_full,
+        weights=weights,
+        q_nm1=q,
+    )
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    def _frame_iter():
+        for dcd in dcd_list:
+            if verbose:
+                print(f"reading from {dcd}")
+            for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+                iter_dcd(
+                    dcd,
+                    tmpl_model,
+                    chunk=int(chunk),
+                    stride=int(stride),
+                    atom_indices=atom_indices_full,
+                )
+            ):
+                if fi < int(frame_start):
+                    continue
+                if frame_stop is not None and fi >= int(frame_stop):
+                    break
+
+                if box_frame_nm is None:
+                    if box_fallback is None:
+                        raise ValueError("DCD has no unit cell; pass box_nm=(Lx,Ly,Lz) in nm")
+                    b = box_fallback
+                else:
+                    b = _box_lengths_nm(box_frame_nm)
+
+                yield np.asarray(xyz_sel_nm, dtype=np.float64), np.asarray(b, dtype=np.float64)
+
+    do_parallel = (str(parallel).lower() == "frames") and int(n_workers) > 1
+    fw = max(1, int(n_workers))
+    max_pending = int(max_pending_tasks) if max_pending_tasks is not None else (2 * fw)
+
+    frame_means: list[np.ndarray] = []
+    frame_has: list[np.ndarray] = []
+
+    def _consume_result(acc: np.ndarray, cnt: np.ndarray) -> None:
+        cnt_i = np.asarray(cnt, dtype=np.int64)
+        acc_f = np.asarray(acc, dtype=np.float64)
+
+        has = cnt_i >= int(min_qvecs_per_bin)
+        mu = np.zeros_like(acc_f)
+        mu[has] = acc_f[has] / cnt_i[has].astype(np.float64)
+
+        frame_means.append(mu)
+        frame_has.append(has)
+
+    # IMPORTANT: initialize worker globals for the serial path too.
+    if not do_parallel:
+        _init_full_recip_worker(q, wspec, int(qvec_block))
+        for xyz_nm, b_nm in _frame_iter():
+            acc, cnt = _full_recip_one_frame_worker(xyz_nm, b_nm)
+            _consume_result(acc, cnt)
+    else:
+        if not use_processes:
+            ex = ThreadPoolExecutor(max_workers=fw)
+            _init_full_recip_worker(q, wspec, int(qvec_block))
+            submit_fn = _full_recip_one_frame_worker
+        else:
+            ex = ProcessPoolExecutor(
+                max_workers=fw,
+                initializer=_init_full_recip_worker,
+                initargs=(q, wspec, int(qvec_block)),
+            )
+            submit_fn = _full_recip_one_frame_worker
+
+        try:
+            futures = []
+            for xyz_nm, b_nm in _frame_iter():
+                futures.append(ex.submit(submit_fn, xyz_nm, b_nm))
+                if len(futures) >= max_pending:
+                    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                    futures = list(not_done)
+                    for fut in done:
+                        acc, cnt = fut.result()
+                        _consume_result(acc, cnt)
+
+            while futures:
+                done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                futures = list(not_done)
+                for fut in done:
+                    acc, cnt = fut.result()
+                    _consume_result(acc, cnt)
+        finally:
+            ex.shutdown(wait=True)
+
+    if not frame_means:
+        raise ValueError("no frames selected")
+
+    arr = np.stack(frame_means, axis=0)  # (n_frames, n_q)
+    has = np.stack(frame_has, axis=0)  # (n_frames, n_q)
+
+    denom = np.sum(has.astype(np.int64), axis=0)
+    denom = np.maximum(denom, 1)
+    i_mean = np.sum(arr * has.astype(np.float64), axis=0) / denom.astype(np.float64)
+
+    i_stderr = np.zeros_like(i_mean)
+    for j in range(i_mean.size):
+        mj = has[:, j]
+        nj = int(np.sum(mj))
+        if nj >= 2:
+            v = arr[mj, j]
+            i_stderr[j] = float(np.std(v, ddof=1)) / math.sqrt(float(nj))
+
+    return FullDebyeResult(
+        q_nm1=q,
+        i_mean=i_mean,
+        i_stderr=i_stderr,
+        n_frames=int(arr.shape[0]),
+    )
 
 
 def _sq_single_dcd(
