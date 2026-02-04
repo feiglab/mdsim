@@ -1418,16 +1418,45 @@ def _init_full_recip_worker(
     q_nm1: np.ndarray,
     wspec: _WeightSpec,
     qvec_block: int,
+    blas_threads: int = 1,
 ) -> None:
-    global _G_RECIP_Q, _G_RECIP_QEDGES, _G_RECIP_WSPEC, _G_RECIP_QVEC_BLOCK
+    import os
+
+    t = str(max(1, int(blas_threads)))
+    os.environ["OMP_NUM_THREADS"] = t
+    os.environ["MKL_NUM_THREADS"] = t
+    os.environ["OPENBLAS_NUM_THREADS"] = t
+    os.environ["NUMEXPR_NUM_THREADS"] = t
+
+    global _G_RECIP_Q, _G_RECIP_QEDGES, _G_RECIP_WSPEC, _G_RECIP_QVEC_BLOCK, _G_BLAS_THREADS
     q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
     _G_RECIP_Q = q
     _G_RECIP_QEDGES = _q_edges_from_centers(q)
     _G_RECIP_WSPEC = wspec
     _G_RECIP_QVEC_BLOCK = int(qvec_block)
+    _G_BLAS_THREADS = max(1, int(blas_threads))
 
 
 def _full_recip_one_frame_worker(
+    xyz_sel_nm: np.ndarray,
+    box_nm: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if _G_RECIP_Q is None or _G_RECIP_QEDGES is None or _G_RECIP_WSPEC is None:
+        raise RuntimeError("reciprocal worker globals not initialized")
+
+    try:
+        from threadpoolctl import threadpool_limits
+    except Exception:  # pragma: no cover
+        threadpool_limits = None  # type: ignore[assignment]
+
+    if threadpool_limits is None:
+        return _full_recip_one_frame_worker_core(xyz_sel_nm, box_nm)
+
+    with threadpool_limits(limits=max(1, int(_G_BLAS_THREADS))):
+        return _full_recip_one_frame_worker_core(xyz_sel_nm, box_nm)
+
+
+def _full_recip_one_frame_worker_core(
     xyz_sel_nm: np.ndarray,
     box_nm: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1544,6 +1573,7 @@ def full_debye_reciprocal_from_dcd(
     n_workers: int = 1,
     use_processes: bool = True,
     max_pending_tasks: Optional[int] = None,
+    blas_threads: int = 1,
     verbose: bool = False,
 ) -> FullDebyeResult:
     """
@@ -1662,20 +1692,20 @@ def full_debye_reciprocal_from_dcd(
 
     # IMPORTANT: initialize worker globals for the serial path too.
     if not do_parallel:
-        _init_full_recip_worker(q, wspec, int(qvec_block))
+        _init_full_recip_worker(q, wspec, int(qvec_block), int(blas_threads))
         for xyz_nm, b_nm in _frame_iter():
             acc, cnt = _full_recip_one_frame_worker(xyz_nm, b_nm)
             _consume_result(acc, cnt)
     else:
         if not use_processes:
             ex = ThreadPoolExecutor(max_workers=fw)
-            _init_full_recip_worker(q, wspec, int(qvec_block))
+            _init_full_recip_worker(q, wspec, int(qvec_block), int(blas_threads))
             submit_fn = _full_recip_one_frame_worker
         else:
             ex = ProcessPoolExecutor(
                 max_workers=fw,
                 initializer=_init_full_recip_worker,
-                initargs=(q, wspec, int(qvec_block)),
+                initargs=(q, wspec, int(qvec_block), int(blas_threads)),
             )
             submit_fn = _full_recip_one_frame_worker
 
