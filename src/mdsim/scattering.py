@@ -2327,6 +2327,54 @@ def structure_factor_from_dcd_reciprocal(
     return out
 
 
+def cubic_shell_q_values(
+    l_nm: float,
+    q_shell_max_nm1: float,
+    *,
+    include_m1: bool = True,
+    return_degeneracy: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | np.ndarray:
+    """
+    True shell-aligned |q| values for a cubic box:
+      q = (2*pi/L) * sqrt(m), where m = nx^2+ny^2+nz^2 for integer triplets.
+    Returns only shells with at least one q-vector (degeneracy > 0).
+    """
+    if l_nm <= 0:
+        raise ValueError("l_nm must be > 0")
+    if q_shell_max_nm1 <= 0:
+        raise ValueError("q_shell_max_nm1 must be > 0")
+
+    q0 = 2.0 * np.pi / float(l_nm)
+    n_max = int(np.floor(float(q_shell_max_nm1) / q0))
+    if n_max < 1:
+        qs = np.array([], dtype=float)
+        deg = np.array([], dtype=int)
+        return (qs, deg) if return_degeneracy else qs
+
+    # Enumerate integer triplets; count degeneracy per m
+    deg_by_m: dict[int, int] = {}
+    rng = range(-n_max, n_max + 1)
+    for nx in rng:
+        for ny in rng:
+            for nz in rng:
+                if nx == 0 and ny == 0 and nz == 0:
+                    continue
+                m = nx * nx + ny * ny + nz * nz
+                if not include_m1 and m == 1:
+                    continue
+                deg_by_m[m] = deg_by_m.get(m, 0) + 1
+
+    m_vals = np.array(sorted(deg_by_m.keys()), dtype=int)
+    q_vals = q0 * np.sqrt(m_vals.astype(float))
+    deg = np.array([deg_by_m[int(m)] for m in m_vals], dtype=int)
+
+    m_ok = q_vals <= float(q_shell_max_nm1) + 1e-12
+    q_vals = q_vals[m_ok]
+    deg = deg[m_ok]
+
+    return (q_vals, deg) if return_degeneracy else q_vals
+
+
 def shell_aligned_q_grid(
     l_nm: float,
     *,
@@ -2338,73 +2386,31 @@ def shell_aligned_q_grid(
     dedup_tol: float = 1e-6,
 ) -> np.ndarray:
     """
-    Build a q grid for cubic boxes:
-      - shell-aligned |q| values up to q_shell_max_nm1 using q = q0*sqrt(m)
-        where q0 = 2*pi/L and m = nx^2+ny^2+nz^2.
-      - then a linear grid from max(q_shell_max, q_switch) to q_max_nm1.
-
-    Parameters
-    ----------
-    l_nm:
-        Average cubic box length (nm).
-    q_shell_max_nm1:
-        Include shell-aligned q values with q <= this cutoff (nm^-1).
-    q_max_nm1:
-        Maximum q for the final grid (nm^-1).
-    n_linear:
-        Number of linear points from q_switch..q_max_nm1 (inclusive).
-    q_min_nm1:
-        Optional hard minimum q. If set, drop shell points below it.
-    include_m1:
-        If False, start shells from m=2 (skips the 6-vector lowest shell).
-    dedup_tol:
-        Tolerance for merging near-duplicate q values when concatenating.
-
-    Returns
-    -------
-    q_nm1 : (n,) float
-        Strictly increasing q centers.
+    Shell-aligned (true cubic shells) up to q_shell_max_nm1, then linear to q_max_nm1.
     """
-    if l_nm <= 0:
-        raise ValueError("l_nm must be > 0")
-    if q_shell_max_nm1 <= 0 or q_max_nm1 <= 0:
-        raise ValueError("q_shell_max_nm1 and q_max_nm1 must be > 0")
     if q_max_nm1 <= q_shell_max_nm1:
         raise ValueError("q_max_nm1 must be > q_shell_max_nm1")
     if n_linear < 2:
         raise ValueError("n_linear must be >= 2")
 
-    q0 = 2.0 * np.pi / float(l_nm)
+    q_shell = cubic_shell_q_values(
+        l_nm,
+        q_shell_max_nm1,
+        include_m1=include_m1,
+        return_degeneracy=False,
+    )
 
-    m_min = 1 if include_m1 else 2
-    if q_shell_max_nm1 < q0 * np.sqrt(m_min):
-        shell_q = np.array([], dtype=float)
-    else:
-        m_max = int(np.floor((float(q_shell_max_nm1) / q0) ** 2))
-        m_max = max(m_max, m_min)
+    if q_min_nm1 is not None:
+        q_shell = q_shell[q_shell >= float(q_min_nm1) - dedup_tol]
 
-        m_vals = np.arange(m_min, m_max + 1, dtype=int)
-        shell_q = q0 * np.sqrt(m_vals.astype(float))
-
-        if q_min_nm1 is not None:
-            shell_q = shell_q[shell_q >= float(q_min_nm1) - dedup_tol]
-
-        shell_q = shell_q[shell_q <= float(q_shell_max_nm1) + dedup_tol]
-
-    # Decide where linear spacing should start
     q_switch = float(q_shell_max_nm1)
-    if shell_q.size > 0:
-        q_switch = max(q_switch, float(shell_q[-1]))
+    if q_shell.size > 0:
+        q_switch = max(q_switch, float(q_shell[-1]))
 
-    # Build linear part (inclusive endpoints)
     q_lin = np.linspace(q_switch, float(q_max_nm1), int(n_linear), dtype=float)
 
-    # Merge + deduplicate
-    q_all = np.concatenate([shell_q, q_lin])
+    q_all = np.concatenate([q_shell, q_lin])
     q_all.sort()
-
-    if q_all.size == 0:
-        raise ValueError("empty q grid")
 
     keep = [0]
     for i in range(1, q_all.size):
@@ -2412,8 +2418,6 @@ def shell_aligned_q_grid(
             keep.append(i)
     q_out = q_all[np.array(keep, dtype=int)]
 
-    # Ensure strict increasing
     if np.any(np.diff(q_out) <= 0):
-        raise RuntimeError("q grid is not strictly increasing (dedup_tol too small?)")
-
+        raise RuntimeError("q grid not strictly increasing")
     return q_out
