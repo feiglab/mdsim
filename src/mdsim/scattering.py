@@ -612,6 +612,14 @@ _G_FULL_WSPEC: Optional[_WeightSpec] = None
 _G_FULL_ATOM_BLOCK: int = 512
 _G_FULL_Q_BLOCK: int = 64
 
+# --- Monomer (single-group) Debye: worker globals ---------------------------
+
+_G_MONO_Q: Optional[np.ndarray] = None
+_G_MONO_WSPEC: Optional[_WeightSpec] = None
+_G_MONO_ATOM_BLOCK: int = 512
+_G_MONO_Q_BLOCK: int = 64
+
+
 # --- Reciprocal full intensity: worker globals --------------------------------
 
 _G_RECIP_Q: Optional[np.ndarray] = None
@@ -670,6 +678,58 @@ def _full_debye_one_frame_worker(
         b,
         atom_block=_G_FULL_ATOM_BLOCK,
         q_block=_G_FULL_Q_BLOCK,
+    )
+    # --- Monomer (single-group) Debye: worker init + per-frame worker ----------
+
+
+def _init_monomer_ff_worker(
+    q_nm1: np.ndarray,
+    wspec: _WeightSpec,
+    atom_block: int,
+    q_block: int,
+) -> None:
+    global _G_MONO_Q, _G_MONO_WSPEC, _G_MONO_ATOM_BLOCK, _G_MONO_Q_BLOCK
+    _G_MONO_Q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+    _G_MONO_WSPEC = wspec
+    _G_MONO_ATOM_BLOCK = int(atom_block)
+    _G_MONO_Q_BLOCK = int(q_block)
+
+
+def _monomer_ff_one_frame_worker(
+    xyz_sel_nm: np.ndarray,
+    box_nm: np.ndarray,
+) -> np.ndarray:
+    if _G_MONO_Q is None or _G_MONO_WSPEC is None:
+        raise RuntimeError("monomer ff worker globals not initialized")
+
+    del box_nm
+    q = _G_MONO_Q
+    wspec = _G_MONO_WSPEC
+    xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+
+    if wspec.mode == "scalar":
+        if wspec.w_sel is None:
+            raise ValueError("wspec.w_sel is None for scalar mode")
+        w = np.asarray(wspec.w_sel, dtype=np.float64)
+        return debye_intensity_nm(
+            xyz,
+            q,
+            w,
+            atom_block=_G_MONO_ATOM_BLOCK,
+            q_block=_G_MONO_Q_BLOCK,
+        )
+
+    if wspec.el_id_sel is None or wspec.f_el_q is None:
+        raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
+    el = np.asarray(wspec.el_id_sel, dtype=np.int32)
+    ftab = np.asarray(wspec.f_el_q, dtype=np.float64)
+    return debye_intensity_nm_xray(
+        xyz,
+        q,
+        el,
+        ftab,
+        atom_block=_G_MONO_ATOM_BLOCK,
+        q_block=_G_MONO_Q_BLOCK,
     )
 
 
@@ -1176,6 +1236,198 @@ def cluster_form_factors_from_dcd(
         i_per_protein_mean=i_mean,
         i_per_protein_stderr=i_stderr,
         counts=np.array([counts[int(m)] for m in sizes.tolist()], dtype=np.int64),
+    )
+
+
+def monomer_form_factor_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, list[FileLike]],
+    *,
+    selection: Union[str, list[list[int]]] = "protein",
+    q_nm1: Optional[np.ndarray] = None,
+    q_min_nm1: float = 0.2,
+    q_max_nm1: float = 20.0,
+    n_q: int = 200,
+    weights: str = "unity",
+    atom_block: int = 512,
+    q_block: int = 64,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    parallel: Literal["none", "frames"] = "none",
+    n_workers: int = 1,
+    use_processes: bool = True,
+    max_pending_tasks: Optional[int] = None,
+    verbose: bool = False,
+) -> ClusterFFResult:
+    """Single-group (monomer) Debye form factor from DCD (no clustering, no PBC).
+
+    This is an analogue of cluster_form_factors_from_dcd for trajectories containing a
+    single protein (or a selection that yields exactly one group). It computes I(q)
+    for each frame using the non-periodic Debye sum and returns a ClusterFFResult
+    with sizes=[1].
+
+    Notes
+    -----
+    - Coordinates are used as-is (no wrap/unwrap).
+    - parallel="frames" uses per-frame parallelism, like full_debye_from_dcd.
+    """
+    dcd_list = [dcd_files] if isinstance(dcd_files, (str, Path)) else list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    tmpl_model, groups_sel, atom_indices_full, extra = _protein_groups_from_selection(
+        pdb_file,
+        selection,
+    )
+    n_groups = int(extra["n_proteins"])
+    if n_groups != 1:
+        raise ValueError(f"selection must yield exactly 1 group; got {n_groups}")
+
+    if q_nm1 is None:
+        if int(n_q) < 2:
+            raise ValueError("n_q must be >= 2")
+        q = np.linspace(float(q_min_nm1), float(q_max_nm1), int(n_q), dtype=np.float64)
+    else:
+        q = np.asarray(q_nm1, dtype=np.float64).reshape(-1)
+        if q.size < 1:
+            raise ValueError("q_nm1 must be non-empty")
+
+    wspec = _atomic_weights_for_selection(
+        tmpl_model,
+        atom_indices_full,
+        weights=weights,
+        q_nm1=q,
+    )
+
+    def _frame_iter():
+        for dcd in dcd_list:
+            if verbose:
+                print(f"reading from {dcd}")
+            for fi, (xyz_sel_nm, _box_frame_nm) in enumerate(
+                iter_dcd(
+                    dcd,
+                    tmpl_model,
+                    chunk=int(chunk),
+                    stride=int(stride),
+                    atom_indices=atom_indices_full,
+                )
+            ):
+                if fi < int(frame_start):
+                    continue
+                if frame_stop is not None and fi >= int(frame_stop):
+                    break
+                yield np.asarray(xyz_sel_nm, dtype=np.float64)
+
+    def _one_frame(xyz_nm: np.ndarray) -> np.ndarray:
+        if wspec.mode == "scalar":
+            if wspec.w_sel is None:
+                raise ValueError("wspec.w_sel is None for scalar mode")
+            w = np.asarray(wspec.w_sel, dtype=np.float64)
+            return debye_intensity_nm(
+                xyz_nm,
+                q,
+                w,
+                atom_block=int(atom_block),
+                q_block=int(q_block),
+            )
+
+        if wspec.el_id_sel is None or wspec.f_el_q is None:
+            raise ValueError("wspec missing el_id_sel/f_el_q for xray mode")
+        el = np.asarray(wspec.el_id_sel, dtype=np.int32)
+        ftab = np.asarray(wspec.f_el_q, dtype=np.float64)
+        return debye_intensity_nm_xray(
+            xyz_nm,
+            q,
+            el,
+            ftab,
+            atom_block=int(atom_block),
+            q_block=int(q_block),
+        )
+
+    do_parallel = (str(parallel).lower() == "frames") and int(n_workers) > 1
+    fw = max(1, int(n_workers))
+    max_pending = int(max_pending_tasks) if max_pending_tasks is not None else (2 * fw)
+
+    frames: list[np.ndarray] = []
+
+    if not do_parallel:
+        for xyz_nm in _frame_iter():
+            frames.append(_one_frame(xyz_nm))
+    else:
+        if not use_processes:
+            ex = ThreadPoolExecutor(max_workers=fw)
+            try:
+                futures = []
+                for xyz_nm in _frame_iter():
+                    futures.append(ex.submit(_one_frame, xyz_nm))
+                    if len(futures) >= max_pending:
+                        done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                        futures = list(not_done)
+                        for fut in done:
+                            frames.append(fut.result())
+                while futures:
+                    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                    futures = list(not_done)
+                    for fut in done:
+                        frames.append(fut.result())
+            finally:
+                ex.shutdown(wait=True)
+        else:
+            ex = ProcessPoolExecutor(
+                max_workers=fw,
+                initializer=_init_monomer_ff_worker,
+                initargs=(q, wspec, int(atom_block), int(q_block)),
+            )
+            try:
+                futures = []
+                for xyz_nm in _frame_iter():
+                    futures.append(ex.submit(_monomer_ff_one_frame_worker, xyz_nm, np.zeros(3)))
+                    if len(futures) >= max_pending:
+                        done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                        futures = list(not_done)
+                        for fut in done:
+                            frames.append(fut.result())
+                while futures:
+                    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+                    futures = list(not_done)
+                    for fut in done:
+                        frames.append(fut.result())
+            finally:
+                ex.shutdown(wait=True)
+
+    if not frames:
+        raise ValueError("no frames selected")
+
+    arr = np.stack(frames, axis=0)  # (n_frames, n_q)
+    i_mu = np.mean(arr, axis=0)
+    n_frames = int(arr.shape[0])
+    if n_frames >= 2:
+        i_se = np.std(arr, axis=0, ddof=1) / math.sqrt(float(n_frames))
+    else:
+        i_se = np.zeros_like(i_mu)
+
+    sizes = np.array([1], dtype=np.int64)
+    counts = np.array([n_frames], dtype=np.int64)
+
+    i_mu2 = i_mu[None, :]
+    i_se2 = i_se[None, :]
+
+    return ClusterFFResult(
+        q_nm1=q,
+        sizes=sizes,
+        i_mean=i_mu2,
+        i_stderr=i_se2,
+        i_per_protein_mean=i_mu2,
+        i_per_protein_stderr=i_se2,
+        counts=counts,
     )
 
 
