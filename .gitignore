@@ -24,6 +24,10 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+src/*.egg-info/
+**/*.egg-info/
+src/__pycache__
+src/mdsim/__pycache__
 MANIFEST
 
 # PyInstaller

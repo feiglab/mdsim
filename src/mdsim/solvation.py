@@ -201,6 +201,11 @@ def _build_grid(
     periodic: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int]]:
     sol_xyz = np.asarray(sol_xyz, dtype=np.float32)
+    if sol_xyz.size == 0:
+        sol_xyz = sol_xyz.reshape((0, 3))
+    elif sol_xyz.ndim == 1:
+        sol_xyz = sol_xyz.reshape((-1, 3))
+
     bmin = np.asarray(bmin, dtype=np.float32)
     dim = np.asarray(dim, dtype=np.float32)
 
@@ -285,15 +290,22 @@ def solvate(
     solvcut = _to_nm_float(solvcut)
     watcut = _to_nm_float(watcut)
 
+    if model is None:
+        from types import SimpleNamespace
+
+        model = SimpleNamespace(model_id=0, atoms=[])
+
     sol_xyz = np.asarray([(a.x, a.y, a.z) for a in model.atoms], dtype=np.float32)
+    if sol_xyz.size == 0:
+        sol_xyz = sol_xyz.reshape((0, 3))
+    elif sol_xyz.ndim == 1:
+        sol_xyz = sol_xyz.reshape((-1, 3))
 
     # API lengths are in nm; model coordinates are assumed to be Å (PDB convention).
     padding_a = float(padding) * _A_PER_NM
     solvcut_a = float(solvcut) * _A_PER_NM
     watcut_a = float(watcut) * _A_PER_NM
     boxwidth_a = float(boxwidth) * _A_PER_NM
-    if sol_xyz.size == 0:
-        raise ValueError("model has no atoms")
 
     if box_size is not None and box_min is None and box_max is None:
         box_min = (0.0, 0.0, 0.0)
@@ -303,6 +315,8 @@ def solvate(
         bmin = np.asarray(_vec3_nm(box_min), dtype=np.float32) * _A_PER_NM
         bmax = np.asarray(_vec3_nm(box_max), dtype=np.float32) * _A_PER_NM
     else:
+        if sol_xyz.size == 0:
+            raise ValueError("box_min/box_max or box_size required when model has no atoms")
         bmin = sol_xyz.min(axis=0)
         bmax = sol_xyz.max(axis=0)
         cofm = sol_xyz.mean(axis=0)

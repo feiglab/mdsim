@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.25"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "mdsim"
@@ -8,8 +8,8 @@ version = "1.0.0"
 description = "MDSim simulations via openMM."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
-authors = [{ name = "Feig Lab", email="mfeiglab@gmail.com" }]
+license = {file = "LICENSE"}
+authors = [{name = "Feig Lab", email = "mfeiglab@gmail.com"}]
 classifiers = [
   "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
   "Programming Language :: Python :: 3",
@@ -21,20 +21,35 @@ dependencies = [
   "openmm>=8.0",
   "mdtraj>=1.9.0",
   "periodictable",
-]  
+]
 
 [project.optional-dependencies]
 dev = [
-   "pytest>=8",
-   "ruff>=0.6",
-   "black>=24",
+  "pytest>=8",
+  "ruff>=0.6",
+  "black>=24",
 ]
 
 [project.urls]
 Homepage = "https://github.com/feiglab/mdsim"
 
 [project.scripts]
-mdsim = "mdsim.cli:main"
+mdsim = "mdsim.cli.cli:main"
+prep_waterbox = "mdsim.cli.prep_waterbox:main"
+equi_waterbox = "mdsim.cli.equi_waterbox:main"
+waterbox = "mdsim.cli.waterbox:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+script-files = [
+  "scripts/check_waterbox_jobs.sh",
+  "scripts/run_waterbox.sh",
+  "scripts/setup_waterbox_job.sh",
+  "scripts/job.waterbox.slurm.template",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.black]
 line-length = 100
@@ -43,10 +58,9 @@ target-version = ["py39"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
-select = ["E","F","I","UP"]
 src = ["src"]
-ignore = ["UP007", "UP045"]
 
 [tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
 ignore = ["UP007", "UP045"]
 

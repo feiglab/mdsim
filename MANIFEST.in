@@ -1,0 +1,8 @@
+include README.md LICENSE pyproject.toml
+recursive-include scripts *.sh *.template
+
+prune notebooks
+prune .github
+prune .ruff_cache
+prune .git
+global-exclude *.pyc __pycache__ .DS_Store
