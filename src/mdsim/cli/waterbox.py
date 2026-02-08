@@ -102,7 +102,7 @@ def _parse_args(
         action="store_false",
         help="Disable NPT",
     )
-    p.set_defaults(npt=True)
+    p.set_defaults(npt=False)
 
     p.add_argument(
         "--pressure",
