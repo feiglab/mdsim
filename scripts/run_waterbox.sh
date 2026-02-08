@@ -9,8 +9,34 @@ usage() {
 nstep="${1:-}"
 [[ -n "$nstep" ]] || usage
 
-tstep=0.03
-gamma=1.0
+cfg_tstep=""
+cfg_gamma=""
+cfg_npt=""
+
+if [[ -r config ]]; then
+    cfg_tstep=$(
+        awk '$1=="tstep" && NF>=2 { print $2; exit }' config
+    )
+    cfg_gamma=$(
+        awk '$1=="gamma" && NF>=2 { print $2; exit }' config
+    )
+    cfg_npt=$(
+        awk '$1=="npt" && NF>=2 { print $2; exit }' config
+    )
+fi
+
+tstep=0.002
+[[ -n "${cfg_tstep:-}" ]] && tstep=$cfg_tstep
+
+gamma=0.1
+[[ -n "${cfg_gamma:-}" ]] && gamma=$cfg_gamma
+
+npt=false
+[[ -n "${cfg_npt:-}" ]] && npt=$cfg_npt
+
+nptoption="--no-opt"
+[[ "$npt" == "true" ]] && nptoption="--npt"
+
 
 # Read last (default 0)
 last=0
@@ -45,7 +71,7 @@ touch "$lock"
 
 # call to program to do the work
 set +e
-waterbox --run "$next" --nstep "$nstep" --tstep "$tstep" --gamma "$gamma" >"run.out" 2>"error.out"
+waterbox --run "$next" --nstep "$nstep" --tstep "$tstep" --gamma "$gamma" "$nptoption" >"run.out" 2>"error.out"
 py_rc=$?
 
 # If python itself failed, treat as error (still allow CUDA parsing below)
@@ -73,15 +99,13 @@ if grep -qE 'CUDA_ERROR|No compatible CUDA device' "error.out"; then
 fi
 
 # Success path: only advance last if expected output exists
-outxml="restart_${next}.xml"
+outxml="prod_${next}.xml"
 if [[ -s "$outxml" ]]; then
   echo "$next" > "last"
 
   # Determine maxrun: prefer run-local, then global, else default
   maxrun=10
   if [[ -r "maxrun" ]]; then
-    maxrun="$(< "maxrun")"
-  elif [[ -r "maxrun" ]]; then
     maxrun="$(< "maxrun")"
   fi
   if ! [[ "$maxrun" =~ ^[0-9]+$ ]]; then
