@@ -27,8 +27,6 @@ def _apply_config_defaults(
 ) -> None:
     defaults: dict[str, object] = {}
 
-    if "mode" in cfg:
-        defaults["mode"] = cfg["mode"]
     if "setup" in cfg:
         defaults["setup"] = Path(cfg["setup"])
     if "equi" in cfg:
@@ -100,7 +98,6 @@ def main() -> None:
     resources = str(args.resources)
     device = int(args.device)
 
-    cfg_path = Path(args.config)
     if bool(args.write_config):
         cfg["setup"] = format_value(args.setup)
         cfg["equi"] = format_value(args.equi)

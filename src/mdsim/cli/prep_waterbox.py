@@ -174,7 +174,7 @@ def _parse_args(
         "--orient",
         dest="orient",
         action="store_true",
-        help="Orient using refsel plane and rotate othersel into x-axis",
+        help="Center solute using refsel if given",
     )
     orient_grp.add_argument(
         "--no-orient",
@@ -191,7 +191,7 @@ def _parse_args(
         action="store_true",
         help="Hydrogen mass repartioning",
     )
-    orient_grp.add_argument(
+    hmass_grp.add_argument(
         "--no-hmass",
         dest="hmass",
         action="store_false",
@@ -250,7 +250,6 @@ def main() -> None:
     ff_val = _default_forcefields() if args.ff is None else _expand_forcefields(args.ff)
     _validate_forcefields(ff_val)
 
-    cfg_path = Path(args.config)
     if bool(args.write_config):
         cfg["setup"] = format_value(args.setup)
         if pdb_arg is not None:
