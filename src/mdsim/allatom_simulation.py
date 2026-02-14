@@ -391,6 +391,7 @@ class MDSim:
             for f in flist:
                 if _is_readable_file(f):
                     plist.append(f)
+            print(plist)
             if plist:
                 self.cpar = CharmmParameterSet(*plist)
 
