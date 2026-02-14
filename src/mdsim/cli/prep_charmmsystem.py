@@ -249,6 +249,7 @@ def main() -> None:
         psf=psf_path,
         par=ff_val,
         box=(boxx, boxy, boxz),
+        hmass=bool(args.hmass),
         switching="openmm",
     )
 
