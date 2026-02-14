@@ -34,7 +34,7 @@ gamma=0.1
 npt=false
 [[ -n "${cfg_npt:-}" ]] && npt=$cfg_npt
 
-nptoption="--no-opt"
+nptoption="--no-npt"
 [[ "$npt" == "true" ]] && nptoption="--npt"
 
 
