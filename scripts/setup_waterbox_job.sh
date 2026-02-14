@@ -31,7 +31,7 @@ fi
 [[ -n "${cfg_queue:-}" ]] && default_queue=$cfg_queue
 queue=${queue_arg:-$default_queue}
 
-default_nsteps=5000000
+default_nsteps=1000000
 default_maxrun=10
 
 [[ -n "${cfg_nsteps:-}" ]] && default_nsteps=$cfg_nsteps
