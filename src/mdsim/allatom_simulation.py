@@ -4,7 +4,6 @@ import os
 import warnings
 from collections.abc import Sequence
 from math import floor, pi
-from typing import Optional
 
 import mdtraj as md
 import numpy as np
@@ -391,7 +390,6 @@ class MDSim:
             for f in flist:
                 if _is_readable_file(f):
                     plist.append(f)
-            print(plist)
             if plist:
                 self.cpar = CharmmParameterSet(*plist)
 
@@ -1469,11 +1467,14 @@ class MDSim:
         raise TypeError("box must be a number, a length-3 tuple, or a Quantity.")
 
 
-def _is_readable_file(path: Optional[str]) -> bool:
-    """Return True if `path` is a readable file; False for None or invalid types."""
-    if not isinstance(path, str):
+def _is_readable_file(path: object) -> bool:
+    if path is None:
         return False
-    return os.path.isfile(path) and os.access(path, os.R_OK)
+    try:
+        p = os.fspath(path)  # accepts str and PathLike
+    except TypeError:
+        return False
+    return os.path.isfile(p) and os.access(p, os.R_OK)
 
 
 def harmonic_energy_xyz(
