@@ -54,7 +54,7 @@ if [[ -z "$setnum" || ! "$setnum" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-tag="AS.${parent}_${setnum}"
+tag="MD.${parent}_${setnum}"
 
 dir=$(pwd)
 dir_esc=$(printf '%s' "$dir" | sed 's/[\/&|\\]/\\&/g')
