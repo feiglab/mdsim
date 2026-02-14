@@ -43,6 +43,7 @@ from openmm.app import (
 from openmm.unit import (
     Quantity,
     bar,
+    dalton,
     kelvin,
     kilojoule,
     mole,
@@ -278,11 +279,17 @@ class MDSim:
     def set_hydrogenmass(self, hm):
         self.hydrogenmass = None
         if isinstance(hm, bool) and hm:
-            self.hydrogenmass = 3.0
-        elif isinstance(hm, str):
+            self.hydrogenmass = 3.0 * dalton
+            return
+        if isinstance(hm, (int, float)):
             hmassval = float(hm)
             if hmassval > 1.0:
-                self.hydrogenmass = hmassval
+                self.hydrogenmass = hmassval * dalton
+            return
+        if isinstance(hm, str):
+            hmassval = float(hm)
+            if hmassval > 1.0:
+                self.hydrogenmass = hmassval * dalton
 
     def set_switching(self, sw):
         self.switching = None
