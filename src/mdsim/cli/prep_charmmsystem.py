@@ -173,7 +173,7 @@ def _parse_args(
         "--ff",
         nargs="+",
         default=None,
-        help="OpenMM forcefield XMLs (allatom only).",
+        help="CHARMM parameter files.",
     )
 
     p.add_argument(
