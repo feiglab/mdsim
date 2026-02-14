@@ -2004,7 +2004,8 @@ class PDBReader:
         for raw in lines:
             if not raw:
                 continue
-            rec = raw[0:6].strip().upper()
+            rec6 = raw[0:6].strip().upper()
+            rec = rec6.strip()
 
             if rec == "MODEL":
                 model_id = _safe_int(raw[10:14], default=len(s.models) + 1) or len(s.models) + 1
@@ -2018,7 +2019,7 @@ class PDBReader:
                 current_model = None
                 continue
 
-            if rec == "ATOM":
+            if rec6.startswith("ATOM") or rec6.startswith("HETATM"):
                 if current_model is None:
                     current_model = Model(model_id=1)
                     s.models.append(current_model)
@@ -2298,9 +2299,32 @@ def _deduce_element(atomname: str, resname: str, element_hint: str = "") -> str:
     return fb if fb else "X"
 
 
+def _pdb_atom_serial_field(line: str) -> str:
+    """Return the raw serial field slice for PDB ATOM/HETATM.
+
+    Handles non-standard 6-digit serials written as 'ATOM 100000', where the
+    leading digit spills into the record-name field.
+    """
+    if len(line) < 11:
+        return line
+
+    # Standard: columns 7-11 (0-based 6:11)
+    field = line[6:11]
+    if field.strip().isdigit() or set(field.strip()) == {"*"}:
+        return field
+
+    # 6-digit spill: columns 6-11 (0-based 5:11)
+    field2 = line[5:11]
+    if field2.strip().isdigit() or set(field2.strip()) == {"*"}:
+        return field2
+
+    # Legacy fallback (older versions used 4:11)
+    return line[4:11]
+
+
 def _parse_atom_line(line: str) -> Atom:
     # PDB v3.3 column mapping, simplified
-    raw_serial = line[4:11]
+    raw_serial = _pdb_atom_serial_field(line)
     s_serial = raw_serial.strip()
     if s_serial and all(ch == "*" for ch in s_serial):
         serial = 0
