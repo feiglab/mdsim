@@ -36,6 +36,7 @@ Homepage = "https://github.com/feiglab/mdsim"
 [project.scripts]
 mdsim = "mdsim.cli.cli:main"
 prep_waterbox = "mdsim.cli.prep_waterbox:main"
+prep_charmmsystem = "mdsim.cli.prep_charmmsystem:main"
 equi_waterbox = "mdsim.cli.equi_waterbox:main"
 waterbox = "mdsim.cli.waterbox:main"
 
