@@ -180,6 +180,13 @@ class MDSim:
         if not self.topology:
             self.set_dummy_topology()
 
+        if self.box_vectors and self.topology is not None:
+            a, b, c = self.box_vectors  # Quantity Vec3
+            a0 = Vec3(a.x, a.y, a.z)
+            b0 = Vec3(b.x, b.y, b.z)
+            c0 = Vec3(c.x, c.y, c.z)
+            self.topology.setPeriodicBoxVectors((a0, b0, c0))
+
         self.integrator = LangevinIntegrator(self.temperature, self.gamma, self.tstep)
 
         try:
