@@ -75,6 +75,15 @@ def _element_key(el: str) -> str:
     return s
 
 
+def _normalize_element_symbol(sym: str) -> str:
+    s = sym.strip()
+    if not s:
+        return s
+    if len(s) == 1:
+        return s.upper()
+    return s[0].upper() + s[1:].lower()
+
+
 def _build_xray_tables_for_selection(
     template_model: Any,
     atom_indices_full: list[int],
@@ -109,6 +118,7 @@ def _build_xray_tables_for_selection(
     f_el_q = np.empty((len(uniq), q.size), dtype=np.float64)
     for k, i in key_to_id.items():
         # fxrayatstol returns electrons (real f0)
+        k = _normalize_element_symbol(k)
         f_el_q[int(i)] = np.asarray(_pt_cm.fxrayatstol(k, stol), dtype=np.float64)
 
     return el_id, f_el_q
