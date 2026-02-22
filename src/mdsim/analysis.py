@@ -4,6 +4,7 @@ import io
 import math
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -1170,6 +1171,352 @@ def rdf_from_dcd(
     }
 
 
+# --- site-site RDFs (coarse-grained CA per residue) ---------------------------
+
+
+@dataclass(frozen=True)
+class SiteRDFResult:
+    r_nm: np.ndarray
+    y: np.ndarray
+    y_err: np.ndarray
+    n_chains: int
+    n_frames: int
+    n_pairs_per_frame: int
+    mode: str
+    normalization: str
+    res_i: int
+    res_j: int
+    atom_name: str
+
+
+def _site_atom_indices_by_chain(
+    tmpl: Any,
+    *,
+    resnum: int,
+    atom_name: str = "CA",
+) -> tuple[list[str], np.ndarray]:
+    """
+    Return (chain_keys, atom_indices) for `atom_name` at residue `resnum` in each chain.
+
+    chain_keys are template_model.chain keys (e.g., seg IDs); indices are template atom indices.
+    """
+    model = tmpl.model if hasattr(tmpl, "model") else tmpl
+    want = str(atom_name).strip().upper()
+    out_keys: list[str] = []
+    out_idx: list[int] = []
+
+    # Need a fast atom id->index map in template ordering.
+    atom_to_idx = {id(a): i for i, a in enumerate(model.atoms)}
+
+    for key, ch in model.chain.items():
+        hit = None
+        for r in ch.residues:
+            if int(r.resnum) != int(resnum):
+                continue
+            for a in r.atoms:
+                if (a.name or "").strip().upper() == want:
+                    hit = a
+                    break
+            if hit is not None:
+                break
+        if hit is None:
+            continue
+        idx = atom_to_idx.get(id(hit))
+        if idx is None:
+            continue
+        out_keys.append(str(key))
+        out_idx.append(int(idx))
+
+    return out_keys, np.asarray(out_idx, dtype=np.int64)
+
+
+def _rdf_norm_from_counts(
+    counts: np.ndarray,
+    *,
+    r_edges_nm: np.ndarray,
+    n_frames: int,
+    n_ref: int,
+    vol_nm3: float,
+    n_targets_per_ref: int,
+    normalization: str,
+) -> np.ndarray:
+    norm = str(normalization).strip().lower()
+    if norm not in {"gr", "prob", "number_density"}:
+        raise ValueError("normalization must be 'gr', 'prob', or 'number_density'")
+
+    shell_vol = (4.0 * math.pi / 3.0) * (np.power(r_edges_nm[1:], 3) - np.power(r_edges_nm[:-1], 3))
+
+    if norm == "number_density":
+        # number density around a *reference* bead
+        denom = float(n_frames) * float(n_ref) * shell_vol
+        return counts / denom
+
+    if norm == "gr":
+        # g(r) around a reference bead, relative to bulk target density
+        rho = float(n_targets_per_ref) / float(vol_nm3)
+        denom = float(n_frames) * float(n_ref) * rho * shell_vol
+        return counts / denom
+
+    # prob: radial probability density p(r) s.t. integral p(r) dr = 1
+    dr = np.diff(r_edges_nm)
+    tot = float(np.sum(counts))
+    if tot <= 0.0:
+        return np.zeros_like(counts, dtype=np.float64)
+    return (counts / tot) / dr
+
+
+def site_rdf_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    res_i: int,
+    res_j: int,
+    atom_name: str = "CA",
+    mode: str = "both",  # "intra" | "inter" | "both"
+    normalization: str = "gr",  # "gr" | "prob" | "number_density"
+    dr_nm: float = 0.02,
+    r_max_nm: Optional[float] = None,
+    stride: int = 1,
+    chunk: int = 500,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    box_nm: Optional[Sequence[float]] = None,
+) -> SiteRDFResult:
+    """
+    Site-site RDF between residue `res_i` (reference) and `res_j` (counted) across chains.
+
+    Replicates for SEM:
+      - intra: each chain contributes one distance per frame
+      - inter: each *reference chain* contributes distances to all other chains per frame
+      - both: concatenation (intra + inter); replicates are per reference chain
+    """
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    m = str(mode).strip().lower()
+    if m not in {"intra", "inter", "both"}:
+        raise ValueError("mode must be 'intra', 'inter', or 'both'")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    keys_i, idx_i_full = _site_atom_indices_by_chain(
+        tmpl, resnum=int(res_i), atom_name=str(atom_name)
+    )
+    keys_j, idx_j_full = _site_atom_indices_by_chain(
+        tmpl, resnum=int(res_j), atom_name=str(atom_name)
+    )
+    map_j = {k: int(v) for k, v in zip(keys_j, idx_j_full.tolist())}
+
+    # Align chains present in both.
+    keep_keys: list[str] = []
+    ii: list[int] = []
+    jj: list[int] = []
+    for k, vi in zip(keys_i, idx_i_full.tolist()):
+        vj = map_j.get(k)
+        if vj is None:
+            continue
+        keep_keys.append(k)
+        ii.append(int(vi))
+        jj.append(int(vj))
+
+    if len(ii) < 2:
+        raise ValueError("need >=2 chains with both residues present")
+
+    idx_i_full = np.asarray(ii, dtype=np.int64)
+    idx_j_full = np.asarray(jj, dtype=np.int64)
+    n_ch = int(idx_i_full.size)
+
+    # Union atom indices for DCD selection.
+    atom_indices_full = sorted(set(idx_i_full.tolist() + idx_j_full.tolist()))
+    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+    idx_i = np.asarray([idx_map[int(x)] for x in idx_i_full.tolist()], dtype=np.int64)
+    idx_j = np.asarray([idx_map[int(x)] for x in idx_j_full.tolist()], dtype=np.int64)
+
+    # r_max default: half min box edge (needs box)
+    if r_max_nm is None:
+        half = []
+        for dcd in dcd_list:
+            b0 = _peek_first_box_nm(
+                dcd,
+                tmpl_model,
+                atom_indices_full,
+                int(stride),
+                box_nm=box_nm,
+            )
+            half.append(0.5 * float(np.min(b0)))
+        r_max = float(min(half))
+    else:
+        r_max = float(r_max_nm)
+
+    if r_max <= 0.0:
+        raise ValueError("r_max_nm must be > 0")
+    if float(dr_nm) <= 0.0:
+        raise ValueError("dr_nm must be > 0")
+
+    r_edges = np.arange(0.0, r_max + float(dr_nm), float(dr_nm), dtype=np.float64)
+    if r_edges.size < 2:
+        raise ValueError("invalid r_max/dr combination")
+    r_edges[-1] = r_max
+    r_nm = 0.5 * (r_edges[:-1] + r_edges[1:])
+
+    # Per-replicate histograms (replicate = reference chain).
+    n_bins = int(r_edges.size - 1)
+    h_rep = np.zeros((n_ch, n_bins), dtype=np.float64)
+    h_sum = np.zeros((n_bins,), dtype=np.float64)
+
+    n_frames = 0
+    n_pairs_per_frame = 0
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    # Precompute mask for inter pairs in an (n_ch, n_ch) matrix.
+    eye = np.eye(n_ch, dtype=bool)
+    not_diag = ~eye
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+                b = box_fallback
+            else:
+                b = np.asarray(box_frame_nm, dtype=np.float64).reshape(3)
+
+            if np.any(b <= 0.0):
+                raise ValueError("box lengths must be positive")
+            vol = float(b[0] * b[1] * b[2])
+            if vol <= 0.0:
+                raise ValueError("non-positive box volume")
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            pos_i = xyz[idx_i, :]  # (n_ch, 3)
+            pos_j = xyz[idx_j, :]  # (n_ch, 3)
+
+            # Build distance sets by mode.
+            dists_by_ref: list[np.ndarray] = []
+
+            if m in {"intra", "both"}:
+                d = pos_j - pos_i
+                d = _min_image_disp_nm(d, b)
+                r = np.linalg.norm(d, axis=1)  # (n_ch,)
+                dists_by_ref.append(r[:, None])  # per ref chain: 1 target
+
+            if m in {"inter", "both"}:
+                d = pos_j[None, :, :] - pos_i[:, None, :]  # (n_ch, n_ch, 3)
+                d = d - np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
+                rij = np.linalg.norm(d, axis=2)  # (n_ch, n_ch)
+                # per ref chain: all targets except itself
+                for a in range(n_ch):
+                    dists_by_ref.append(rij[a, not_diag[a]][None, :])
+
+            # Assemble per-reference-chain histograms.
+            # For "intra": one replicate block per chain.
+            # For "inter": replicate is reference chain; counts per ref include (n_ch-1) pairs.
+            # For "both": combine intra+inter counts into the same replicate id (ref chain).
+            if m == "intra":
+                n_pairs_per_frame = n_ch
+                for a in range(n_ch):
+                    ra = dists_by_ref[0][a, :]
+                    ha, _ = np.histogram(ra, bins=r_edges)
+                    h_rep[a] += ha
+                    h_sum += ha
+            elif m == "inter":
+                n_pairs_per_frame = n_ch * (n_ch - 1)
+                # dists_by_ref has n_ch entries, each shape (1, n_ch-1)
+                for a in range(n_ch):
+                    ra = dists_by_ref[a][0]
+                    ha, _ = np.histogram(ra, bins=r_edges)
+                    h_rep[a] += ha
+                    h_sum += ha
+            else:
+                # both: build per-ref as intra + inter(a)
+                n_pairs_per_frame = n_ch * n_ch
+                intra = dists_by_ref[0].reshape(n_ch)  # (n_ch,)
+                for a in range(n_ch):
+                    ra = np.concatenate([np.asarray([intra[a]]), dists_by_ref[1 + a][0]])
+                    ha, _ = np.histogram(ra, bins=r_edges)
+                    h_rep[a] += ha
+                    h_sum += ha
+
+            n_frames += 1
+
+    if n_frames <= 0:
+        raise ValueError("no frames selected")
+
+    # Per-reference normalization.
+    # Each chain has one reference site (res_i), so number of references is n_ch.
+    n_ref = n_ch
+
+    if m == "intra":
+        n_targets_per_ref = 1
+    elif m == "inter":
+        n_targets_per_ref = n_ch - 1
+    else:
+        n_targets_per_ref = n_ch
+
+    b_use = _box_lengths_nm(box_nm) if box_nm is not None else b  # type: ignore[name-defined]
+    vol_use = float(b_use[0] * b_use[1] * b_use[2])
+
+    y = _rdf_norm_from_counts(
+        h_sum,
+        r_edges_nm=r_edges,
+        n_frames=n_frames,
+        n_ref=n_ref,
+        vol_nm3=vol_use,
+        n_targets_per_ref=n_targets_per_ref,
+        normalization=normalization,
+    )
+
+    y_rep = np.empty_like(h_rep, dtype=np.float64)
+    for a in range(n_ch):
+        y_rep[a] = _rdf_norm_from_counts(
+            h_rep[a],
+            r_edges_nm=r_edges,
+            n_frames=n_frames,
+            n_ref=1,  # each replicate is one reference chain
+            vol_nm3=vol_use,
+            n_targets_per_ref=n_targets_per_ref,
+            normalization=normalization,
+        )
+
+    y_err = np.std(y_rep, axis=0, ddof=1) / math.sqrt(float(n_ch))
+
+    return SiteRDFResult(
+        r_nm=r_nm,
+        y=y,
+        y_err=y_err,
+        n_chains=n_ch,
+        n_frames=int(n_frames),
+        n_pairs_per_frame=int(n_pairs_per_frame),
+        mode=m,
+        normalization=str(normalization).strip().lower(),
+        res_i=int(res_i),
+        res_j=int(res_j),
+        atom_name=str(atom_name).strip().upper(),
+    )
+
+
 def _fmt_hms(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
     h = int(seconds // 3600)
@@ -1185,3 +1532,285 @@ def _progress_print(msg: str, *, stream=None) -> None:
         stream = sys.stderr
     stream.write(msg + "\n")
     stream.flush()
+
+
+@dataclass(frozen=True)
+class MSDResult:
+    t_ns: np.ndarray
+    msd_nm2: np.ndarray
+    msd_stderr_nm2: np.ndarray
+    msd_per_chain_nm2: np.ndarray  # (n_chains, n_frames)
+    n_chains: int
+    n_frames: int
+    dt_ns: float
+    mode: str
+    resnum: Optional[int]
+    atom_name: str
+
+
+def _unwrap_time_series_nm(x_wrapped: np.ndarray, boxes_nm: np.ndarray) -> np.ndarray:
+    x = np.asarray(x_wrapped, dtype=np.float64)
+    b = np.asarray(boxes_nm, dtype=np.float64)
+    if x.ndim != 3 or x.shape[-1] != 3:
+        raise ValueError("x_wrapped must have shape (n_frames, n_chains, 3)")
+    if b.ndim != 2 or b.shape[-1] != 3:
+        raise ValueError("boxes_nm must have shape (n_frames, 3)")
+    if x.shape[0] != b.shape[0]:
+        raise ValueError("x_wrapped and boxes_nm must have same n_frames")
+
+    out = np.empty_like(x)
+    out[0] = x[0]
+    for t in range(1, x.shape[0]):
+        bt = b[t].reshape(1, 3)
+        d = x[t] - x[t - 1]
+        d = d - np.rint(d / bt) * bt
+        out[t] = out[t - 1] + d
+    return out
+
+
+def _autocorr_fft_1d(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    n = int(x.size)
+    if n < 1:
+        raise ValueError("empty series")
+    m = 1 << (2 * n - 1).bit_length()
+    f = np.fft.rfft(x, n=m)
+    ac = np.fft.irfft(f * np.conjugate(f), n=m)[:n]
+    return np.asarray(ac, dtype=np.float64)
+
+
+def _msd_one_chain_fft(r_nm: np.ndarray) -> np.ndarray:
+    r = np.asarray(r_nm, dtype=np.float64)
+    if r.ndim != 2 or r.shape[1] != 3:
+        raise ValueError("r_nm must have shape (n_frames, 3)")
+    n = int(r.shape[0])
+    if n < 2:
+        raise ValueError("need >=2 frames")
+
+    r2 = np.einsum("ij,ij->i", r, r)
+    ac = _autocorr_fft_1d(r[:, 0]) + _autocorr_fft_1d(r[:, 1]) + _autocorr_fft_1d(r[:, 2])
+
+    c = np.cumsum(r2)
+    tot = float(c[-1])
+
+    msd = np.empty((n,), dtype=np.float64)
+    msd[0] = 0.0
+    for k in range(1, n):
+        denom = float(n - k)
+        s0 = float(c[n - k - 1])
+        s1 = float(tot - c[k - 1])
+        dot = float(ac[k])
+        msd[k] = (s0 + s1 - 2.0 * dot) / denom
+    return msd
+
+
+def msd_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    mode: str = "com",  # "com" | "cog" | "residue"
+    resnum: Optional[int] = None,
+    atom_name: str = "CA",
+    dt_ns: float,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 500,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> MSDResult:
+    if dt_ns <= 0.0:
+        raise ValueError("dt_ns must be > 0")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    m = str(mode).strip().lower()
+    if m not in {"com", "cog", "residue"}:
+        raise ValueError("mode must be 'com', 'cog', or 'residue'")
+    if m == "residue" and resnum is None:
+        raise ValueError("resnum is required for mode='residue'")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    if m in {"com", "cog"}:
+        groups_full = solute_groups(tmpl, group_spec="protein")
+        if not groups_full:
+            raise ValueError("solute_groups returned no groups")
+        masses = atom_masses(tmpl) if m == "com" else None
+        center = "com" if m == "com" else "cog"
+        atom_set: set[int] = set()
+        for g in groups_full:
+            atom_set.update(int(i) for i in g.tolist())
+        atom_indices_full = sorted(atom_set)
+
+        idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+        groups_sel = [
+            np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64) for g in groups_full
+        ]
+    else:
+        keys, idx_full = _site_atom_indices_by_chain(
+            tmpl, resnum=int(resnum), atom_name=str(atom_name)
+        )
+        if int(idx_full.size) < 2:
+            raise ValueError("need >=2 chains with requested residue/atom present")
+        groups_sel = [np.asarray([i], dtype=np.int64) for i in range(int(idx_full.size))]
+        atom_indices_full = [int(i) for i in idx_full.tolist()]
+        masses = None
+        center = "cog"
+
+    n_ch = int(len(groups_sel))
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    centers_wr: list[np.ndarray] = []
+    boxes: list[np.ndarray] = []
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks box; pass box_nm=(Lx,Ly,Lz) in nm")
+                b = box_fallback
+            else:
+                b = _box_lengths_nm(box_frame_nm)
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            c = group_centers_nm(
+                xyz,
+                groups_sel,
+                masses=masses,
+                box_nm=b,
+                center=center,
+                unwrap=True,
+                wrap=True,
+            )
+            if c.shape != (n_ch, 3):
+                raise ValueError("unexpected centers shape")
+            centers_wr.append(np.asarray(c, dtype=np.float64))
+            boxes.append(np.asarray(b, dtype=np.float64))
+
+    if not centers_wr:
+        raise ValueError("no frames selected")
+
+    x_wr = np.stack(centers_wr, axis=0)  # (n_frames, n_ch, 3)
+    b_all = np.stack(boxes, axis=0)  # (n_frames, 3)
+    x_un = _unwrap_time_series_nm(x_wr, b_all)
+
+    n_frames = int(x_un.shape[0])
+    t_ns = np.arange(n_frames, dtype=np.float64) * float(dt_ns)
+
+    msd_ch = np.empty((n_ch, n_frames), dtype=np.float64)
+    for a in range(n_ch):
+        msd_ch[a] = _msd_one_chain_fft(x_un[:, a, :])
+
+    msd = np.mean(msd_ch, axis=0)
+    msd_stderr = np.std(msd_ch, axis=0, ddof=1) / math.sqrt(float(n_ch))
+
+    return MSDResult(
+        t_ns=t_ns,
+        msd_nm2=msd,
+        msd_stderr_nm2=msd_stderr,
+        msd_per_chain_nm2=msd_ch,
+        n_chains=n_ch,
+        n_frames=n_frames,
+        dt_ns=float(dt_ns),
+        mode=m,
+        resnum=None if resnum is None else int(resnum),
+        atom_name=str(atom_name).strip().upper(),
+    )
+
+
+@dataclass(frozen=True)
+class MSDFitResult:
+    fit_tmin_ns: float
+    fit_tmax_ns: float
+    slope_nm2_per_ns: float
+    intercept_nm2: float
+    d_nm2_per_ns: float
+    d_stderr_nm2_per_ns: float
+    per_chain_d_nm2_per_ns: np.ndarray
+
+
+def _linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if x.size != y.size or x.size < 2:
+        raise ValueError("need >=2 points to fit")
+    a = np.vstack([x, np.ones_like(x)]).T
+    sol, _, _, _ = np.linalg.lstsq(a, y, rcond=None)
+    return float(sol[0]), float(sol[1])
+
+
+def fit_msd_linear(
+    msd: MSDResult,
+    *,
+    fit_tmin_ns: float,
+    fit_tmax_ns: float,
+    dims: int = 3,
+    use_chain_sem: bool = True,
+) -> MSDFitResult:
+    """
+    Fit MSD(t) = slope * t + intercept on [fit_tmin_ns, fit_tmax_ns].
+
+    Diffusion: D = slope / (2*dims). For 3D, D = slope/6.
+
+    Error:
+      - use_chain_sem=True: fit each chain, report mean D and SEM across chains.
+      - else: no uncertainty estimate beyond 0.0 (kept simple).
+    """
+    if dims <= 0:
+        raise ValueError("dims must be >= 1")
+    t = msd.t_ns
+    y = msd.msd_nm2
+    tmin = float(fit_tmin_ns)
+    tmax = float(fit_tmax_ns)
+    if tmax <= tmin:
+        raise ValueError("fit_tmax_ns must be > fit_tmin_ns")
+
+    sel = (t >= tmin) & (t <= tmax)
+    if int(np.sum(sel)) < 2:
+        raise ValueError("fit window selects <2 points")
+
+    slope, intercept = _linear_fit(t[sel], y[sel])
+    d = slope / (2.0 * float(dims))
+
+    d_stderr = 0.0
+    d_ch = np.empty((msd.n_chains,), dtype=np.float64)
+
+    if use_chain_sem:
+        for a in range(msd.n_chains):
+            s, _ = _linear_fit(t[sel], msd.msd_per_chain_nm2[a, sel])
+            d_ch[a] = s / (2.0 * float(dims))
+        d_stderr = float(np.std(d_ch, ddof=1)) / math.sqrt(float(msd.n_chains))
+    else:
+        d_ch[:] = np.nan
+
+    return MSDFitResult(
+        fit_tmin_ns=tmin,
+        fit_tmax_ns=tmax,
+        slope_nm2_per_ns=float(slope),
+        intercept_nm2=float(intercept),
+        d_nm2_per_ns=float(d),
+        d_stderr_nm2_per_ns=float(d_stderr),
+        per_chain_d_nm2_per_ns=d_ch,
+    )

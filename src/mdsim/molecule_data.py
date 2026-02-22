@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
+import os
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -15,6 +17,28 @@ from openmm.app import Topology, element
 from openmm.unit import Quantity, Unit, angstrom, dalton, nanometer, radian
 
 FileLike = Union[str, Path, io.BytesIO, io.StringIO]
+
+
+@contextlib.contextmanager
+def _suppress_c_stdout_stderr(enabled: bool = True) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
+
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old_out = os.dup(1)
+    old_err = os.dup(2)
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(old_out, 1)
+        os.dup2(old_err, 2)
+        os.close(old_out)
+        os.close(old_err)
+        os.close(devnull)
+
 
 # --- Data containers ---------------------------------------------------------
 
@@ -3146,6 +3170,7 @@ def iter_dcd(
     chunk: int = 500,
     stride: int = 1,
     atom_indices: Optional[Sequence[int]] = None,
+    suppress_plugin_messages: bool = True,
 ) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
     """Stream frames from a CHARMM DCD.
 
@@ -3172,26 +3197,35 @@ def iter_dcd(
     if atom_indices is not None:
         atom_idx_list = [int(i) for i in atom_indices]
 
-    for trj in md.iterload(
-        dcd_file,
-        top=top,
-        chunk=int(chunk),
-        stride=int(stride),
-        atom_indices=atom_idx_list,
-    ):
-        if getattr(trj, "unitcell_angles", None) is not None and trj.unitcell_angles is not None:
-            ang = np.asarray(trj.unitcell_angles, dtype=np.float64)
-            if not np.allclose(ang, 90.0, atol=1e-3):
-                raise ValueError("triclinic unit cells are not supported for PBC analysis")
+    dcd_file = os.fspath(dcd_file)
 
-        xyz = np.asarray(trj.xyz, dtype=np.float64)
-        boxes = None
-        if getattr(trj, "unitcell_lengths", None) is not None and trj.unitcell_lengths is not None:
-            boxes = np.asarray(trj.unitcell_lengths, dtype=np.float64)
+    with _suppress_c_stdout_stderr(suppress_plugin_messages):
+        for trj in md.iterload(
+            dcd_file,
+            top=top,
+            chunk=int(chunk),
+            stride=int(stride),
+            atom_indices=atom_idx_list,
+        ):
+            if (
+                getattr(trj, "unitcell_angles", None) is not None
+                and trj.unitcell_angles is not None
+            ):
+                ang = np.asarray(trj.unitcell_angles, dtype=np.float64)
+                if not np.allclose(ang, 90.0, atol=1e-3):
+                    raise ValueError("triclinic unit cells are not supported for PBC analysis")
 
-        for i in range(int(xyz.shape[0])):
-            box_i = None if boxes is None else boxes[i]
-            yield xyz[i], box_i
+            xyz = np.asarray(trj.xyz, dtype=np.float64)
+            boxes = None
+            if (
+                getattr(trj, "unitcell_lengths", None) is not None
+                and trj.unitcell_lengths is not None
+            ):
+                boxes = np.asarray(trj.unitcell_lengths, dtype=np.float64)
+
+            for i in range(int(xyz.shape[0])):
+                box_i = None if boxes is None else boxes[i]
+                yield xyz[i], box_i
 
 
 # ----------------------------- helpers ---------------------------------------
