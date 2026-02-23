@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import math
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -530,3 +532,117 @@ def clusters_from_dcd(
             "frame_stop": frame_stop,
         },
     }
+
+
+@dataclass(frozen=True)
+class CondensateResult:
+    membership: np.ndarray  # (n_frames, n_chains) bool
+    largest_size: np.ndarray  # (n_frames,) int
+    n_condensates: np.ndarray  # (n_frames,) int
+    condensates_by_frame: list[list[list[int]]]  # per frame: list of clusters (member indices)
+    min_size: int
+    params: dict[str, Any]
+
+
+def condensates_from_dcd(
+    pdb_file: Any,
+    dcd_files: Any,
+    *,
+    # interaction definition (reuses clustering.py)
+    dist_cutoff_nm: float,
+    contact_threshold: int = 1,
+    selection: Union[str, Sequence[Sequence[int]]] = "protein",
+    heavy_only: bool = False,
+    # condensate definition
+    min_frac: float = 0.1,
+    min_size: Optional[int] = None,
+    # io/frames
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    box_nm: Optional[Sequence[float]] = None,
+    progress: bool = False,
+) -> CondensateResult:
+    """
+    Identify condensate membership per frame using clustering.clusters_from_dcd.
+
+    - First, clusters are defined by an inter-chain edge graph:
+        edge(i,j) exists if >= contact_threshold atom pairs within dist_cutoff_nm
+    - Then, a "condensate" is any cluster with size >= min_size, where:
+        min_size = ceil(min_frac * n_chains) unless overridden.
+
+    Returns a per-frame membership boolean mask.
+    """
+    if float(dist_cutoff_nm) <= 0.0:
+        raise ValueError("dist_cutoff_nm must be > 0")
+    if int(contact_threshold) <= 0:
+        raise ValueError("contact_threshold must be >= 1")
+    if float(min_frac) <= 0.0 or float(min_frac) > 1.0:
+        raise ValueError("min_frac must be in (0, 1]")
+
+    from .clustering import (
+        clusters_from_dcd,  # reuse your module :contentReference[oaicite:1]{index=1}
+    )
+
+    out = clusters_from_dcd(
+        pdb_file=pdb_file,
+        dcd_files=dcd_files,
+        selection=selection,
+        heavy_only=bool(heavy_only),
+        dist_cutoff_nm=float(dist_cutoff_nm),
+        contact_threshold=int(contact_threshold),
+        stride=int(stride),
+        chunk=int(chunk),
+        frame_start=int(frame_start),
+        frame_stop=frame_stop,
+        box_nm=box_nm,
+        progress=bool(progress),
+    )
+
+    clusters_by_frame = out["clusters_by_frame"]
+    n_chains = int(out["n_proteins"])
+    n_frames = int(out["frames_used"])
+
+    if min_size is None:
+        ms = int(math.ceil(float(min_frac) * float(n_chains)))
+        min_size_i = max(2, ms)
+    else:
+        min_size_i = int(min_size)
+        if min_size_i < 2:
+            raise ValueError("min_size must be >= 2")
+
+    membership = np.zeros((n_frames, n_chains), dtype=bool)
+    largest = np.zeros((n_frames,), dtype=np.int64)
+    n_cond = np.zeros((n_frames,), dtype=np.int64)
+    condensates_only: list[list[list[int]]] = []
+
+    for t, clusters in enumerate(clusters_by_frame):
+        conds = [c for c in clusters if int(len(c)) >= min_size_i]
+        condensates_only.append(conds)
+
+        if conds:
+            largest[t] = int(max(len(c) for c in conds))
+            n_cond[t] = int(len(conds))
+            for c in conds:
+                membership[t, np.asarray(c, dtype=np.int64)] = True
+        else:
+            largest[t] = 0
+            n_cond[t] = 0
+
+    params = dict(out.get("params", {}))
+    params.update(
+        {
+            "min_frac": float(min_frac),
+            "min_size": int(min_size_i),
+        }
+    )
+
+    return CondensateResult(
+        membership=membership,
+        largest_size=largest,
+        n_condensates=n_cond,
+        condensates_by_frame=condensates_only,
+        min_size=int(min_size_i),
+        params=params,
+    )

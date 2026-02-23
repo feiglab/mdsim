@@ -1604,6 +1604,53 @@ def _msd_one_chain_fft(r_nm: np.ndarray) -> np.ndarray:
     return msd
 
 
+def _centers_unwrapped_from_frame(
+    xyz_nm: np.ndarray,
+    groups: Sequence[np.ndarray],
+    ref_sel: np.ndarray,
+    ref_wr_prev: np.ndarray,
+    ref_un_prev: np.ndarray,
+    box_nm: np.ndarray,
+    *,
+    masses: Optional[np.ndarray],
+    center: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    b = np.asarray(box_nm, dtype=np.float64).reshape(3)
+    xyz = np.asarray(xyz_nm, dtype=np.float64)
+
+    ref_wr = xyz[ref_sel, :]
+    d = ref_wr - ref_wr_prev
+    d -= np.rint(d / b.reshape(1, 3)) * b.reshape(1, 3)
+    ref_un = ref_un_prev + d
+
+    cen_mode = str(center).strip().lower()
+    if cen_mode not in {"cog", "com"}:
+        raise ValueError("center must be 'cog' or 'com'")
+
+    centers = np.empty((len(groups), 3), dtype=np.float64)
+
+    for gi, idx in enumerate(groups):
+        idx_i = np.asarray(idx, dtype=np.int64)
+        g_wr = xyz[idx_i, :]
+
+        # unwrap group atoms relative to the *wrapped* ref, then place in ref_un image
+        delta = g_wr - ref_wr[gi : gi + 1, :]
+        delta -= np.rint(delta / b.reshape(1, 3)) * b.reshape(1, 3)
+        g_un = ref_un[gi : gi + 1, :] + delta
+
+        if cen_mode == "cog" or masses is None:
+            centers[gi] = np.mean(g_un, axis=0)
+        else:
+            w = np.asarray(masses[idx_i], dtype=np.float64)
+            tot = float(np.sum(w))
+            if tot <= 0.0:
+                centers[gi] = np.mean(g_un, axis=0)
+            else:
+                centers[gi] = np.sum(g_un * w[:, None], axis=0) / tot
+
+    return centers, ref_wr, ref_un
+
+
 def msd_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
@@ -1655,6 +1702,9 @@ def msd_from_dcd(
         groups_sel = [
             np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64) for g in groups_full
         ]
+        ref_sel = np.asarray([int(g[0]) for g in groups_sel], dtype=np.int64)
+        ref_wr_prev: Optional[np.ndarray] = None
+        ref_un_prev: Optional[np.ndarray] = None
     else:
         keys, idx_full = _site_atom_indices_by_chain(
             tmpl, resnum=int(resnum), atom_name=str(atom_name)
@@ -1695,26 +1745,44 @@ def msd_from_dcd(
                 b = _box_lengths_nm(box_frame_nm)
 
             xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
-            c = group_centers_nm(
-                xyz,
-                groups_sel,
-                masses=masses,
-                box_nm=b,
-                center=center,
-                unwrap=True,
-                wrap=True,
-            )
-            if c.shape != (n_ch, 3):
-                raise ValueError("unexpected centers shape")
-            centers_wr.append(np.asarray(c, dtype=np.float64))
-            boxes.append(np.asarray(b, dtype=np.float64))
+
+            if m in {"com", "cog"}:
+                if ref_wr_prev is None:
+                    ref_wr_prev = np.asarray(xyz[ref_sel, :], dtype=np.float64)
+                    ref_un_prev = ref_wr_prev.copy()
+
+                centers_un, ref_wr_prev, ref_un_prev = _centers_unwrapped_from_frame(
+                    xyz,
+                    groups_sel,
+                    ref_sel,
+                    ref_wr_prev,
+                    ref_un_prev,
+                    np.asarray(b, dtype=np.float64),
+                    masses=masses,
+                    center=center,
+                )
+                if centers_un.shape != (n_ch, 3):
+                    raise ValueError("unexpected centers shape")
+                centers_wr.append(np.asarray(centers_un, dtype=np.float64))
+
+            else:
+                # residue mode: xyz contains one selected atom per chain (because atom_indices_full
+                # is the per-chain residue atom index list). groups_sel is [[0],[1],...].
+                if xyz.shape != (n_ch, 3):
+                    raise ValueError("unexpected residue coords shape")
+                centers_wr.append(np.asarray(xyz, dtype=np.float64))
+                boxes.append(np.asarray(b, dtype=np.float64))
 
     if not centers_wr:
         raise ValueError("no frames selected")
 
     x_wr = np.stack(centers_wr, axis=0)  # (n_frames, n_ch, 3)
-    b_all = np.stack(boxes, axis=0)  # (n_frames, 3)
-    x_un = _unwrap_time_series_nm(x_wr, b_all)
+
+    if m in {"com", "cog"}:
+        x_un = x_wr  # already unwrapped in time
+    else:
+        b_all = np.stack(boxes, axis=0)  # (n_frames, 3)
+        x_un = _unwrap_time_series_nm(x_wr, b_all)
 
     n_frames = int(x_un.shape[0])
     t_ns = np.arange(n_frames, dtype=np.float64) * float(dt_ns)
@@ -1813,4 +1881,227 @@ def fit_msd_linear(
         d_nm2_per_ns=float(d),
         d_stderr_nm2_per_ns=float(d_stderr),
         per_chain_d_nm2_per_ns=d_ch,
+    )
+
+
+@dataclass(frozen=True)
+class RgResult:
+    rg_per_chain_nm: np.ndarray  # (n_chains, n_frames)
+    rg_mean_nm: np.ndarray  # (n_frames,)
+    rg_stderr_nm: np.ndarray  # (n_frames,)
+    n_chains: int
+    n_frames: int
+    mode: str  # "cog" or "com"
+
+
+def _chain_groups_from_template(tmpl: Any) -> list[np.ndarray]:
+    model = tmpl.model if hasattr(tmpl, "model") else tmpl
+    atom_to_idx = {id(a): i for i, a in enumerate(model.atoms)}
+
+    out: list[np.ndarray] = []
+    for _, ch in model.chain.items():
+        idx: list[int] = []
+        for r in ch.residues:
+            for a in r.atoms:
+                ai = atom_to_idx.get(id(a))
+                if ai is not None:
+                    idx.append(int(ai))
+        if idx:
+            out.append(np.asarray(idx, dtype=np.int64))
+
+    if not out:
+        raise ValueError("no chains found in template")
+    return out
+
+
+def _groups_to_rect_index(groups_sel: Sequence[np.ndarray]) -> Optional[np.ndarray]:
+    if not groups_sel:
+        return None
+    n0 = int(groups_sel[0].size)
+    if n0 <= 0:
+        return None
+    for g in groups_sel[1:]:
+        if int(g.size) != n0:
+            return None
+    idx2 = np.empty((len(groups_sel), n0), dtype=np.int64)
+    for i, g in enumerate(groups_sel):
+        idx2[i, :] = np.asarray(g, dtype=np.int64)
+    return idx2
+
+
+def rg_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    mode: str = "cog",  # "cog" | "com"
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> RgResult:
+    """
+    Per-chain Rg time series (nm) for wrapped trajectories.
+
+    PBC handling:
+      - Unwrap each chain within each frame relative to its first bead (min-image).
+      - Orthorhombic boxes only.
+      - If DCD lacks unit cell lengths, pass box_nm=(Lx,Ly,Lz) in nm.
+
+    Performance:
+      - Uses a vectorized fast path when all chains have the same number of beads.
+      - Falls back to a per-chain loop for variable-length chains.
+    """
+    m = str(mode).strip().lower()
+    if m not in {"cog", "com"}:
+        raise ValueError("mode must be 'cog' or 'com'")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    groups_full = _chain_groups_from_template(tmpl)
+    n_ch = int(len(groups_full))
+
+    masses_all = atom_masses(tmpl) if m == "com" else None
+
+    atom_set: set[int] = set()
+    for g in groups_full:
+        atom_set.update(int(i) for i in g.tolist())
+    atom_indices_full = sorted(atom_set)
+
+    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+    groups_sel = [
+        np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64) for g in groups_full
+    ]
+    idx2 = _groups_to_rect_index(groups_sel)
+
+    masses_sel = None
+    if masses_all is not None:
+        masses_sel = np.asarray(masses_all[atom_indices_full], dtype=np.float64)
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    rg_frames: list[np.ndarray] = []
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks box; pass box_nm=(Lx,Ly,Lz) in nm")
+                b = np.asarray(box_fallback, dtype=np.float64).reshape(3)
+            else:
+                b = _box_lengths_nm(box_frame_nm)
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+
+            if idx2 is not None:
+                # Fast path: all chains same size
+                x = xyz[idx2, :]  # (n_ch, n_beads, 3)
+                ref = x[:, 0:1, :]
+                d = x - ref
+                d -= np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
+                x_un = ref + d
+
+                if masses_sel is None:
+                    c = np.mean(x_un, axis=1)
+                    d2 = np.sum((x_un - c[:, None, :]) ** 2, axis=2)
+                    rg2 = np.mean(d2, axis=1)
+                    rg_ch = np.sqrt(np.maximum(rg2, 0.0))
+                else:
+                    w = masses_sel[idx2]  # (n_ch, n_beads)
+                    wsum = np.sum(w, axis=1)
+                    ok = wsum > 0.0
+
+                    c = np.empty((n_ch, 3), dtype=np.float64)
+                    if np.any(ok):
+                        c[ok] = (
+                            np.sum(
+                                x_un[ok] * w[ok, :, None],
+                                axis=1,
+                            )
+                            / wsum[ok, None]
+                        )
+                    if np.any(~ok):
+                        c[~ok] = np.mean(x_un[~ok], axis=1)
+
+                    d2 = np.sum((x_un - c[:, None, :]) ** 2, axis=2)
+                    rg2 = np.empty((n_ch,), dtype=np.float64)
+                    if np.any(ok):
+                        rg2[ok] = np.sum(w[ok] * d2[ok], axis=1) / wsum[ok]
+                    if np.any(~ok):
+                        rg2[~ok] = np.mean(d2[~ok], axis=1)
+                    rg_ch = np.sqrt(np.maximum(rg2, 0.0))
+
+            else:
+                # Fallback: variable chain length
+                rg_ch = np.empty((n_ch,), dtype=np.float64)
+                for ci in range(n_ch):
+                    idx = groups_sel[ci]
+                    if idx.size == 0:
+                        rg_ch[ci] = np.nan
+                        continue
+
+                    ref = xyz[idx[0], :].reshape(1, 3)
+                    d = xyz[idx, :] - ref
+                    d -= np.rint(d / b.reshape(1, 3)) * b.reshape(1, 3)
+                    x_un = ref + d
+
+                    if masses_sel is None:
+                        c = np.mean(x_un, axis=0)
+                        d2 = np.sum((x_un - c) ** 2, axis=1)
+                        rg2 = float(np.mean(d2))
+                        rg_ch[ci] = math.sqrt(max(rg2, 0.0))
+                    else:
+                        w = masses_sel[idx]
+                        tot = float(np.sum(w))
+                        if tot <= 0.0:
+                            c = np.mean(x_un, axis=0)
+                            d2 = np.sum((x_un - c) ** 2, axis=1)
+                            rg2 = float(np.mean(d2))
+                            rg_ch[ci] = math.sqrt(max(rg2, 0.0))
+                        else:
+                            c = np.sum(x_un * w[:, None], axis=0) / tot
+                            d2 = np.sum((x_un - c) ** 2, axis=1)
+                            rg2 = float(np.sum(w * d2) / tot)
+                            rg_ch[ci] = math.sqrt(max(rg2, 0.0))
+
+            rg_frames.append(np.asarray(rg_ch, dtype=np.float64))
+
+    if not rg_frames:
+        raise ValueError("no frames selected")
+
+    rg_pf = np.stack(rg_frames, axis=1)  # (n_ch, n_frames)
+    rg_mean = np.nanmean(rg_pf, axis=0)
+    rg_stderr = np.nanstd(rg_pf, axis=0, ddof=1) / math.sqrt(float(n_ch))
+
+    return RgResult(
+        rg_per_chain_nm=rg_pf,
+        rg_mean_nm=rg_mean,
+        rg_stderr_nm=rg_stderr,
+        n_chains=n_ch,
+        n_frames=int(rg_pf.shape[1]),
+        mode=m,
     )
