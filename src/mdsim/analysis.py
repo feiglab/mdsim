@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import sys
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -1539,7 +1541,7 @@ class MSDResult:
     t_ns: np.ndarray
     msd_nm2: np.ndarray
     msd_stderr_nm2: np.ndarray
-    msd_per_chain_nm2: np.ndarray  # (n_chains, n_frames)
+    msd_per_chain_nm2: np.ndarray  # (n_chains, n_lags)
     n_chains: int
     n_frames: int
     dt_ns: float
@@ -1551,104 +1553,194 @@ class MSDResult:
 def _unwrap_time_series_nm(x_wrapped: np.ndarray, boxes_nm: np.ndarray) -> np.ndarray:
     x = np.asarray(x_wrapped, dtype=np.float64)
     b = np.asarray(boxes_nm, dtype=np.float64)
+
     if x.ndim != 3 or x.shape[-1] != 3:
-        raise ValueError("x_wrapped must have shape (n_frames, n_chains, 3)")
+        raise ValueError("x_wrapped must have shape (n_frames, n_items, 3)")
     if b.ndim != 2 or b.shape[-1] != 3:
         raise ValueError("boxes_nm must have shape (n_frames, 3)")
     if x.shape[0] != b.shape[0]:
-        raise ValueError("x_wrapped and boxes_nm must have same n_frames")
+        raise ValueError("x_wrapped and boxes_nm must have the same n_frames")
 
     out = np.empty_like(x)
     out[0] = x[0]
-    for t in range(1, x.shape[0]):
-        bt = b[t].reshape(1, 3)
-        d = x[t] - x[t - 1]
-        d = d - np.rint(d / bt) * bt
-        out[t] = out[t - 1] + d
+    if int(x.shape[0]) == 1:
+        return out
+
+    d = x[1:] - x[:-1]
+    bt = b[1:, None, :]
+    d = d - np.rint(d / bt) * bt
+    out[1:] = x[0] + np.cumsum(d, axis=0)
     return out
 
 
-def _autocorr_fft_1d(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float64).reshape(-1)
-    n = int(x.size)
-    if n < 1:
-        raise ValueError("empty series")
-    m = 1 << (2 * n - 1).bit_length()
-    f = np.fft.rfft(x, n=m)
-    ac = np.fft.irfft(f * np.conjugate(f), n=m)[:n]
+def _autocorr_fft_multi_1d(x: np.ndarray, n_fft: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    f = np.fft.rfft(x, n=int(n_fft), axis=0)
+    ac = np.fft.irfft(f * np.conjugate(f), n=int(n_fft), axis=0)
     return np.asarray(ac, dtype=np.float64)
 
 
-def _msd_one_chain_fft(r_nm: np.ndarray) -> np.ndarray:
+def _msd_block_fft(r_nm: np.ndarray) -> np.ndarray:
     r = np.asarray(r_nm, dtype=np.float64)
-    if r.ndim != 2 or r.shape[1] != 3:
-        raise ValueError("r_nm must have shape (n_frames, 3)")
+    if r.ndim != 3 or r.shape[2] != 3:
+        raise ValueError("r_nm must have shape (n_frames, n_chains, 3)")
+
     n = int(r.shape[0])
     if n < 2:
-        raise ValueError("need >=2 frames")
+        raise ValueError("need >=2 frames to compute MSD")
 
-    r2 = np.einsum("ij,ij->i", r, r)
-    ac = _autocorr_fft_1d(r[:, 0]) + _autocorr_fft_1d(r[:, 1]) + _autocorr_fft_1d(r[:, 2])
+    n_fft = 1 << int((2 * n - 1).bit_length())
 
-    c = np.cumsum(r2)
-    tot = float(c[-1])
+    ac = np.zeros((n, int(r.shape[1])), dtype=np.float64)
+    for d in range(3):
+        ac_d = _autocorr_fft_multi_1d(r[:, :, d], n_fft)[:n]
+        ac += ac_d
 
-    msd = np.empty((n,), dtype=np.float64)
-    msd[0] = 0.0
-    for k in range(1, n):
-        denom = float(n - k)
-        s0 = float(c[n - k - 1])
-        s1 = float(tot - c[k - 1])
-        dot = float(ac[k])
-        msd[k] = (s0 + s1 - 2.0 * dot) / denom
-    return msd
+    r2 = np.sum(r * r, axis=2)  # (n, n_ch)
+    c = np.cumsum(r2, axis=0)
+    c0 = np.vstack([np.zeros((1, int(r2.shape[1])), dtype=np.float64), c])
+
+    k = np.arange(n, dtype=np.int64)
+    s0 = c0[n - k]  # sum |r(t)|^2 over t=0..n-k-1
+    s1 = c0[n] - c0[k]  # sum |r(t+k)|^2 over t=0..n-k-1
+    denom = (n - k).astype(np.float64).reshape(n, 1)
+
+    msd = (s0 + s1 - 2.0 * ac) / denom
+    msd[0, :] = 0.0
+    return msd.T  # (n_ch, n_lags)
 
 
-def _centers_unwrapped_from_frame(
+def _msd_fft_all(
+    r_nm: np.ndarray,
+    *,
+    n_jobs: int,
+    block_chains: int,
+) -> np.ndarray:
+    r = np.asarray(r_nm, dtype=np.float64)
+    if r.ndim != 3 or r.shape[2] != 3:
+        raise ValueError("r_nm must have shape (n_frames, n_chains, 3)")
+    if int(block_chains) <= 0:
+        raise ValueError("block_chains must be >= 1")
+
+    n_frames = int(r.shape[0])
+    n_ch = int(r.shape[1])
+    out = np.empty((n_ch, n_frames), dtype=np.float64)
+
+    blocks = [(i, min(i + int(block_chains), n_ch)) for i in range(0, n_ch, block_chains)]
+    if n_jobs <= 1 or len(blocks) == 1:
+        for s, e in blocks:
+            out[s:e] = _msd_block_fft(r[:, s:e, :])
+        return out
+
+    n_workers = min(int(n_jobs), len(blocks))
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(_msd_block_fft, r[:, s:e, :]): (s, e) for s, e in blocks}
+        for fut in as_completed(futs):
+            s, e = futs[fut]
+            out[s:e] = fut.result()
+
+    return out
+
+
+def _centers_wrapped_nm(
     xyz_nm: np.ndarray,
     groups: Sequence[np.ndarray],
-    ref_sel: np.ndarray,
-    ref_wr_prev: np.ndarray,
-    ref_un_prev: np.ndarray,
-    box_nm: np.ndarray,
     *,
+    idx2: Optional[np.ndarray],
     masses: Optional[np.ndarray],
     center: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    b = np.asarray(box_nm, dtype=np.float64).reshape(3)
+) -> np.ndarray:
     xyz = np.asarray(xyz_nm, dtype=np.float64)
-
-    ref_wr = xyz[ref_sel, :]
-    d = ref_wr - ref_wr_prev
-    d -= np.rint(d / b.reshape(1, 3)) * b.reshape(1, 3)
-    ref_un = ref_un_prev + d
-
-    cen_mode = str(center).strip().lower()
-    if cen_mode not in {"cog", "com"}:
+    c = str(center).strip().lower()
+    if c not in {"cog", "com"}:
         raise ValueError("center must be 'cog' or 'com'")
 
-    centers = np.empty((len(groups), 3), dtype=np.float64)
+    if idx2 is not None:
+        x = xyz[idx2, :]  # (n_ch, n_beads, 3)
+        if c == "cog" or masses is None:
+            return np.mean(x, axis=1)
 
-    for gi, idx in enumerate(groups):
-        idx_i = np.asarray(idx, dtype=np.int64)
-        g_wr = xyz[idx_i, :]
+        w = np.asarray(masses, dtype=np.float64)[idx2]  # (n_ch, n_beads)
+        wsum = np.sum(w, axis=1)
+        out = np.empty((int(idx2.shape[0]), 3), dtype=np.float64)
+        ok = wsum > 0.0
+        if np.any(ok):
+            out[ok] = np.sum(x[ok] * w[ok, :, None], axis=1) / wsum[ok, None]
+        if np.any(~ok):
+            out[~ok] = np.mean(x[~ok], axis=1)
+        return out
 
-        # unwrap group atoms relative to the *wrapped* ref, then place in ref_un image
-        delta = g_wr - ref_wr[gi : gi + 1, :]
-        delta -= np.rint(delta / b.reshape(1, 3)) * b.reshape(1, 3)
-        g_un = ref_un[gi : gi + 1, :] + delta
+    out = np.empty((len(groups), 3), dtype=np.float64)
+    if c == "cog" or masses is None:
+        for i, idx in enumerate(groups):
+            out[i] = np.mean(xyz[np.asarray(idx, dtype=np.int64), :], axis=0)
+        return out
 
-        if cen_mode == "cog" or masses is None:
-            centers[gi] = np.mean(g_un, axis=0)
+    m = np.asarray(masses, dtype=np.float64)
+    for i, idx in enumerate(groups):
+        ii = np.asarray(idx, dtype=np.int64)
+        sel = xyz[ii, :]
+        w = m[ii]
+        tot = float(np.sum(w))
+        if tot <= 0.0:
+            out[i] = np.mean(sel, axis=0)
         else:
-            w = np.asarray(masses[idx_i], dtype=np.float64)
-            tot = float(np.sum(w))
-            if tot <= 0.0:
-                centers[gi] = np.mean(g_un, axis=0)
-            else:
-                centers[gi] = np.sum(g_un * w[:, None], axis=0) / tot
+            out[i] = np.sum(sel * w[:, None], axis=0) / tot
+    return out
 
-    return centers, ref_wr, ref_un
+
+def _centers_wrapped_pbc_nm(
+    xyz_nm: np.ndarray,
+    groups: Sequence[np.ndarray],
+    *,
+    idx2: Optional[np.ndarray],
+    masses: Optional[np.ndarray],
+    center: str,
+    box_nm: np.ndarray,
+) -> np.ndarray:
+    xyz = np.asarray(xyz_nm, dtype=np.float64)
+    b = np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    c = str(center).strip().lower()
+    if c not in {"cog", "com"}:
+        raise ValueError("center must be 'cog' or 'com'")
+
+    if idx2 is not None:
+        x = xyz[idx2, :]  # (n_ch, n_beads, 3)
+
+        ref = x[:, 0:1, :]
+        d = x - ref
+        d -= np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
+        x = ref + d
+
+        if c == "cog" or masses is None:
+            cen = np.mean(x, axis=1)
+        else:
+            w = np.asarray(masses, dtype=np.float64)[idx2]
+            wsum = np.sum(w, axis=1)
+            out = np.empty((int(idx2.shape[0]), 3), dtype=np.float64)
+
+            ok = wsum > 0.0
+            if np.any(ok):
+                out[ok] = np.sum(x[ok] * w[ok, :, None], axis=1) / wsum[ok, None]
+            if np.any(~ok):
+                out[~ok] = np.mean(x[~ok], axis=1)
+
+            cen = out
+
+        cen -= np.floor(cen / b.reshape(1, 3)) * b.reshape(1, 3)
+        return cen
+
+    # fallback: uses existing per-group loop implementation
+    return group_centers_nm(
+        xyz,
+        groups,
+        masses=masses,
+        box_nm=b,
+        center=c,
+        unwrap=True,
+        wrap=True,
+    )
 
 
 def msd_from_dcd(
@@ -1664,8 +1756,28 @@ def msd_from_dcd(
     chunk: int = 500,
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
+    n_jobs: int = 0,
+    block_chains: int = 16,
+    unwrap_within_frame: bool = False,
 ) -> MSDResult:
-    if dt_ns <= 0.0:
+    """
+    Fast MSD for systems where each chain is wrapped as a whole.
+
+    Algorithm
+    ---------
+    1) Compute wrapped chain centers (COG/COM) or a per-chain residue coordinate.
+    2) Time-unwrap the (n_frames, n_chains, 3) series with minimum-image deltas.
+       This lets coordinates "explode" across PBC.
+    3) Compute per-chain MSD via FFT autocorrelation, in chain blocks and optionally
+       in parallel threads.
+
+    Notes
+    -----
+    - Orthorhombic boxes only (DCD unit-cell lengths).
+    - If you pass multiple DCDs, frames are concatenated and unwrapped continuously.
+      If your DCDs are independent replicates, call this per-file instead.
+    """
+    if float(dt_ns) <= 0.0:
         raise ValueError("dt_ns must be > 0")
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -1687,12 +1799,18 @@ def msd_from_dcd(
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
+    masses_sel = None
+    groups_sel: list[np.ndarray] = []
+    idx2: Optional[np.ndarray] = None
+    atom_indices_full: list[int] = []
+    center = "cog"
+
     if m in {"com", "cog"}:
+        center = "com" if m == "com" else "cog"
         groups_full = solute_groups(tmpl, group_spec="protein")
         if not groups_full:
             raise ValueError("solute_groups returned no groups")
-        masses = atom_masses(tmpl) if m == "com" else None
-        center = "com" if m == "com" else "cog"
+
         atom_set: set[int] = set()
         for g in groups_full:
             atom_set.update(int(i) for i in g.tolist())
@@ -1702,21 +1820,25 @@ def msd_from_dcd(
         groups_sel = [
             np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64) for g in groups_full
         ]
-        ref_sel = np.asarray([int(g[0]) for g in groups_sel], dtype=np.int64)
-        ref_wr_prev: Optional[np.ndarray] = None
-        ref_un_prev: Optional[np.ndarray] = None
-    else:
-        keys, idx_full = _site_atom_indices_by_chain(
-            tmpl, resnum=int(resnum), atom_name=str(atom_name)
-        )
-        if int(idx_full.size) < 2:
-            raise ValueError("need >=2 chains with requested residue/atom present")
-        groups_sel = [np.asarray([i], dtype=np.int64) for i in range(int(idx_full.size))]
-        atom_indices_full = [int(i) for i in idx_full.tolist()]
-        masses = None
-        center = "cog"
+        idx2 = _groups_to_rect_index(groups_sel)
 
-    n_ch = int(len(groups_sel))
+        if m == "com":
+            masses_all = atom_masses(tmpl)
+            masses_sel = np.asarray(masses_all[atom_indices_full], dtype=np.float64)
+
+    else:
+        _, idx_full = _site_atom_indices_by_chain(
+            tmpl,
+            resnum=int(resnum),
+            atom_name=str(atom_name),
+        )
+        if int(idx_full.size) < 1:
+            raise ValueError("no chains with requested residue/atom present")
+        atom_indices_full = [int(i) for i in idx_full.tolist()]
+
+    n_ch = int(len(groups_sel)) if m in {"com", "cog"} else int(len(atom_indices_full))
+    if n_ch < 1:
+        raise ValueError("need >=1 chain for MSD")
     box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
 
     centers_wr: list[np.ndarray] = []
@@ -1747,52 +1869,57 @@ def msd_from_dcd(
             xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
 
             if m in {"com", "cog"}:
-                if ref_wr_prev is None:
-                    ref_wr_prev = np.asarray(xyz[ref_sel, :], dtype=np.float64)
-                    ref_un_prev = ref_wr_prev.copy()
+                if unwrap_within_frame:
+                    cen = _centers_wrapped_pbc_nm(
+                        xyz,
+                        groups_sel,
+                        idx2=idx2,
+                        masses=masses_sel,
+                        center=center,
+                        box_nm=b,
+                    )
+                else:
+                    cen = _centers_wrapped_nm(
+                        xyz,
+                        groups_sel,
+                        idx2=idx2,
+                        masses=masses_sel,
+                        center=center,
+                    )
 
-                centers_un, ref_wr_prev, ref_un_prev = _centers_unwrapped_from_frame(
-                    xyz,
-                    groups_sel,
-                    ref_sel,
-                    ref_wr_prev,
-                    ref_un_prev,
-                    np.asarray(b, dtype=np.float64),
-                    masses=masses,
-                    center=center,
-                )
-                if centers_un.shape != (n_ch, 3):
+                if cen.shape != (n_ch, 3):
                     raise ValueError("unexpected centers shape")
-                centers_wr.append(np.asarray(centers_un, dtype=np.float64))
-
+                centers_wr.append(cen)
             else:
-                # residue mode: xyz contains one selected atom per chain (because atom_indices_full
-                # is the per-chain residue atom index list). groups_sel is [[0],[1],...].
                 if xyz.shape != (n_ch, 3):
                     raise ValueError("unexpected residue coords shape")
-                centers_wr.append(np.asarray(xyz, dtype=np.float64))
-                boxes.append(np.asarray(b, dtype=np.float64))
+                centers_wr.append(xyz)
+
+            boxes.append(np.asarray(b, dtype=np.float64))
 
     if not centers_wr:
         raise ValueError("no frames selected")
 
     x_wr = np.stack(centers_wr, axis=0)  # (n_frames, n_ch, 3)
-
-    if m in {"com", "cog"}:
-        x_un = x_wr  # already unwrapped in time
-    else:
-        b_all = np.stack(boxes, axis=0)  # (n_frames, 3)
-        x_un = _unwrap_time_series_nm(x_wr, b_all)
+    b_all = np.stack(boxes, axis=0)  # (n_frames, 3)
+    x_un = _unwrap_time_series_nm(x_wr, b_all)
 
     n_frames = int(x_un.shape[0])
     t_ns = np.arange(n_frames, dtype=np.float64) * float(dt_ns)
 
-    msd_ch = np.empty((n_ch, n_frames), dtype=np.float64)
-    for a in range(n_ch):
-        msd_ch[a] = _msd_one_chain_fft(x_un[:, a, :])
+    n_jobs_i = int(n_jobs)
+    if n_jobs_i <= 0:
+        n_jobs_use = os.cpu_count() or 1
+    else:
+        n_jobs_use = n_jobs_i
 
+    msd_ch = _msd_fft_all(x_un, n_jobs=n_jobs_use, block_chains=int(block_chains))
     msd = np.mean(msd_ch, axis=0)
-    msd_stderr = np.std(msd_ch, axis=0, ddof=1) / math.sqrt(float(n_ch))
+
+    if n_ch < 2:
+        msd_stderr = np.zeros_like(msd, dtype=np.float64)
+    else:
+        msd_stderr = np.std(msd_ch, axis=0, ddof=1) / math.sqrt(float(n_ch))
 
     return MSDResult(
         t_ns=t_ns,
