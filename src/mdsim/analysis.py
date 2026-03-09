@@ -969,7 +969,7 @@ def _rdf_single_dcd(
                 )
             b = box_fallback
         else:
-            b = np.asarray(box_frame_nm, dtype=np.float64).reshape(3)
+            b = _box_lengths_nm(box_frame_nm)
 
         if np.any(b <= 0.0):
             raise ValueError("box lengths must be positive")
@@ -1012,7 +1012,7 @@ def rdf_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
     *,
-    selection: Union[str, Sequence[Sequence[int]]] = "protein",
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
     center: str = "cog",
     unwrap: bool = True,
     dr_nm: float = 0.01,
@@ -1047,12 +1047,7 @@ def rdf_from_dcd(
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
-    if isinstance(selection, str):
-        groups_global = StructureSelector(selection).atom_lists(tmpl)
-    else:
-        groups_global = [[int(i) for i in g] for g in selection]
-
-    groups_global = [g for g in groups_global if g]
+    groups_global = _selection_to_groups(tmpl, selection)
     if len(groups_global) < 2:
         raise ValueError("selection must yield >=2 non-empty groups")
 
@@ -1285,12 +1280,14 @@ def site_rdf_from_dcd(
     box_nm: Optional[Sequence[float]] = None,
 ) -> SiteRDFResult:
     """
-    Site-site RDF between residue `res_i` (reference) and `res_j` (counted) across chains.
+    Site-site RDF between residue `res_i` (reference) and `res_j` (counted)
+    across chains.
 
-    Replicates for SEM:
-      - intra: each chain contributes one distance per frame
-      - inter: each *reference chain* contributes distances to all other chains per frame
-      - both: concatenation (intra + inter); replicates are per reference chain
+    Replicates for SEM
+    ------------------
+    - intra: each chain contributes one distance per frame
+    - inter: each reference chain contributes distances to all other chains
+    - both: intra + inter combined for each reference chain
     """
     dcd_list = _as_file_list(dcd_files)
     if not dcd_list:
@@ -1306,26 +1303,31 @@ def site_rdf_from_dcd(
     if m not in {"intra", "inter", "both"}:
         raise ValueError("mode must be 'intra', 'inter', or 'both'")
 
+    norm = str(normalization).strip().lower()
+    if norm not in {"gr", "prob", "number_density"}:
+        raise ValueError("normalization must be 'gr', 'prob', or 'number_density'")
+
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
     keys_i, idx_i_full = _site_atom_indices_by_chain(
-        tmpl, resnum=int(res_i), atom_name=str(atom_name)
+        tmpl,
+        resnum=int(res_i),
+        atom_name=str(atom_name),
     )
     keys_j, idx_j_full = _site_atom_indices_by_chain(
-        tmpl, resnum=int(res_j), atom_name=str(atom_name)
+        tmpl,
+        resnum=int(res_j),
+        atom_name=str(atom_name),
     )
     map_j = {k: int(v) for k, v in zip(keys_j, idx_j_full.tolist())}
 
-    # Align chains present in both.
-    keep_keys: list[str] = []
     ii: list[int] = []
     jj: list[int] = []
     for k, vi in zip(keys_i, idx_i_full.tolist()):
         vj = map_j.get(k)
         if vj is None:
             continue
-        keep_keys.append(k)
         ii.append(int(vi))
         jj.append(int(vj))
 
@@ -1336,13 +1338,11 @@ def site_rdf_from_dcd(
     idx_j_full = np.asarray(jj, dtype=np.int64)
     n_ch = int(idx_i_full.size)
 
-    # Union atom indices for DCD selection.
     atom_indices_full = sorted(set(idx_i_full.tolist() + idx_j_full.tolist()))
     idx_map = {old: new for new, old in enumerate(atom_indices_full)}
     idx_i = np.asarray([idx_map[int(x)] for x in idx_i_full.tolist()], dtype=np.int64)
     idx_j = np.asarray([idx_map[int(x)] for x in idx_j_full.tolist()], dtype=np.int64)
 
-    # r_max default: half min box edge (needs box)
     if r_max_nm is None:
         half = []
         for dcd in dcd_list:
@@ -1369,17 +1369,15 @@ def site_rdf_from_dcd(
     r_edges[-1] = r_max
     r_nm = 0.5 * (r_edges[:-1] + r_edges[1:])
 
-    # Per-replicate histograms (replicate = reference chain).
     n_bins = int(r_edges.size - 1)
     h_rep = np.zeros((n_ch, n_bins), dtype=np.float64)
     h_sum = np.zeros((n_bins,), dtype=np.float64)
 
     n_frames = 0
     n_pairs_per_frame = 0
+    vol_sum = 0.0
 
     box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
-
-    # Precompute mask for inter pairs in an (n_ch, n_ch) matrix.
     eye = np.eye(n_ch, dtype=bool)
     not_diag = ~eye
 
@@ -1403,60 +1401,57 @@ def site_rdf_from_dcd(
                     raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
                 b = box_fallback
             else:
-                b = np.asarray(box_frame_nm, dtype=np.float64).reshape(3)
+                b = _box_lengths_nm(box_frame_nm)
 
-            if np.any(b <= 0.0):
-                raise ValueError("box lengths must be positive")
             vol = float(b[0] * b[1] * b[2])
             if vol <= 0.0:
                 raise ValueError("non-positive box volume")
+            vol_sum += vol
 
             xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
             pos_i = xyz[idx_i, :]  # (n_ch, 3)
             pos_j = xyz[idx_j, :]  # (n_ch, 3)
 
-            # Build distance sets by mode.
-            dists_by_ref: list[np.ndarray] = []
-
-            if m in {"intra", "both"}:
+            if m == "intra":
                 d = pos_j - pos_i
                 d = _min_image_disp_nm(d, b)
-                r = np.linalg.norm(d, axis=1)  # (n_ch,)
-                dists_by_ref.append(r[:, None])  # per ref chain: 1 target
+                rij = np.linalg.norm(d, axis=1)  # (n_ch,)
 
-            if m in {"inter", "both"}:
+                n_pairs_per_frame = n_ch
+                for a in range(n_ch):
+                    ha, _ = np.histogram(rij[a : a + 1], bins=r_edges)
+                    h_rep[a] += ha
+                    h_sum += ha
+
+            elif m == "inter":
                 d = pos_j[None, :, :] - pos_i[:, None, :]  # (n_ch, n_ch, 3)
                 d = d - np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
                 rij = np.linalg.norm(d, axis=2)  # (n_ch, n_ch)
-                # per ref chain: all targets except itself
-                for a in range(n_ch):
-                    dists_by_ref.append(rij[a, not_diag[a]][None, :])
 
-            # Assemble per-reference-chain histograms.
-            # For "intra": one replicate block per chain.
-            # For "inter": replicate is reference chain; counts per ref include (n_ch-1) pairs.
-            # For "both": combine intra+inter counts into the same replicate id (ref chain).
-            if m == "intra":
-                n_pairs_per_frame = n_ch
-                for a in range(n_ch):
-                    ra = dists_by_ref[0][a, :]
-                    ha, _ = np.histogram(ra, bins=r_edges)
-                    h_rep[a] += ha
-                    h_sum += ha
-            elif m == "inter":
                 n_pairs_per_frame = n_ch * (n_ch - 1)
-                # dists_by_ref has n_ch entries, each shape (1, n_ch-1)
                 for a in range(n_ch):
-                    ra = dists_by_ref[a][0]
+                    ra = rij[a, not_diag[a]]
                     ha, _ = np.histogram(ra, bins=r_edges)
                     h_rep[a] += ha
                     h_sum += ha
-            else:
-                # both: build per-ref as intra + inter(a)
+
+            else:  # both
+                d_intra = pos_j - pos_i
+                d_intra = _min_image_disp_nm(d_intra, b)
+                r_intra = np.linalg.norm(d_intra, axis=1)  # (n_ch,)
+
+                d_inter = pos_j[None, :, :] - pos_i[:, None, :]  # (n_ch, n_ch, 3)
+                d_inter = d_inter - np.rint(d_inter / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
+                r_inter = np.linalg.norm(d_inter, axis=2)  # (n_ch, n_ch)
+
                 n_pairs_per_frame = n_ch * n_ch
-                intra = dists_by_ref[0].reshape(n_ch)  # (n_ch,)
                 for a in range(n_ch):
-                    ra = np.concatenate([np.asarray([intra[a]]), dists_by_ref[1 + a][0]])
+                    ra = np.concatenate(
+                        [
+                            np.asarray([r_intra[a]], dtype=np.float64),
+                            r_inter[a, not_diag[a]],
+                        ]
+                    )
                     ha, _ = np.histogram(ra, bins=r_edges)
                     h_rep[a] += ha
                     h_sum += ha
@@ -1466,10 +1461,7 @@ def site_rdf_from_dcd(
     if n_frames <= 0:
         raise ValueError("no frames selected")
 
-    # Per-reference normalization.
-    # Each chain has one reference site (res_i), so number of references is n_ch.
     n_ref = n_ch
-
     if m == "intra":
         n_targets_per_ref = 1
     elif m == "inter":
@@ -1477,8 +1469,11 @@ def site_rdf_from_dcd(
     else:
         n_targets_per_ref = n_ch
 
-    b_use = _box_lengths_nm(box_nm) if box_nm is not None else b  # type: ignore[name-defined]
-    vol_use = float(b_use[0] * b_use[1] * b_use[2])
+    if box_nm is not None:
+        b_use = _box_lengths_nm(box_nm)
+        vol_use = float(b_use[0] * b_use[1] * b_use[2])
+    else:
+        vol_use = float(vol_sum) / float(n_frames)
 
     y = _rdf_norm_from_counts(
         h_sum,
@@ -1487,7 +1482,7 @@ def site_rdf_from_dcd(
         n_ref=n_ref,
         vol_nm3=vol_use,
         n_targets_per_ref=n_targets_per_ref,
-        normalization=normalization,
+        normalization=norm,
     )
 
     y_rep = np.empty_like(h_rep, dtype=np.float64)
@@ -1496,13 +1491,16 @@ def site_rdf_from_dcd(
             h_rep[a],
             r_edges_nm=r_edges,
             n_frames=n_frames,
-            n_ref=1,  # each replicate is one reference chain
+            n_ref=1,
             vol_nm3=vol_use,
             n_targets_per_ref=n_targets_per_ref,
-            normalization=normalization,
+            normalization=norm,
         )
 
-    y_err = np.std(y_rep, axis=0, ddof=1) / math.sqrt(float(n_ch))
+    if n_ch < 2:
+        y_err = np.zeros_like(y)
+    else:
+        y_err = np.std(y_rep, axis=0, ddof=1) / math.sqrt(float(n_ch))
 
     return SiteRDFResult(
         r_nm=r_nm,
@@ -1512,7 +1510,7 @@ def site_rdf_from_dcd(
         n_frames=int(n_frames),
         n_pairs_per_frame=int(n_pairs_per_frame),
         mode=m,
-        normalization=str(normalization).strip().lower(),
+        normalization=norm,
         res_i=int(res_i),
         res_j=int(res_j),
         atom_name=str(atom_name).strip().upper(),
@@ -2021,24 +2019,18 @@ class RgResult:
     mode: str  # "cog" or "com"
 
 
-def _chain_groups_from_template(tmpl: Any) -> list[np.ndarray]:
-    model = tmpl.model if hasattr(tmpl, "model") else tmpl
-    atom_to_idx = {id(a): i for i, a in enumerate(model.atoms)}
+def _selection_to_groups(
+    tmpl: Any,
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]],
+) -> list[np.ndarray]:
+    if isinstance(selection, str):
+        groups_raw = StructureSelector(selection).atom_lists(tmpl)
+    elif selection and all(isinstance(x, str) for x in selection):
+        groups_raw = StructureSelector(selection).atom_lists(tmpl)
+    else:
+        groups_raw = [[int(i) for i in g] for g in selection]
 
-    out: list[np.ndarray] = []
-    for _, ch in model.chain.items():
-        idx: list[int] = []
-        for r in ch.residues:
-            for a in r.atoms:
-                ai = atom_to_idx.get(id(a))
-                if ai is not None:
-                    idx.append(int(ai))
-        if idx:
-            out.append(np.asarray(idx, dtype=np.int64))
-
-    if not out:
-        raise ValueError("no chains found in template")
-    return out
+    return [np.asarray(g, dtype=np.int64) for g in groups_raw if len(g) > 0]
 
 
 def _groups_to_rect_index(groups_sel: Sequence[np.ndarray]) -> Optional[np.ndarray]:
@@ -2110,14 +2102,8 @@ def rg_from_dcd(
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
-    if isinstance(selection, str):
-        groups_full_raw = StructureSelector(selection).atom_lists(tmpl)
-    elif selection and all(isinstance(x, str) for x in selection):
-        groups_full_raw = StructureSelector(selection).atom_lists(tmpl)
-    else:
-        groups_full_raw = [[int(i) for i in g] for g in selection]
+    groups_full = _selection_to_groups(tmpl, selection)
 
-    groups_full = [np.asarray(g, dtype=np.int64) for g in groups_full_raw if len(g) > 0]
     if not groups_full:
         raise ValueError("selection produced no groups")
 
@@ -2161,7 +2147,7 @@ def rg_from_dcd(
             if box_frame_nm is None:
                 if box_fallback is None:
                     raise ValueError("DCD lacks box; pass box_nm=(Lx,Ly,Lz) in nm")
-                b = np.asarray(box_fallback, dtype=np.float64).reshape(3)
+                b = box_fallback
             else:
                 b = _box_lengths_nm(box_frame_nm)
 
@@ -2256,188 +2242,3 @@ def rg_from_dcd(
         n_frames=int(rg_pf.shape[1]),
         mode=m,
     )
-
-
-@dataclass(frozen=True)
-class ChainContactResult:
-    contacts_per_chain: np.ndarray  # (n_query_chains, n_frames)
-    contacts_mean: np.ndarray  # (n_frames,)
-    contacts_stderr: np.ndarray  # (n_frames,)
-    n_query_chains: int
-    n_partner_chains: int
-    n_frames: int
-    cutoff_nm: float
-
-
-def contacts_from_dcd(
-    pdb_file: FileLike,
-    dcd_files: Union[FileLike, Sequence[FileLike]],
-    *,
-    query_selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein.CA",
-    partner_selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein.CA",
-    cutoff_nm: float = 0.8,
-    box_nm: Optional[Sequence[float]] = None,
-    stride: int = 1,
-    chunk: int = 200,
-    frame_start: int = 0,
-    frame_stop: Optional[int] = None,
-) -> ChainContactResult:
-    """
-    Per-query-chain contact-count time series from wrapped trajectories.
-
-    Parameters
-    ----------
-    query_selection
-        Groups for which contact counts are reported.
-        Examples:
-          - "protein.CA"
-          - ["P001.CA", "P002.CA"]
-    partner_selection
-        Groups against which contacts are counted.
-        Same selection semantics as query_selection.
-    cutoff_nm
-        Atom-atom distance cutoff for a contact.
-    box_nm
-        Optional fallback orthorhombic box lengths in nm if DCD has no box.
-    stride, chunk, frame_start, frame_stop
-        Same semantics as rg_from_dcd.
-
-    Returns
-    -------
-    ChainContactResult
-        contacts_per_chain[i, f] is the number of atom-atom contacts between
-        query group i and all partner groups excluding self-interactions with
-        the same chain/group identity.
-    """
-    if float(cutoff_nm) <= 0.0:
-        raise ValueError("cutoff_nm must be > 0")
-    if int(stride) <= 0:
-        raise ValueError("stride must be >= 1")
-    if int(chunk) <= 0:
-        raise ValueError("chunk must be >= 1")
-    if int(frame_start) < 0:
-        raise ValueError("frame_start must be >= 0")
-
-    dcd_list = _as_file_list(dcd_files)
-    if not dcd_list:
-        raise ValueError("no DCD files provided")
-
-    tmpl = PDBReader().read(pdb_file)
-    tmpl_model = tmpl.model
-
-    query_groups_full = _selection_to_groups(tmpl, query_selection)
-    partner_groups_full = _selection_to_groups(tmpl, partner_selection)
-
-    if not query_groups_full:
-        raise ValueError("query_selection produced no groups")
-    if not partner_groups_full:
-        raise ValueError("partner_selection produced no groups")
-
-    atom_set: set[int] = set()
-    for g in query_groups_full:
-        atom_set.update(int(i) for i in g.tolist())
-    for g in partner_groups_full:
-        atom_set.update(int(i) for i in g.tolist())
-    atom_indices_full = sorted(atom_set)
-
-    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
-
-    query_groups = [
-        np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64) for g in query_groups_full
-    ]
-    partner_groups = [
-        np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64)
-        for g in partner_groups_full
-    ]
-
-    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
-    cutoff2 = float(cutoff_nm) * float(cutoff_nm)
-
-    n_query = len(query_groups)
-    n_partner = len(partner_groups)
-    contact_frames: list[np.ndarray] = []
-
-    for dcd in dcd_list:
-        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
-            iter_dcd(
-                dcd,
-                tmpl_model,
-                chunk=int(chunk),
-                stride=int(stride),
-                atom_indices=atom_indices_full,
-            )
-        ):
-            if fi < int(frame_start):
-                continue
-            if frame_stop is not None and fi >= int(frame_stop):
-                break
-
-            if box_frame_nm is None:
-                if box_fallback is None:
-                    raise ValueError("DCD lacks box; pass box_nm=(Lx,Ly,Lz) in nm")
-                b = np.asarray(box_fallback, dtype=np.float64).reshape(3)
-            else:
-                b = _box_lengths_nm(box_frame_nm)
-
-            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
-            counts = np.zeros(n_query, dtype=np.int64)
-
-            for iq, q_idx in enumerate(query_groups):
-                xq = xyz[q_idx, :]
-                total = 0
-
-                q_key = _group_key(query_groups_full[iq])
-
-                for jp, p_idx in enumerate(partner_groups):
-                    p_key = _group_key(partner_groups_full[jp])
-                    if q_key == p_key:
-                        continue
-
-                    xp = xyz[p_idx, :]
-                    d = xq[:, None, :] - xp[None, :, :]
-                    d -= np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
-                    d2 = np.sum(d * d, axis=2)
-                    total += int(np.count_nonzero(d2 <= cutoff2))
-
-                counts[iq] = total
-
-            contact_frames.append(counts.astype(np.float64))
-
-    if not contact_frames:
-        raise ValueError("no frames selected")
-
-    contacts_pf = np.stack(contact_frames, axis=1)
-    contacts_mean = np.nanmean(contacts_pf, axis=0)
-    if n_query < 2:
-        contacts_stderr = np.zeros_like(contacts_mean)
-    else:
-        contacts_stderr = np.nanstd(contacts_pf, axis=0, ddof=1) / np.sqrt(float(n_query))
-
-    return ChainContactResult(
-        contacts_per_chain=contacts_pf,
-        contacts_mean=contacts_mean,
-        contacts_stderr=contacts_stderr,
-        n_query_chains=n_query,
-        n_partner_chains=n_partner,
-        n_frames=int(contacts_pf.shape[1]),
-        cutoff_nm=float(cutoff_nm),
-    )
-
-
-def _selection_to_groups(
-    tmpl: Any,
-    selection: Union[str, Sequence[str], Sequence[Sequence[int]]],
-) -> list[np.ndarray]:
-    if isinstance(selection, str):
-        groups_raw = StructureSelector(selection).atom_lists(tmpl)
-    elif selection and all(isinstance(x, str) for x in selection):
-        groups_raw = StructureSelector(selection).atom_lists(tmpl)
-    else:
-        groups_raw = [[int(i) for i in g] for g in selection]
-
-    groups = [np.asarray(g, dtype=np.int64) for g in groups_raw if len(g) > 0]
-    return groups
-
-
-def _group_key(g: np.ndarray) -> tuple[int, ...]:
-    return tuple(int(i) for i in np.asarray(g, dtype=np.int64).tolist())

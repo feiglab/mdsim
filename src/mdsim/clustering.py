@@ -10,8 +10,14 @@ from typing import Any, Optional, Union
 
 import numpy as np
 
-from .analysis import _as_file_list, _box_lengths_nm, _fmt_hms, _progress_print
-from .molecule_data import PDBReader, StructureSelector, iter_dcd
+from .analysis import (
+    _as_file_list,
+    _box_lengths_nm,
+    _fmt_hms,
+    _progress_print,
+    _selection_to_groups,
+)
+from .molecule_data import PDBReader, iter_dcd
 
 FileLike = Union[str, Path, io.BytesIO, io.StringIO]
 
@@ -284,7 +290,7 @@ def clusters_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
     *,
-    selection: Union[str, Sequence[Sequence[int]]] = "protein",
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
     heavy_only: bool = True,
     dist_cutoff_nm: float = 0.45,
     contact_threshold: int = 10,
@@ -358,12 +364,8 @@ def clusters_from_dcd(
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
-    # Protein groups (full-atom indices in template)
-    if isinstance(selection, str):
-        groups_full = StructureSelector(selection).atom_lists(tmpl)
-    else:
-        groups_full = [[int(i) for i in g] for g in selection]
-    groups_full = [g for g in groups_full if g]
+    groups_full = _selection_to_groups(tmpl, selection)
+
     if len(groups_full) < 2:
         raise ValueError("selection must yield >=2 non-empty groups")
 
@@ -441,7 +443,7 @@ def clusters_from_dcd(
                     )
                 b = box_fallback
             else:
-                b = np.asarray(box_frame_nm, dtype=np.float64).reshape(3)
+                b = _box_lengths_nm(box_frame_nm)
 
             if np.any(b <= 0.0):
                 raise ValueError("box lengths must be positive")
@@ -551,7 +553,7 @@ def condensates_from_dcd(
     # interaction definition (reuses clustering.py)
     dist_cutoff_nm: float,
     contact_threshold: int = 1,
-    selection: Union[str, Sequence[Sequence[int]]] = "protein",
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
     heavy_only: bool = False,
     # condensate definition
     min_frac: float = 0.1,
@@ -580,10 +582,6 @@ def condensates_from_dcd(
         raise ValueError("contact_threshold must be >= 1")
     if float(min_frac) <= 0.0 or float(min_frac) > 1.0:
         raise ValueError("min_frac must be in (0, 1]")
-
-    from .clustering import (
-        clusters_from_dcd,  # reuse your module :contentReference[oaicite:1]{index=1}
-    )
 
     out = clusters_from_dcd(
         pdb_file=pdb_file,
@@ -645,4 +643,282 @@ def condensates_from_dcd(
         condensates_by_frame=condensates_only,
         min_size=int(min_size_i),
         params=params,
+    )
+
+
+@dataclass(frozen=True)
+class ChainContactResult:
+    contacts_per_chain: np.ndarray  # (n_query, n_frames)
+    contacts_mean: np.ndarray  # (n_frames,)
+    contacts_stderr: np.ndarray  # (n_frames,)
+    n_query_chains: int
+    n_partner_chains: int
+    n_frames: int
+    cutoff_nm: float
+
+
+def _contacts_between_group_sets_one_frame(
+    xyz_nm: np.ndarray,  # (n_atoms, 3) in selected-atom indexing
+    box_nm: np.ndarray,  # (3,)
+    atom_to_query: np.ndarray,  # (n_atoms,) int, -1 if not in query set
+    atom_to_partner: np.ndarray,  # (n_atoms,) int, -1 if not in partner set
+    same_group_pairs: set[tuple[int, int]],
+    *,
+    dist_cutoff_nm: float,
+    cell_size_nm: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Count atom-atom contacts from query groups to partner groups for one frame.
+
+    Returns
+    -------
+    pair_counts : (n_query, n_partner) int64
+        Number of atom pairs within cutoff for each query-partner group pair.
+
+    Notes
+    -----
+    - Self interactions are excluded using same_group_pairs.
+    - Double counting is avoided using the same cell-ordering logic as
+      _contacts_and_clusters_one_frame().
+    """
+    if dist_cutoff_nm <= 0.0:
+        raise ValueError("dist_cutoff_nm must be > 0")
+
+    xyz = _wrap_positions_nm(np.asarray(xyz_nm, dtype=np.float64), box_nm)
+    cs = float(dist_cutoff_nm if cell_size_nm is None else cell_size_nm)
+    ncell, _, bins = _build_cells(xyz, box_nm, cs)
+    nx, ny, nz = [int(v) for v in ncell.tolist()]
+
+    q_valid = atom_to_query >= 0
+    p_valid = atom_to_partner >= 0
+    n_query = int(np.max(atom_to_query[q_valid])) + 1 if np.any(q_valid) else 0
+    n_partner = int(np.max(atom_to_partner[p_valid])) + 1 if np.any(p_valid) else 0
+    out = np.zeros((n_query, n_partner), dtype=np.int64)
+
+    cut2 = float(dist_cutoff_nm * dist_cutoff_nm)
+
+    def flat_cell(ix: int, iy: int, iz: int) -> int:
+        return int(ix * (ny * nz) + iy * nz + iz)
+
+    def add_hits(
+        q_ids_a: np.ndarray,
+        p_ids_b: np.ndarray,
+        hit_mask: np.ndarray,
+    ) -> None:
+        if not np.any(hit_mask):
+            return
+        q_hit = q_ids_a[hit_mask]
+        p_hit = p_ids_b[hit_mask]
+        for qi_val, pj_val in zip(q_hit.tolist(), p_hit.tolist()):
+            qi = int(qi_val)
+            pj = int(pj_val)
+            if qi < 0 or pj < 0:
+                continue
+            if (qi, pj) in same_group_pairs:
+                continue
+            out[qi, pj] += 1
+
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                c0 = flat_cell(ix, iy, iz)
+                atoms0 = bins[c0]
+                if not atoms0:
+                    continue
+
+                a0 = np.asarray(atoms0, dtype=np.int64)
+                x0 = xyz[a0, :]
+                q0 = atom_to_query[a0]
+                p0 = atom_to_partner[a0]
+
+                seen: set[int] = set()
+                for dx, dy, dz in _NEIGHBOR_OFFSETS_27:
+                    jx = (ix + dx) % nx
+                    jy = (iy + dy) % ny
+                    jz = (iz + dz) % nz
+                    c1 = flat_cell(jx, jy, jz)
+                    if c1 in seen:
+                        continue
+                    seen.add(c1)
+
+                    if c1 < c0:
+                        continue
+
+                    atoms1 = bins[c1]
+                    if not atoms1:
+                        continue
+
+                    a1 = np.asarray(atoms1, dtype=np.int64)
+                    x1 = xyz[a1, :]
+                    q1 = atom_to_query[a1]
+                    p1 = atom_to_partner[a1]
+
+                    if c1 == c0:
+                        m = len(a0)
+                        for ii in range(m - 1):
+                            ri = x0[ii : ii + 1, :]
+                            d = x0[ii + 1 :, :] - ri
+                            d = _min_image_disp_nm(d, box_nm)
+                            dist2 = np.einsum("ij,ij->i", d, d)
+                            hit = dist2 <= cut2
+                            if not np.any(hit):
+                                continue
+
+                            # direction: atom ii as query, jj as partner
+                            qi = np.full(m - ii - 1, q0[ii], dtype=np.int64)
+                            add_hits(qi, p0[ii + 1 :], hit)
+
+                            # reverse direction: atom jj as query, ii as partner
+                            qj = q0[ii + 1 :]
+                            pi = np.full(m - ii - 1, p0[ii], dtype=np.int64)
+                            add_hits(qj, pi, hit)
+                        continue
+
+                    for ii in range(len(a0)):
+                        ri = x0[ii : ii + 1, :]
+                        d = x1 - ri
+                        d = _min_image_disp_nm(d, box_nm)
+                        dist2 = np.einsum("ij,ij->i", d, d)
+                        hit = dist2 <= cut2
+                        if not np.any(hit):
+                            continue
+
+                        qi = np.full(len(a1), q0[ii], dtype=np.int64)
+                        add_hits(qi, p1, hit)
+
+                        qj = q1
+                        pi = np.full(len(a1), p0[ii], dtype=np.int64)
+                        add_hits(qj, pi, hit)
+
+    return out
+
+
+def contacts_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    query_selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein.CA",
+    partner_selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein.CA",
+    cutoff_nm: float = 0.8,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> ChainContactResult:
+    if float(cutoff_nm) <= 0.0:
+        raise ValueError("cutoff_nm must be > 0")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    query_groups_full = _selection_to_groups(tmpl, query_selection)
+    partner_groups_full = _selection_to_groups(tmpl, partner_selection)
+
+    if not query_groups_full:
+        raise ValueError("query_selection produced no groups")
+    if not partner_groups_full:
+        raise ValueError("partner_selection produced no groups")
+
+    atom_set: set[int] = set()
+    for g in query_groups_full:
+        atom_set.update(int(i) for i in g.tolist())
+    for g in partner_groups_full:
+        atom_set.update(int(i) for i in g.tolist())
+    atom_indices = sorted(atom_set)
+
+    idx_map = {old: new for new, old in enumerate(atom_indices)}
+
+    query_groups = [
+        np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64) for g in query_groups_full
+    ]
+    partner_groups = [
+        np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64)
+        for g in partner_groups_full
+    ]
+
+    atom_to_query = np.full(len(atom_indices), -1, dtype=np.int64)
+    for qi, g in enumerate(query_groups):
+        atom_to_query[g] = int(qi)
+
+    atom_to_partner = np.full(len(atom_indices), -1, dtype=np.int64)
+    for pj, g in enumerate(partner_groups):
+        atom_to_partner[g] = int(pj)
+
+    same_group_pairs: set[tuple[int, int]] = set()
+    partner_lookup = {
+        tuple(int(i) for i in g.tolist()): j for j, g in enumerate(partner_groups_full)
+    }
+    for qi, g in enumerate(query_groups_full):
+        key = tuple(int(i) for i in g.tolist())
+        pj = partner_lookup.get(key)
+        if pj is not None:
+            same_group_pairs.add((int(qi), int(pj)))
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    frames: list[np.ndarray] = []
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks box; pass box_nm=(Lx,Ly,Lz) in nm")
+                b = box_fallback
+            else:
+                b = _box_lengths_nm(box_frame_nm)
+
+            pair_counts = _contacts_between_group_sets_one_frame(
+                np.asarray(xyz_sel_nm, dtype=np.float64),
+                b,
+                atom_to_query,
+                atom_to_partner,
+                same_group_pairs,
+                dist_cutoff_nm=float(cutoff_nm),
+            )
+            frames.append(np.sum(pair_counts, axis=1).astype(np.float64))
+
+    if not frames:
+        raise ValueError("no frames selected")
+
+    contacts_pf = np.stack(frames, axis=1)
+    contacts_mean = np.nanmean(contacts_pf, axis=0)
+    if contacts_pf.shape[0] < 2:
+        contacts_stderr = np.zeros_like(contacts_mean)
+    else:
+        contacts_stderr = np.nanstd(contacts_pf, axis=0, ddof=1) / math.sqrt(
+            float(contacts_pf.shape[0])
+        )
+
+    return ChainContactResult(
+        contacts_per_chain=contacts_pf,
+        contacts_mean=contacts_mean,
+        contacts_stderr=contacts_stderr,
+        n_query_chains=int(contacts_pf.shape[0]),
+        n_partner_chains=int(len(partner_groups)),
+        n_frames=int(contacts_pf.shape[1]),
+        cutoff_nm=float(cutoff_nm),
     )
