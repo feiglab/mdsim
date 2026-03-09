@@ -2061,7 +2061,8 @@ def rg_from_dcd(
     frame_stop: Optional[int] = None,
 ) -> RgResult:
     """
-    Per-group Rg time series (nm) for wrapped trajectories.
+    Per-group Rg time series (nm) using coordinates exactly as stored
+    in the trajectory.
 
     Group definition
     ----------------
@@ -2076,15 +2077,19 @@ def rg_from_dcd(
       - Sequence[Sequence[int]]:
           Explicit atom-index groups in template atom indexing.
 
-    PBC handling:
-      - Unwrap each group within each frame relative to its first atom (min-image).
-      - Orthorhombic boxes only.
-      - If DCD lacks unit cell lengths, pass box_nm=(Lx,Ly,Lz) in nm.
+    Notes
+    -----
+    - No PBC/min-image unwrapping is applied within a group.
+    - This assumes each selected group is already whole within each frame.
+    - box_nm is accepted for API compatibility but is not used here.
 
-    Performance:
-      - Uses a vectorized fast path when all groups have the same number of atoms.
-      - Falls back to a per-group loop for variable-length groups.
+    Performance
+    -----------
+    - Uses a vectorized fast path when all groups have the same number of atoms.
+    - Falls back to a per-group loop for variable-length groups.
     """
+    _ = box_nm
+
     m = str(mode).strip().lower()
     if m not in {"cog", "com"}:
         raise ValueError("mode must be 'cog' or 'com'")
@@ -2103,7 +2108,6 @@ def rg_from_dcd(
     tmpl_model = tmpl.model
 
     groups_full = _selection_to_groups(tmpl, selection)
-
     if not groups_full:
         raise ValueError("selection produced no groups")
 
@@ -2125,12 +2129,10 @@ def rg_from_dcd(
     if masses_all is not None:
         masses_sel = np.asarray(masses_all[atom_indices_full], dtype=np.float64)
 
-    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
-
     rg_frames: list[np.ndarray] = []
 
     for dcd in dcd_list:
-        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+        for fi, (xyz_sel_nm, _box_frame_nm) in enumerate(
             iter_dcd(
                 dcd,
                 tmpl_model,
@@ -2144,25 +2146,14 @@ def rg_from_dcd(
             if frame_stop is not None and fi >= int(frame_stop):
                 break
 
-            if box_frame_nm is None:
-                if box_fallback is None:
-                    raise ValueError("DCD lacks box; pass box_nm=(Lx,Ly,Lz) in nm")
-                b = box_fallback
-            else:
-                b = _box_lengths_nm(box_frame_nm)
-
             xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
 
             if idx2 is not None:
                 x = xyz[idx2, :]  # (n_groups, n_atoms_per_group, 3)
-                ref = x[:, 0:1, :]
-                d = x - ref
-                d -= np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
-                x_un = ref + d
 
                 if masses_sel is None:
-                    c = np.mean(x_un, axis=1)
-                    d2 = np.sum((x_un - c[:, None, :]) ** 2, axis=2)
+                    c = np.mean(x, axis=1)
+                    d2 = np.sum((x - c[:, None, :]) ** 2, axis=2)
                     rg2 = np.mean(d2, axis=1)
                     rg_ch = np.sqrt(np.maximum(rg2, 0.0))
                 else:
@@ -2174,15 +2165,15 @@ def rg_from_dcd(
                     if np.any(ok):
                         c[ok] = (
                             np.sum(
-                                x_un[ok] * w[ok, :, None],
+                                x[ok] * w[ok, :, None],
                                 axis=1,
                             )
                             / wsum[ok, None]
                         )
                     if np.any(~ok):
-                        c[~ok] = np.mean(x_un[~ok], axis=1)
+                        c[~ok] = np.mean(x[~ok], axis=1)
 
-                    d2 = np.sum((x_un - c[:, None, :]) ** 2, axis=2)
+                    d2 = np.sum((x - c[:, None, :]) ** 2, axis=2)
                     rg2 = np.empty((n_groups,), dtype=np.float64)
                     if np.any(ok):
                         rg2[ok] = np.sum(w[ok] * d2[ok], axis=1) / wsum[ok]
@@ -2198,27 +2189,24 @@ def rg_from_dcd(
                         rg_ch[gi] = np.nan
                         continue
 
-                    ref = xyz[idx[0], :].reshape(1, 3)
-                    d = xyz[idx, :] - ref
-                    d -= np.rint(d / b.reshape(1, 3)) * b.reshape(1, 3)
-                    x_un = ref + d
+                    x = xyz[idx, :]
 
                     if masses_sel is None:
-                        c = np.mean(x_un, axis=0)
-                        d2 = np.sum((x_un - c) ** 2, axis=1)
+                        c = np.mean(x, axis=0)
+                        d2 = np.sum((x - c) ** 2, axis=1)
                         rg2 = float(np.mean(d2))
                         rg_ch[gi] = math.sqrt(max(rg2, 0.0))
                     else:
                         w = masses_sel[idx]
                         tot = float(np.sum(w))
                         if tot <= 0.0:
-                            c = np.mean(x_un, axis=0)
-                            d2 = np.sum((x_un - c) ** 2, axis=1)
+                            c = np.mean(x, axis=0)
+                            d2 = np.sum((x - c) ** 2, axis=1)
                             rg2 = float(np.mean(d2))
                             rg_ch[gi] = math.sqrt(max(rg2, 0.0))
                         else:
-                            c = np.sum(x_un * w[:, None], axis=0) / tot
-                            d2 = np.sum((x_un - c) ** 2, axis=1)
+                            c = np.sum(x * w[:, None], axis=0) / tot
+                            d2 = np.sum((x - c) ** 2, axis=1)
                             rg2 = float(np.sum(w * d2) / tot)
                             rg_ch[gi] = math.sqrt(max(rg2, 0.0))
 
@@ -2227,7 +2215,7 @@ def rg_from_dcd(
     if not rg_frames:
         raise ValueError("no frames selected")
 
-    rg_pf = np.stack(rg_frames, axis=1)  # (n_groups, n_frames)
+    rg_pf = np.stack(rg_frames, axis=1)
     rg_mean = np.nanmean(rg_pf, axis=0)
     if n_groups < 2:
         rg_stderr = np.zeros_like(rg_mean)
