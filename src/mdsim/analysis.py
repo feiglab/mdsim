@@ -2060,6 +2060,7 @@ def rg_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
     *,
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
     mode: str = "cog",  # "cog" | "com"
     box_nm: Optional[Sequence[float]] = None,
     stride: int = 1,
@@ -2068,16 +2069,29 @@ def rg_from_dcd(
     frame_stop: Optional[int] = None,
 ) -> RgResult:
     """
-    Per-chain Rg time series (nm) for wrapped trajectories.
+    Per-group Rg time series (nm) for wrapped trajectories.
+
+    Group definition
+    ----------------
+    selection may be:
+      - str:
+          Passed to StructureSelector. Examples:
+            "protein"     -> one group per chain
+            "protein.CA"  -> one C-alpha group per chain
+      - Sequence[str]:
+          One selector per output group. Examples:
+            ["SEG1.CA", "SEG2.CA"]
+      - Sequence[Sequence[int]]:
+          Explicit atom-index groups in template atom indexing.
 
     PBC handling:
-      - Unwrap each chain within each frame relative to its first bead (min-image).
+      - Unwrap each group within each frame relative to its first atom (min-image).
       - Orthorhombic boxes only.
       - If DCD lacks unit cell lengths, pass box_nm=(Lx,Ly,Lz) in nm.
 
     Performance:
-      - Uses a vectorized fast path when all chains have the same number of beads.
-      - Falls back to a per-chain loop for variable-length chains.
+      - Uses a vectorized fast path when all groups have the same number of atoms.
+      - Falls back to a per-group loop for variable-length groups.
     """
     m = str(mode).strip().lower()
     if m not in {"cog", "com"}:
@@ -2096,9 +2110,18 @@ def rg_from_dcd(
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
-    groups_full = _chain_groups_from_template(tmpl)
-    n_ch = int(len(groups_full))
+    if isinstance(selection, str):
+        groups_full_raw = StructureSelector(selection).atom_lists(tmpl)
+    elif selection and all(isinstance(x, str) for x in selection):
+        groups_full_raw = StructureSelector(selection).atom_lists(tmpl)
+    else:
+        groups_full_raw = [[int(i) for i in g] for g in selection]
 
+    groups_full = [np.asarray(g, dtype=np.int64) for g in groups_full_raw if len(g) > 0]
+    if not groups_full:
+        raise ValueError("selection produced no groups")
+
+    n_groups = int(len(groups_full))
     masses_all = atom_masses(tmpl) if m == "com" else None
 
     atom_set: set[int] = set()
@@ -2145,8 +2168,7 @@ def rg_from_dcd(
             xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
 
             if idx2 is not None:
-                # Fast path: all chains same size
-                x = xyz[idx2, :]  # (n_ch, n_beads, 3)
+                x = xyz[idx2, :]  # (n_groups, n_atoms_per_group, 3)
                 ref = x[:, 0:1, :]
                 d = x - ref
                 d -= np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
@@ -2158,11 +2180,11 @@ def rg_from_dcd(
                     rg2 = np.mean(d2, axis=1)
                     rg_ch = np.sqrt(np.maximum(rg2, 0.0))
                 else:
-                    w = masses_sel[idx2]  # (n_ch, n_beads)
+                    w = masses_sel[idx2]
                     wsum = np.sum(w, axis=1)
                     ok = wsum > 0.0
 
-                    c = np.empty((n_ch, 3), dtype=np.float64)
+                    c = np.empty((n_groups, 3), dtype=np.float64)
                     if np.any(ok):
                         c[ok] = (
                             np.sum(
@@ -2175,7 +2197,7 @@ def rg_from_dcd(
                         c[~ok] = np.mean(x_un[~ok], axis=1)
 
                     d2 = np.sum((x_un - c[:, None, :]) ** 2, axis=2)
-                    rg2 = np.empty((n_ch,), dtype=np.float64)
+                    rg2 = np.empty((n_groups,), dtype=np.float64)
                     if np.any(ok):
                         rg2[ok] = np.sum(w[ok] * d2[ok], axis=1) / wsum[ok]
                     if np.any(~ok):
@@ -2183,12 +2205,11 @@ def rg_from_dcd(
                     rg_ch = np.sqrt(np.maximum(rg2, 0.0))
 
             else:
-                # Fallback: variable chain length
-                rg_ch = np.empty((n_ch,), dtype=np.float64)
-                for ci in range(n_ch):
-                    idx = groups_sel[ci]
+                rg_ch = np.empty((n_groups,), dtype=np.float64)
+                for gi in range(n_groups):
+                    idx = groups_sel[gi]
                     if idx.size == 0:
-                        rg_ch[ci] = np.nan
+                        rg_ch[gi] = np.nan
                         continue
 
                     ref = xyz[idx[0], :].reshape(1, 3)
@@ -2200,7 +2221,7 @@ def rg_from_dcd(
                         c = np.mean(x_un, axis=0)
                         d2 = np.sum((x_un - c) ** 2, axis=1)
                         rg2 = float(np.mean(d2))
-                        rg_ch[ci] = math.sqrt(max(rg2, 0.0))
+                        rg_ch[gi] = math.sqrt(max(rg2, 0.0))
                     else:
                         w = masses_sel[idx]
                         tot = float(np.sum(w))
@@ -2208,27 +2229,215 @@ def rg_from_dcd(
                             c = np.mean(x_un, axis=0)
                             d2 = np.sum((x_un - c) ** 2, axis=1)
                             rg2 = float(np.mean(d2))
-                            rg_ch[ci] = math.sqrt(max(rg2, 0.0))
+                            rg_ch[gi] = math.sqrt(max(rg2, 0.0))
                         else:
                             c = np.sum(x_un * w[:, None], axis=0) / tot
                             d2 = np.sum((x_un - c) ** 2, axis=1)
                             rg2 = float(np.sum(w * d2) / tot)
-                            rg_ch[ci] = math.sqrt(max(rg2, 0.0))
+                            rg_ch[gi] = math.sqrt(max(rg2, 0.0))
 
             rg_frames.append(np.asarray(rg_ch, dtype=np.float64))
 
     if not rg_frames:
         raise ValueError("no frames selected")
 
-    rg_pf = np.stack(rg_frames, axis=1)  # (n_ch, n_frames)
+    rg_pf = np.stack(rg_frames, axis=1)  # (n_groups, n_frames)
     rg_mean = np.nanmean(rg_pf, axis=0)
-    rg_stderr = np.nanstd(rg_pf, axis=0, ddof=1) / math.sqrt(float(n_ch))
+    if n_groups < 2:
+        rg_stderr = np.zeros_like(rg_mean)
+    else:
+        rg_stderr = np.nanstd(rg_pf, axis=0, ddof=1) / math.sqrt(float(n_groups))
 
     return RgResult(
         rg_per_chain_nm=rg_pf,
         rg_mean_nm=rg_mean,
         rg_stderr_nm=rg_stderr,
-        n_chains=n_ch,
+        n_chains=n_groups,
         n_frames=int(rg_pf.shape[1]),
         mode=m,
     )
+
+
+@dataclass(frozen=True)
+class ChainContactResult:
+    contacts_per_chain: np.ndarray  # (n_query_chains, n_frames)
+    contacts_mean: np.ndarray  # (n_frames,)
+    contacts_stderr: np.ndarray  # (n_frames,)
+    n_query_chains: int
+    n_partner_chains: int
+    n_frames: int
+    cutoff_nm: float
+
+
+def contacts_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    query_selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein.CA",
+    partner_selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein.CA",
+    cutoff_nm: float = 0.8,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> ChainContactResult:
+    """
+    Per-query-chain contact-count time series from wrapped trajectories.
+
+    Parameters
+    ----------
+    query_selection
+        Groups for which contact counts are reported.
+        Examples:
+          - "protein.CA"
+          - ["P001.CA", "P002.CA"]
+    partner_selection
+        Groups against which contacts are counted.
+        Same selection semantics as query_selection.
+    cutoff_nm
+        Atom-atom distance cutoff for a contact.
+    box_nm
+        Optional fallback orthorhombic box lengths in nm if DCD has no box.
+    stride, chunk, frame_start, frame_stop
+        Same semantics as rg_from_dcd.
+
+    Returns
+    -------
+    ChainContactResult
+        contacts_per_chain[i, f] is the number of atom-atom contacts between
+        query group i and all partner groups excluding self-interactions with
+        the same chain/group identity.
+    """
+    if float(cutoff_nm) <= 0.0:
+        raise ValueError("cutoff_nm must be > 0")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    query_groups_full = _selection_to_groups(tmpl, query_selection)
+    partner_groups_full = _selection_to_groups(tmpl, partner_selection)
+
+    if not query_groups_full:
+        raise ValueError("query_selection produced no groups")
+    if not partner_groups_full:
+        raise ValueError("partner_selection produced no groups")
+
+    atom_set: set[int] = set()
+    for g in query_groups_full:
+        atom_set.update(int(i) for i in g.tolist())
+    for g in partner_groups_full:
+        atom_set.update(int(i) for i in g.tolist())
+    atom_indices_full = sorted(atom_set)
+
+    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+
+    query_groups = [
+        np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64) for g in query_groups_full
+    ]
+    partner_groups = [
+        np.asarray([idx_map[int(i)] for i in g.tolist()], dtype=np.int64)
+        for g in partner_groups_full
+    ]
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+    cutoff2 = float(cutoff_nm) * float(cutoff_nm)
+
+    n_query = len(query_groups)
+    n_partner = len(partner_groups)
+    contact_frames: list[np.ndarray] = []
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks box; pass box_nm=(Lx,Ly,Lz) in nm")
+                b = np.asarray(box_fallback, dtype=np.float64).reshape(3)
+            else:
+                b = _box_lengths_nm(box_frame_nm)
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            counts = np.zeros(n_query, dtype=np.int64)
+
+            for iq, q_idx in enumerate(query_groups):
+                xq = xyz[q_idx, :]
+                total = 0
+
+                q_key = _group_key(query_groups_full[iq])
+
+                for jp, p_idx in enumerate(partner_groups):
+                    p_key = _group_key(partner_groups_full[jp])
+                    if q_key == p_key:
+                        continue
+
+                    xp = xyz[p_idx, :]
+                    d = xq[:, None, :] - xp[None, :, :]
+                    d -= np.rint(d / b.reshape(1, 1, 3)) * b.reshape(1, 1, 3)
+                    d2 = np.sum(d * d, axis=2)
+                    total += int(np.count_nonzero(d2 <= cutoff2))
+
+                counts[iq] = total
+
+            contact_frames.append(counts.astype(np.float64))
+
+    if not contact_frames:
+        raise ValueError("no frames selected")
+
+    contacts_pf = np.stack(contact_frames, axis=1)
+    contacts_mean = np.nanmean(contacts_pf, axis=0)
+    if n_query < 2:
+        contacts_stderr = np.zeros_like(contacts_mean)
+    else:
+        contacts_stderr = np.nanstd(contacts_pf, axis=0, ddof=1) / np.sqrt(float(n_query))
+
+    return ChainContactResult(
+        contacts_per_chain=contacts_pf,
+        contacts_mean=contacts_mean,
+        contacts_stderr=contacts_stderr,
+        n_query_chains=n_query,
+        n_partner_chains=n_partner,
+        n_frames=int(contacts_pf.shape[1]),
+        cutoff_nm=float(cutoff_nm),
+    )
+
+
+def _selection_to_groups(
+    tmpl: Any,
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]],
+) -> list[np.ndarray]:
+    if isinstance(selection, str):
+        groups_raw = StructureSelector(selection).atom_lists(tmpl)
+    elif selection and all(isinstance(x, str) for x in selection):
+        groups_raw = StructureSelector(selection).atom_lists(tmpl)
+    else:
+        groups_raw = [[int(i) for i in g] for g in selection]
+
+    groups = [np.asarray(g, dtype=np.int64) for g in groups_raw if len(g) > 0]
+    return groups
+
+
+def _group_key(g: np.ndarray) -> tuple[int, ...]:
+    return tuple(int(i) for i in np.asarray(g, dtype=np.int64).tolist())
