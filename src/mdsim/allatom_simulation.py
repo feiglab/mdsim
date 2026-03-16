@@ -1054,6 +1054,7 @@ class MDSim:
         target=0.0,
         k=10.0,
         center="cog",
+        tag="dihedral",
     ):
         """
         Harmonic umbrella on the dihedral angle between four centroids.
@@ -1078,14 +1079,14 @@ class MDSim:
         # Try to find an existing Umbrella_dihedral force
         force = None
         for f in self.system.getForces():
-            if isinstance(f, CustomCentroidBondForce) and f.getName() == "Umbrella_dihedral":
+            if isinstance(f, CustomCentroidBondForce) and f.getName() == f"Umbrella_{tag}":
                 force = f
                 break
 
         if force is None:
             # Create the force the first time
             bias = (
-                "0.5 * uk_dihedral * delta^2; "
+                f"0.5 * uk_{tag} * delta^2; "
                 "delta = delta - 2*pi*floor((delta + pi)/(2*pi));"
                 "pi = acos(-1);"
                 "delta = d - target;"
@@ -1095,10 +1096,10 @@ class MDSim:
             force = CustomCentroidBondForce(4, bias)
             force.addPerBondParameter("target")  # radians
             force.addGlobalParameter(
-                "uk_dihedral",
+                f"uk_{tag}",
                 k * kilojoule / (mole * radian**2),
             )
-            force.setName("Umbrella_dihedral")
+            force.setName(f"Umbrella_{tag}")
             self.system.addForce(force)
 
         # For each call, add new centroid groups + a new bond
@@ -1117,9 +1118,9 @@ class MDSim:
 
         force.addBond([idx_a, idx_b, idx_c, idx_d], [target * radian])
 
-    def update_umbrella_dihedral(self, k=10.0):
+    def update_umbrella_dihedral(self, k=10.0, *, tag="dihedral"):
         if self.system and self.simulation:
-            self.simulation.context.setParameter("uk_dihedral", k * kilojoule / mole / radian**2)
+            self.simulation.context.setParameter(f"uk_{tag}", k * kilojoule / mole / radian**2)
 
     def set_umbrella_angle(
         self,
