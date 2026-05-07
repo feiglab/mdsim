@@ -2230,3 +2230,463 @@ def rg_from_dcd(
         n_frames=int(rg_pf.shape[1]),
         mode=m,
     )
+
+
+# --- binding/contact probability analysis ------------------------------------
+
+
+AVOGADRO = 6.02214076e23
+R_KJ_MOL_K = 0.00831446261815324
+
+
+@dataclass(frozen=True)
+class SpecificContact:
+    """Specific contact between local bead indices in two selected groups."""
+
+    i_local: int
+    j_local: int
+    cutoff_nm: float
+
+
+@dataclass(frozen=True)
+class BindingCriterion:
+    """Binding definition.
+
+    kind:
+      - "cofm": COG/COM distance between groups
+      - "closest": closest bead distance between groups
+      - "specific": specific local bead contacts
+    """
+
+    kind: str
+    cutoff_nm: float = 1.0
+    contacts: tuple[SpecificContact, ...] = ()
+    min_contacts: int = 1
+
+
+@dataclass(frozen=True)
+class BindingAffinityResult:
+    pair_i: np.ndarray
+    pair_j: np.ndarray
+    bound: np.ndarray
+    metric_nm: np.ndarray
+    exclusive_count: np.ndarray
+    box_volume_nm3: np.ndarray
+    criterion: BindingCriterion
+    n_a: int
+    n_b: int
+
+    @property
+    def n_frames(self) -> int:
+        return int(self.bound.shape[0])
+
+    @property
+    def pair_probability(self) -> np.ndarray:
+        return np.mean(self.bound, axis=0)
+
+    @property
+    def any_bound_probability(self) -> float:
+        return float(np.any(self.bound, axis=1).mean())
+
+    @property
+    def mean_bound_pairs(self) -> float:
+        return float(self.bound.sum(axis=1).mean())
+
+    @property
+    def mean_exclusive_complexes(self) -> float:
+        return float(self.exclusive_count.mean())
+
+    def kd_molar(self) -> float:
+        """Estimate Kd for A + B <-> AB from exclusive complex count."""
+
+        n_ab = self.mean_exclusive_complexes
+        if n_ab <= 0.0:
+            return float("inf")
+
+        volume_nm3 = float(np.nanmean(self.box_volume_nm3))
+        if volume_nm3 <= 0.0 or not np.isfinite(volume_nm3):
+            raise ValueError("valid box volume is required for Kd")
+
+        n_a_free = max(float(self.n_a) - n_ab, 0.0)
+        n_b_free = max(float(self.n_b) - n_ab, 0.0)
+        volume_l = volume_nm3 * 1.0e-24
+        return n_a_free * n_b_free / (n_ab * AVOGADRO * volume_l)
+
+    def delta_g_kj_mol(self, temperature_k: float) -> float:
+        kd = self.kd_molar()
+        if kd <= 0.0 or not np.isfinite(kd):
+            return float("inf")
+        return R_KJ_MOL_K * float(temperature_k) * math.log(kd)
+
+
+def binding_affinity_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    group_a: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
+    group_b: Optional[Union[str, Sequence[str], Sequence[Sequence[int]]]] = None,
+    criterion: BindingCriterion = BindingCriterion(kind="closest", cutoff_nm=0.8),
+    center: str = "cog",
+    stride: int = 1,
+    chunk: int = 500,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    box_nm: Optional[Sequence[float]] = None,
+    exclusive: bool = True,
+    unwrap_groups: bool = True,
+) -> BindingAffinityResult:
+    """Estimate binding probability and apparent Kd from DCD contacts.
+
+    Parameters
+    ----------
+    pdb_file
+        Template PDB matching the DCD atom order.
+    dcd_files
+        One DCD or a sequence of DCDs.
+    group_a, group_b
+        Selection strings or explicit atom-index groups. If group_b is None,
+        group_a is self-paired with duplicate/self pairs removed.
+    criterion
+        BindingCriterion("cofm"), BindingCriterion("closest"), or
+        BindingCriterion("specific").
+    center
+        "cog" or "com"; used for cofm only.
+    exclusive
+        If True, greedily counts at most one partner per A and B molecule per frame.
+        Use this for Kd-like estimates.
+    unwrap_groups
+        If True, unwrap atoms within each molecule before center calculations.
+    """
+
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    kind = criterion.kind.strip().lower()
+    if kind not in {"cofm", "closest", "specific"}:
+        raise ValueError("criterion.kind must be 'cofm', 'closest', or 'specific'")
+
+    center_mode = center.strip().lower()
+    if center_mode not in {"cog", "com"}:
+        raise ValueError("center must be 'cog' or 'com'")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    groups_a_full = _selection_to_groups(tmpl, group_a)
+    groups_b_full = groups_a_full if group_b is None else _selection_to_groups(tmpl, group_b)
+
+    if not groups_a_full or not groups_b_full:
+        raise ValueError("group selection produced no groups")
+
+    same_groups = group_b is None
+    pair_i, pair_j = _binding_pairs(len(groups_a_full), len(groups_b_full), same_groups)
+    if pair_i.size == 0:
+        raise ValueError("no molecule pairs to analyze")
+
+    atom_indices_full = _binding_atom_subset(groups_a_full, groups_b_full)
+    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+
+    groups_a = _remap_groups(groups_a_full, idx_map)
+    groups_b = groups_a if same_groups else _remap_groups(groups_b_full, idx_map)
+
+    masses_sel = None
+    if kind == "cofm" and center_mode == "com":
+        masses_all = atom_masses(tmpl_model)
+        masses_sel = np.asarray(masses_all[atom_indices_full], dtype=np.float64)
+
+    bound_rows: list[np.ndarray] = []
+    metric_rows: list[np.ndarray] = []
+    count_rows: list[float] = []
+    volume_rows: list[float] = []
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+                box = box_fallback
+            else:
+                box = _box_lengths_nm(box_frame_nm)
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            bound, metric = _binding_frame(
+                xyz,
+                box,
+                groups_a,
+                groups_b,
+                pair_i,
+                pair_j,
+                criterion,
+                masses=masses_sel,
+                center=center_mode,
+                unwrap_groups=unwrap_groups,
+            )
+
+            if exclusive:
+                n_complex = _binding_exclusive_count(bound, metric, pair_i, pair_j)
+            else:
+                n_complex = float(bound.sum())
+
+            bound_rows.append(bound)
+            metric_rows.append(metric)
+            count_rows.append(n_complex)
+            volume_rows.append(float(box[0] * box[1] * box[2]))
+
+    if not bound_rows:
+        raise ValueError("no frames selected")
+
+    return BindingAffinityResult(
+        pair_i=pair_i,
+        pair_j=pair_j,
+        bound=np.vstack(bound_rows),
+        metric_nm=np.vstack(metric_rows),
+        exclusive_count=np.asarray(count_rows, dtype=np.float64),
+        box_volume_nm3=np.asarray(volume_rows, dtype=np.float64),
+        criterion=criterion,
+        n_a=len(groups_a_full),
+        n_b=len(groups_b_full),
+    )
+
+
+def save_binding_affinity(prefix: FileLike, result: BindingAffinityResult) -> None:
+    """Write pair probabilities and frame time series."""
+
+    p = Path(prefix)
+
+    pair_data = np.column_stack(
+        (
+            result.pair_i,
+            result.pair_j,
+            result.pair_probability,
+            np.nanmean(result.metric_nm, axis=0),
+        )
+    )
+    np.savetxt(
+        p.with_suffix(".pairs.dat"),
+        pair_data,
+        fmt=["%d", "%d", "%.8f", "%.8f"],
+        header="pair_i pair_j p_bound mean_metric_nm",
+    )
+
+    ts_data = np.column_stack(
+        (
+            np.arange(result.n_frames, dtype=np.int64),
+            result.bound.sum(axis=1),
+            result.exclusive_count,
+            np.any(result.bound, axis=1).astype(np.int32),
+        )
+    )
+    np.savetxt(
+        p.with_suffix(".timeseries.dat"),
+        ts_data,
+        fmt=["%d", "%d", "%.8f", "%d"],
+        header="frame bound_pairs exclusive_complexes any_bound",
+    )
+
+
+def _binding_frame(
+    xyz_nm: np.ndarray,
+    box_nm: np.ndarray,
+    groups_a: Sequence[np.ndarray],
+    groups_b: Sequence[np.ndarray],
+    pair_i: np.ndarray,
+    pair_j: np.ndarray,
+    criterion: BindingCriterion,
+    *,
+    masses: Optional[np.ndarray],
+    center: str,
+    unwrap_groups: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    kind = criterion.kind.strip().lower()
+    n_pairs = int(pair_i.size)
+
+    bound = np.zeros(n_pairs, dtype=bool)
+    metric = np.full(n_pairs, np.inf, dtype=np.float64)
+
+    centers_a = None
+    centers_b = None
+    if kind == "cofm":
+        centers_a = group_centers_nm(
+            xyz_nm,
+            groups_a,
+            masses=masses,
+            box_nm=box_nm,
+            center=center,
+            unwrap=unwrap_groups,
+            wrap=True,
+        )
+        centers_b = group_centers_nm(
+            xyz_nm,
+            groups_b,
+            masses=masses,
+            box_nm=box_nm,
+            center=center,
+            unwrap=unwrap_groups,
+            wrap=True,
+        )
+
+    for k, (ia_raw, jb_raw) in enumerate(zip(pair_i, pair_j)):
+        ia = int(ia_raw)
+        jb = int(jb_raw)
+
+        if kind == "cofm":
+            assert centers_a is not None
+            assert centers_b is not None
+            dist = _binding_distance(centers_a[ia], centers_b[jb], box_nm)
+            metric[k] = dist
+            bound[k] = dist <= criterion.cutoff_nm
+
+        elif kind == "closest":
+            dist = _binding_closest_distance(
+                xyz_nm[groups_a[ia]],
+                xyz_nm[groups_b[jb]],
+                box_nm,
+            )
+            metric[k] = dist
+            bound[k] = dist <= criterion.cutoff_nm
+
+        elif kind == "specific":
+            n_contact, score = _binding_specific_contacts(
+                xyz_nm,
+                groups_a[ia],
+                groups_b[jb],
+                box_nm,
+                criterion.contacts,
+            )
+            metric[k] = score
+            bound[k] = n_contact >= int(criterion.min_contacts)
+
+    return bound, metric
+
+
+def _binding_specific_contacts(
+    xyz_nm: np.ndarray,
+    group_a: np.ndarray,
+    group_b: np.ndarray,
+    box_nm: np.ndarray,
+    contacts: Sequence[SpecificContact],
+) -> tuple[int, float]:
+    if not contacts:
+        raise ValueError("specific binding requires at least one contact")
+
+    n_contact = 0
+    score = np.inf
+
+    for contact in contacts:
+        ia = int(group_a[int(contact.i_local)])
+        jb = int(group_b[int(contact.j_local)])
+        cutoff = float(contact.cutoff_nm)
+        dist = _binding_distance(xyz_nm[ia], xyz_nm[jb], box_nm)
+
+        if dist <= cutoff:
+            n_contact += 1
+        score = min(score, dist / cutoff)
+
+    return int(n_contact), float(score)
+
+
+def _binding_closest_distance(
+    xyz_a: np.ndarray,
+    xyz_b: np.ndarray,
+    box_nm: np.ndarray,
+) -> float:
+    d = xyz_a[:, None, :] - xyz_b[None, :, :]
+    d -= np.rint(d / box_nm.reshape(1, 1, 3)) * box_nm.reshape(1, 1, 3)
+    r2 = np.sum(d * d, axis=2)
+    return float(np.sqrt(np.min(r2)))
+
+
+def _binding_distance(a_nm: np.ndarray, b_nm: np.ndarray, box_nm: np.ndarray) -> float:
+    d = np.asarray(a_nm, dtype=np.float64) - np.asarray(b_nm, dtype=np.float64)
+    d -= np.rint(d / box_nm) * box_nm
+    return float(np.sqrt(np.dot(d, d)))
+
+
+def _binding_pairs(
+    n_a: int,
+    n_b: int,
+    same_groups: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    pi: list[int] = []
+    pj: list[int] = []
+
+    for i in range(int(n_a)):
+        for j in range(int(n_b)):
+            if same_groups and j <= i:
+                continue
+            pi.append(i)
+            pj.append(j)
+
+    return np.asarray(pi, dtype=np.int32), np.asarray(pj, dtype=np.int32)
+
+
+def _binding_atom_subset(
+    groups_a: Sequence[np.ndarray],
+    groups_b: Sequence[np.ndarray],
+) -> list[int]:
+    atoms: set[int] = set()
+    for group in groups_a:
+        atoms.update(int(i) for i in group.tolist())
+    for group in groups_b:
+        atoms.update(int(i) for i in group.tolist())
+    return sorted(atoms)
+
+
+def _remap_groups(
+    groups: Sequence[np.ndarray],
+    idx_map: dict[int, int],
+) -> list[np.ndarray]:
+    return [
+        np.asarray([idx_map[int(i)] for i in group.tolist()], dtype=np.int64) for group in groups
+    ]
+
+
+def _binding_exclusive_count(
+    bound: np.ndarray,
+    metric: np.ndarray,
+    pair_i: np.ndarray,
+    pair_j: np.ndarray,
+) -> float:
+    edges = np.flatnonzero(bound)
+    if edges.size == 0:
+        return 0.0
+
+    order = edges[np.argsort(metric[edges])]
+    used_i: set[int] = set()
+    used_j: set[int] = set()
+    count = 0
+
+    for edge_raw in order:
+        edge = int(edge_raw)
+        i = int(pair_i[edge])
+        j = int(pair_j[edge])
+        if i in used_i or j in used_j:
+            continue
+        used_i.add(i)
+        used_j.add(j)
+        count += 1
+
+    return float(count)
