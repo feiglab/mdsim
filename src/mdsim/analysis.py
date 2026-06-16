@@ -3073,3 +3073,417 @@ def _binding_cluster_sizes_for_frame(
     if not include_singletons:
         values = values[values > 1]
     return np.sort(values)[::-1]
+
+
+def _cluster_centers_from_protein_centers(
+    protein_centers_nm: np.ndarray,
+    clusters: Sequence[Sequence[int]],
+    box_nm: np.ndarray,
+    *,
+    min_cluster_size: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert protein centers into cluster centers for one frame.
+
+    protein_centers_nm
+        (n_proteins, 3), wrapped protein centers.
+
+    clusters
+        List of clusters, where each cluster is a list of protein indices.
+
+    box_nm
+        Orthorhombic box lengths in nm.
+
+    min_cluster_size
+        Minimum cluster size to include.
+        Use 1 for monomers + clusters.
+        Use 2 for non-singleton clusters only.
+
+    Returns
+    -------
+    centers_nm
+        (n_clusters_kept, 3)
+
+    sizes
+        Cluster sizes corresponding to centers_nm.
+    """
+    pc = np.asarray(protein_centers_nm, dtype=np.float64)
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    centers: list[np.ndarray] = []
+    sizes: list[int] = []
+
+    for cl in clusters:
+        members = np.asarray(cl, dtype=np.int64)
+
+        if members.size < int(min_cluster_size):
+            continue
+
+        x = pc[members, :]
+
+        if members.size == 1:
+            cen = x[0].copy()
+        else:
+            # Make the cluster whole relative to the first member.
+            ref = x[0:1, :]
+            d = x - ref
+            d -= np.rint(d / box.reshape(1, 3)) * box.reshape(1, 3)
+            x_unwrapped = ref + d
+
+            # Center of geometry of the member protein centers.
+            cen = np.mean(x_unwrapped, axis=0)
+
+        # Wrap cluster center back into the primary box.
+        cen -= np.floor(cen / box) * box
+
+        centers.append(cen)
+        sizes.append(int(members.size))
+
+    if not centers:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0,), dtype=np.int64),
+        )
+
+    return (
+        np.asarray(centers, dtype=np.float64),
+        np.asarray(sizes, dtype=np.int64),
+    )
+
+
+def cluster_rdf_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    clusters_out: dict[str, Any],
+    *,
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
+    center: str = "cog",
+    unwrap_proteins: bool = True,
+    min_cluster_size: int = 1,
+    dr_nm: float = 0.01,
+    r_max_nm: Optional[float] = None,
+    stride: int = 1,
+    chunk: int = 500,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    box_nm: Optional[Sequence[float]] = None,
+) -> dict[str, Any]:
+    """
+    RDF between cluster centers, where the number of cluster particles varies by frame.
+
+    clusters_out
+        Output dictionary from clusters_from_dcd(). It must have been generated
+        using the same DCDs, stride, frame_start/frame_stop, and selection.
+
+    min_cluster_size
+        1 includes monomers and clusters.
+        2 includes only non-singleton clusters.
+
+    Normalization
+    -------------
+    For each frame, the ideal-gas expected shell count is:
+
+        n_pairs(frame) * shell_volume / box_volume(frame)
+
+    This handles a variable number of cluster particles per frame.
+    """
+    dcd_list = _as_file_list(dcd_files)
+
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+    if int(min_cluster_size) < 1:
+        raise ValueError("min_cluster_size must be >= 1")
+    if float(dr_nm) <= 0.0:
+        raise ValueError("dr_nm must be > 0")
+
+    center_mode = str(center).strip().lower()
+    if center_mode not in {"cog", "com"}:
+        raise ValueError("center must be 'cog' or 'com'")
+
+    clusters_by_frame = clusters_out.get("clusters_by_frame")
+    if clusters_by_frame is None:
+        raise KeyError("clusters_out is missing 'clusters_by_frame'")
+
+    clusters_by_frame = list(clusters_by_frame)
+    if not clusters_by_frame:
+        raise ValueError("clusters_out['clusters_by_frame'] is empty")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    groups_global = _selection_to_groups(tmpl, selection)
+
+    if len(groups_global) < 2:
+        raise ValueError("selection must yield >=2 non-empty protein groups")
+
+    n_proteins = int(len(groups_global))
+
+    if "n_proteins" in clusters_out:
+        if int(clusters_out["n_proteins"]) != n_proteins:
+            raise ValueError(
+                f"clusters_out has n_proteins={clusters_out['n_proteins']}, "
+                f"but selection produced {n_proteins} groups"
+            )
+
+    atom_set: set[int] = set()
+    for g in groups_global:
+        atom_set.update(int(i) for i in g)
+
+    atom_indices = sorted(atom_set)
+
+    idx_map = {old: new for new, old in enumerate(atom_indices)}
+    groups = [np.asarray([idx_map[int(i)] for i in g], dtype=np.int32) for g in groups_global]
+
+    masses_sel = None
+    if center_mode == "com":
+        masses_all = atom_masses(tmpl_model)
+        masses_sel = np.asarray(masses_all[atom_indices], dtype=np.float64)
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    # Determine r_max.
+    if r_max_nm is None:
+        half_boxes = []
+
+        for dcd in dcd_list:
+            it = iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=1,
+                stride=int(stride),
+                atom_indices=atom_indices,
+            )
+
+            try:
+                _, b0_raw = next(it)
+            except StopIteration as exc:
+                raise ValueError(f"DCD appears to have no frames: {dcd}") from exc
+
+            if b0_raw is None:
+                if box_fallback is None:
+                    raise ValueError(
+                        "DCD does not include unit cell lengths; " "pass box_nm=(Lx,Ly,Lz) in nm"
+                    )
+                b0 = box_fallback
+            else:
+                b0 = _box_lengths_nm(b0_raw)
+
+            half_boxes.append(0.5 * float(np.min(b0)))
+
+        r_max = float(min(half_boxes))
+    else:
+        r_max = float(r_max_nm)
+
+    if r_max <= 0.0:
+        raise ValueError("r_max_nm must be > 0")
+
+    r_edges = np.arange(
+        0.0,
+        r_max + float(dr_nm),
+        float(dr_nm),
+        dtype=np.float64,
+    )
+
+    if r_edges.size < 2:
+        raise ValueError("invalid r_max/dr combination")
+
+    r_edges[-1] = r_max
+
+    n_bins = int(r_edges.size - 1)
+
+    shell_vol = (4.0 * math.pi / 3.0) * (np.power(r_edges[1:], 3) - np.power(r_edges[:-1], 3))
+
+    gr_blocks: list[np.ndarray] = []
+    kb_blocks: list[np.ndarray] = []
+    b2_blocks: list[np.ndarray] = []
+
+    frames_per_block: list[int] = []
+    min_half_boxes: list[float] = []
+
+    particles_per_frame_all: list[int] = []
+    pairs_per_frame_all: list[int] = []
+    cluster_sizes_kept_all: list[np.ndarray] = []
+
+    global_frame_index = 0
+
+    for dcd in dcd_list:
+        hist = np.zeros(n_bins, dtype=np.float64)
+        norm = np.zeros(n_bins, dtype=np.float64)
+
+        n_frames_block = 0
+        min_half_box_block = float("inf")
+
+        for fi, (xyz_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if global_frame_index >= len(clusters_by_frame):
+                raise ValueError(
+                    "More DCD frames were encountered than clusters_out contains. "
+                    "Check that dcd_files, stride, frame_start, and frame_stop match "
+                    "the clusters_from_dcd() call."
+                )
+
+            clusters = clusters_by_frame[global_frame_index]
+            global_frame_index += 1
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError(
+                        "DCD does not include unit cell lengths; " "pass box_nm=(Lx,Ly,Lz) in nm"
+                    )
+                b = box_fallback
+            else:
+                b = _box_lengths_nm(box_frame_nm)
+
+            if np.any(b <= 0.0):
+                raise ValueError("box lengths must be positive")
+
+            min_half_box_block = min(
+                min_half_box_block,
+                0.5 * float(np.min(b)),
+            )
+
+            vol = float(b[0] * b[1] * b[2])
+
+            if vol <= 0.0:
+                raise ValueError("non-positive box volume")
+
+            # Protein centers first, using the same machinery as rdf_from_dcd().
+            protein_centers = group_centers_nm(
+                xyz_nm,
+                groups,
+                masses=masses_sel,
+                box_nm=b,
+                center=center_mode,
+                unwrap=bool(unwrap_proteins),
+                wrap=True,
+            )
+
+            cluster_centers, cluster_sizes = _cluster_centers_from_protein_centers(
+                protein_centers,
+                clusters,
+                b,
+                min_cluster_size=int(min_cluster_size),
+            )
+
+            n_particles = int(cluster_centers.shape[0])
+            n_pairs = n_particles * (n_particles - 1) // 2
+
+            particles_per_frame_all.append(n_particles)
+            pairs_per_frame_all.append(n_pairs)
+            cluster_sizes_kept_all.append(cluster_sizes)
+
+            if n_pairs > 0:
+                r = _pair_distances_nm(cluster_centers, b)
+                h, _ = np.histogram(r, bins=r_edges)
+
+                hist += h.astype(np.float64)
+
+                # Ideal-gas expected counts for this frame.
+                norm += float(n_pairs) * shell_vol / vol
+
+            n_frames_block += 1
+
+        if n_frames_block <= 0:
+            raise ValueError(f"no frames selected for DCD block: {dcd}")
+
+        if np.all(norm <= 0.0):
+            raise ValueError(
+                "No frame contained at least two cluster particles. "
+                "Try min_cluster_size=1, or check the clustering output."
+            )
+
+        g_r = np.zeros_like(hist)
+        ok = norm > 0.0
+        g_r[ok] = hist[ok] / norm[ok]
+
+        kb = _kb_from_gr(g_r, r_edges)
+        b2 = -0.5 * kb
+
+        gr_blocks.append(g_r)
+        kb_blocks.append(kb)
+        b2_blocks.append(b2)
+
+        frames_per_block.append(int(n_frames_block))
+        min_half_boxes.append(float(min_half_box_block))
+
+    if global_frame_index != len(clusters_by_frame):
+        raise ValueError(
+            "clusters_out contains more frames than were read from the DCDs. "
+            f"Used {global_frame_index} frames, but clusters_out has "
+            f"{len(clusters_by_frame)}. Check stride/frame_start/frame_stop."
+        )
+
+    # Truncate to the safe radius if the box fluctuated.
+    r_keep = min(float(r_max), float(min(min_half_boxes)))
+    n_keep = int(np.searchsorted(r_edges, r_keep, side="right") - 1)
+
+    if n_keep < 1:
+        raise ValueError("box is too small for the requested r_max_nm/dr_nm")
+
+    r_edges_keep = r_edges[: n_keep + 1]
+    r_nm = 0.5 * (r_edges_keep[:-1] + r_edges_keep[1:])
+
+    gr_arr = np.stack([g[:n_keep] for g in gr_blocks], axis=0)
+    kb_arr = np.stack([k[:n_keep] for k in kb_blocks], axis=0)
+    b2_arr = np.stack([b[:n_keep] for b in b2_blocks], axis=0)
+
+    gr_mean = np.mean(gr_arr, axis=0)
+    kb_mean = np.mean(kb_arr, axis=0)
+    b2_mean = np.mean(b2_arr, axis=0)
+
+    n_blocks = int(gr_arr.shape[0])
+
+    if n_blocks < 2:
+        gr_err = np.zeros_like(gr_mean)
+        kb_err = np.zeros_like(kb_mean)
+        b2_err = np.zeros_like(b2_mean)
+        b2_final_err = 0.0
+    else:
+        denom_blocks = math.sqrt(float(n_blocks))
+
+        gr_err = np.std(gr_arr, axis=0, ddof=1) / denom_blocks
+        kb_err = np.std(kb_arr, axis=0, ddof=1) / denom_blocks
+        b2_err = np.std(b2_arr, axis=0, ddof=1) / denom_blocks
+        b2_final_err = float(np.std(b2_arr[:, -1], ddof=1) / denom_blocks)
+
+    return {
+        "r_nm": r_nm,
+        "r_edges_nm": r_edges_keep,
+        "g_r": gr_mean,
+        "g_r_err": gr_err,
+        "kb_nm3": kb_mean,
+        "kb_nm3_err": kb_err,
+        "b2_r_nm3": b2_mean,
+        "b2_r_nm3_err": b2_err,
+        "b2_nm3": float(b2_mean[-1]),
+        "b2_nm3_err": float(b2_final_err),
+        "n_blocks": n_blocks,
+        "frames_per_block": np.asarray(frames_per_block, dtype=np.int64),
+        "particles_per_frame": np.asarray(particles_per_frame_all, dtype=np.int64),
+        "pairs_per_frame": np.asarray(pairs_per_frame_all, dtype=np.int64),
+        "cluster_sizes_by_frame": cluster_sizes_kept_all,
+        "selection": selection,
+        "center": center_mode,
+        "unwrap_proteins": bool(unwrap_proteins),
+        "min_cluster_size": int(min_cluster_size),
+        "stride": int(stride),
+    }
