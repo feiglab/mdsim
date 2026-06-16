@@ -3167,6 +3167,7 @@ def cluster_rdf_from_dcd(
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
     box_nm: Optional[Sequence[float]] = None,
+    tail_norm_range_nm: Optional[tuple[float, float]] = None,
 ) -> dict[str, Any]:
     """
     RDF between cluster centers, where the number of cluster particles varies by frame.
@@ -3465,6 +3466,41 @@ def cluster_rdf_from_dcd(
         b2_err = np.std(b2_arr, axis=0, ddof=1) / denom_blocks
         b2_final_err = float(np.std(b2_arr[:, -1], ddof=1) / denom_blocks)
 
+    tail_norm_factor = 1.0
+
+    if tail_norm_range_nm is not None:
+        rlo, rhi = tail_norm_range_nm
+        tail_sel = (r_nm >= float(rlo)) & (r_nm <= float(rhi))
+
+        if int(np.sum(tail_sel)) < 1:
+            raise ValueError("tail_norm_range_nm selects no RDF points")
+
+        tail_norm_factor = float(np.nanmean(gr_mean[tail_sel]))
+
+        if not np.isfinite(tail_norm_factor) or tail_norm_factor <= 0.0:
+            raise ValueError("invalid tail normalization factor")
+
+        gr_mean = gr_mean / tail_norm_factor
+        gr_err = gr_err / tail_norm_factor
+
+        # Recompute KB/B2 from the renormalized g(r).
+        kb_mean = _kb_from_gr(gr_mean, r_edges_keep)
+        b2_mean = -0.5 * kb_mean
+
+        if n_blocks < 2:
+            kb_err = np.zeros_like(kb_mean)
+            b2_err = np.zeros_like(b2_mean)
+            b2_final_err = 0.0
+        else:
+            gr_arr_norm = gr_arr / tail_norm_factor
+            kb_arr = np.stack([_kb_from_gr(g, r_edges_keep) for g in gr_arr_norm], axis=0)
+            b2_arr = -0.5 * kb_arr
+
+            denom_blocks = math.sqrt(float(n_blocks))
+            kb_err = np.std(kb_arr, axis=0, ddof=1) / denom_blocks
+            b2_err = np.std(b2_arr, axis=0, ddof=1) / denom_blocks
+            b2_final_err = float(np.std(b2_arr[:, -1], ddof=1) / denom_blocks)
+
     return {
         "r_nm": r_nm,
         "r_edges_nm": r_edges_keep,
@@ -3476,6 +3512,8 @@ def cluster_rdf_from_dcd(
         "b2_r_nm3_err": b2_err,
         "b2_nm3": float(b2_mean[-1]),
         "b2_nm3_err": float(b2_final_err),
+        "tail_norm_factor": float(tail_norm_factor),
+        "tail_norm_range_nm": tail_norm_range_nm,
         "n_blocks": n_blocks,
         "frames_per_block": np.asarray(frames_per_block, dtype=np.int64),
         "particles_per_frame": np.asarray(particles_per_frame_all, dtype=np.int64),
