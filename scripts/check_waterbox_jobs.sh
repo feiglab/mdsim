@@ -2,7 +2,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-tag="${1:-run}"
+tag="${1:-prod}"
 
 for n in set*; do
   # Only process directories
