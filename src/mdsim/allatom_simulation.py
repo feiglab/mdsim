@@ -953,8 +953,7 @@ class MDSim:
                         )
                         if value_nm.ndim != 0:
                             raise ValueError(
-                                "Each XYZ coordinate must be scalar; "
-                                f"got shape {value_nm.shape}"
+                                "Each XYZ coordinate must be scalar; " f"got shape {value_nm.shape}"
                             )
                         values.append(float(value_nm))
                     else:
@@ -963,12 +962,9 @@ class MDSim:
                 arr = np.asarray(values, dtype=float)
 
             if arr.shape != (3,):
-                raise ValueError(
-                    f"XYZ target must have shape (3,), got {arr.shape}"
-                )
+                raise ValueError(f"XYZ target must have shape (3,), got {arr.shape}")
 
             return tuple(float(value) for value in arr)
-
 
         def _is_scalar_xyz(value):
             """Return True only when value represents one XYZ vector."""
