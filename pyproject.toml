@@ -21,6 +21,7 @@ dependencies = [
   "openmm>=8.0",
   "mdtraj>=1.9.0",
   "periodictable",
+  "scipy",
 ]
 
 [project.optional-dependencies]

@@ -793,6 +793,124 @@ def _contacts_between_group_sets_one_frame(
     return out
 
 
+def _contacts_per_query_chain_ckdtree_one_frame(
+    xyz_nm: np.ndarray,
+    box_nm: np.ndarray,
+    atom_to_query: np.ndarray,
+    atom_to_partner: np.ndarray,
+    same_group_pairs: set[tuple[int, int]],
+    *,
+    dist_cutoff_nm: float,
+    workers: int = 1,
+    query_atom_chunk: int = 50000,
+) -> np.ndarray:
+    """
+    Count contacts for each query chain using SciPy's periodic cKDTree.
+
+    The tree contains all partner atoms. All query atoms are searched against
+    that tree in compiled SciPy code. ``workers`` controls the threads used by
+    ``cKDTree.query_ball_point``; use -1 for all available CPU cores.
+
+    The result is the row sum that contacts_from_dcd ultimately needs, so this
+    avoids constructing the full (n_query, n_partner) contact matrix.
+    """
+    if float(dist_cutoff_nm) <= 0.0:
+        raise ValueError("dist_cutoff_nm must be > 0")
+    if int(workers) == 0 or int(workers) < -1:
+        raise ValueError("workers must be -1 or a positive integer")
+    if int(query_atom_chunk) <= 0:
+        raise ValueError("query_atom_chunk must be >= 1")
+
+    try:
+        from scipy.spatial import cKDTree
+    except Exception as exc:
+        raise ImportError("SciPy is required for the cKDTree contact implementation") from exc
+
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
+    if np.any(box <= 0.0):
+        raise ValueError("box lengths must be positive")
+
+    # cKDTree with boxsize requires coordinates in [0, L).
+    xyz = _wrap_positions_nm(np.asarray(xyz_nm, dtype=np.float64), box)
+
+    query_atoms = np.flatnonzero(atom_to_query >= 0).astype(np.int64)
+    partner_atoms = np.flatnonzero(atom_to_partner >= 0).astype(np.int64)
+
+    q_valid = atom_to_query >= 0
+    n_query = int(np.max(atom_to_query[q_valid])) + 1 if np.any(q_valid) else 0
+    out = np.zeros(n_query, dtype=np.int64)
+
+    if query_atoms.size == 0 or partner_atoms.size == 0:
+        return out
+
+    # Identical query/partner groups are self interactions and must be removed.
+    same_partner = np.full(n_query, -1, dtype=np.int64)
+    for qi, pj in same_group_pairs:
+        if 0 <= int(qi) < n_query:
+            same_partner[int(qi)] = int(pj)
+
+    partner_xyz = xyz[partner_atoms]
+    tree = cKDTree(partner_xyz, boxsize=box)
+
+    chunk_size = int(query_atom_chunk)
+    for start in range(0, int(query_atoms.size), chunk_size):
+        q_atoms = query_atoms[start : start + chunk_size]
+
+        try:
+            neighbors = tree.query_ball_point(
+                xyz[q_atoms],
+                r=float(dist_cutoff_nm),
+                workers=int(workers),
+                return_sorted=False,
+            )
+        except TypeError as exc:
+            # ``workers`` is available in SciPy >= 1.6. A serial fallback keeps
+            # the routine usable with older SciPy, but cannot provide threading.
+            if int(workers) != 1:
+                raise RuntimeError("parallel cKDTree queries require SciPy >= 1.6") from exc
+            neighbors = tree.query_ball_point(
+                xyz[q_atoms],
+                r=float(dist_cutoff_nm),
+                return_sorted=False,
+            )
+
+        lengths = np.fromiter(
+            (len(v) for v in neighbors),
+            dtype=np.int64,
+            count=len(q_atoms),
+        )
+        n_hits = int(np.sum(lengths))
+        if n_hits == 0:
+            continue
+
+        # Flatten the ragged neighbor lists and retain the corresponding query
+        # atom for every hit. This leaves only vectorized filtering/counting in
+        # Python after the compiled tree search.
+        q_atom_hits = np.repeat(q_atoms, lengths)
+        p_local_hits = np.concatenate(
+            [np.asarray(v, dtype=np.int64) for v in neighbors if len(v) > 0]
+        )
+        p_atom_hits = partner_atoms[p_local_hits]
+
+        q_group_hits = atom_to_query[q_atom_hits]
+        p_group_hits = atom_to_partner[p_atom_hits]
+
+        # The original cell-list routine never compares an atom with itself.
+        keep = q_atom_hits != p_atom_hits
+
+        # Exclude all contacts within an identical query/partner chain.
+        matched_partner = same_partner[q_group_hits]
+        keep &= (matched_partner < 0) | (p_group_hits != matched_partner)
+
+        if np.any(keep):
+            out += np.bincount(
+                q_group_hits[keep],
+                minlength=n_query,
+            ).astype(np.int64, copy=False)
+
+    return out
+
+
 def contacts_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
@@ -805,7 +923,17 @@ def contacts_from_dcd(
     chunk: int = 200,
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
+    workers: int = 1,
+    query_atom_chunk: int = 50000,
 ) -> ChainContactResult:
+    """
+    Calculate atom-contact counts per query chain.
+
+    Neighbor searches use ``scipy.spatial.cKDTree`` with orthorhombic periodic
+    boundaries. Set ``workers=-1`` to use all available CPU cores or specify a
+    positive thread count. Parallelism occurs inside SciPy's compiled neighbor
+    search and does not require Numba or multiprocessing.
+    """
     if float(cutoff_nm) <= 0.0:
         raise ValueError("cutoff_nm must be > 0")
     if int(stride) <= 0:
@@ -814,6 +942,10 @@ def contacts_from_dcd(
         raise ValueError("chunk must be >= 1")
     if int(frame_start) < 0:
         raise ValueError("frame_start must be >= 0")
+    if int(workers) == 0 or int(workers) < -1:
+        raise ValueError("workers must be -1 or a positive integer")
+    if int(query_atom_chunk) <= 0:
+        raise ValueError("query_atom_chunk must be >= 1")
 
     dcd_list = _as_file_list(dcd_files)
     if not dcd_list:
@@ -891,15 +1023,17 @@ def contacts_from_dcd(
             else:
                 b = _box_lengths_nm(box_frame_nm)
 
-            pair_counts = _contacts_between_group_sets_one_frame(
+            contacts = _contacts_per_query_chain_ckdtree_one_frame(
                 np.asarray(xyz_sel_nm, dtype=np.float64),
                 b,
                 atom_to_query,
                 atom_to_partner,
                 same_group_pairs,
                 dist_cutoff_nm=float(cutoff_nm),
+                workers=int(workers),
+                query_atom_chunk=int(query_atom_chunk),
             )
-            frames.append(np.sum(pair_counts, axis=1).astype(np.float64))
+            frames.append(contacts.astype(np.float64, copy=False))
 
     if not frames:
         raise ValueError("no frames selected")
