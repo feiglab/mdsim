@@ -2232,6 +2232,988 @@ def rg_from_dcd(
     )
 
 
+@dataclass(frozen=True)
+class IntrachainDistanceResult:
+    """Intrachain atom-pair distance time series.
+
+    Array conventions match ``RgResult`` and ``ChainContactResult``:
+    the first axis of ``distance_per_chain_nm`` identifies a chain and the
+    second axis identifies trajectory frames.
+    """
+
+    distance_per_chain_nm: np.ndarray  # (n_chains, n_frames)
+    distance_mean_nm: np.ndarray  # (n_frames,)
+    distance_stderr_nm: np.ndarray  # (n_frames,)
+    chain_labels: tuple[str, ...]
+    atom_labels: tuple[tuple[str, str], ...]  # one atom-label pair per chain
+    atom_indices: np.ndarray  # (n_chains, 2), template atom indices
+    n_chains: int
+    n_frames: int
+    selection: Any
+    pbc: bool
+
+
+def _chain_indices_from_selection(
+    tmpl: Any,
+    chains: Union[str, Sequence[str]],
+) -> tuple[list[int], tuple[str, ...], np.ndarray]:
+    """Resolve a chain set using StructureSelector-compatible selections.
+
+    ``chains`` may be one selector or a sequence of selectors. A selector may
+    identify one or several chains. Returned chains are de-duplicated while
+    preserving selector order and topology order within each selector.
+    """
+    model = tmpl.model if hasattr(tmpl, "model") else tmpl
+    n_atoms = int(len(model.atoms))
+
+    atom_index = {id(atom): i for i, atom in enumerate(model.atoms)}
+    atom_to_chain = np.full(n_atoms, -1, dtype=np.int64)
+    chain_labels: list[str] = []
+
+    for ci, (key, chain) in enumerate(model.chain.items()):
+        chain_labels.append(str(key))
+        for residue in chain.residues:
+            for atom in residue.atoms:
+                ai = atom_index.get(id(atom))
+                if ai is not None:
+                    atom_to_chain[int(ai)] = int(ci)
+
+    if isinstance(chains, str):
+        chain_specs: list[Any] = [chains]
+    elif isinstance(chains, Sequence):
+        chain_specs = list(chains)
+    else:
+        raise TypeError("chains must be a selection string or a sequence of selections")
+
+    if not chain_specs:
+        raise ValueError("chains is empty")
+
+    selected: list[int] = []
+    seen: set[int] = set()
+
+    for spec in chain_specs:
+        groups = _selection_to_groups(tmpl, spec)
+        if not groups:
+            raise ValueError(f"chain selection {spec!r} produced no atoms")
+
+        touched: set[int] = set()
+        for group in groups:
+            ci_values = np.unique(atom_to_chain[np.asarray(group, dtype=np.int64)])
+            touched.update(int(ci) for ci in ci_values.tolist() if int(ci) >= 0)
+
+        if not touched:
+            raise ValueError(f"chain selection {spec!r} did not resolve to a physical chain")
+
+        for ci in sorted(touched):
+            if ci not in seen:
+                selected.append(ci)
+                seen.add(ci)
+
+    labels = tuple(chain_labels[ci] for ci in selected)
+    return selected, labels, atom_to_chain
+
+
+def _atom_pair_label(model: Any, atom_index: int) -> str:
+    atom = model.atoms[int(atom_index)]
+    resname = (getattr(atom, "resname", "") or "").strip()
+    resnum = int(getattr(atom, "resnum", 0))
+    name = (getattr(atom, "name", "") or "").strip()
+    return f"{resname}{resnum}.{name}"
+
+
+def intrachain_distances_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    chains: Union[str, Sequence[str]] = "protein",
+    selection: Union[str, Sequence[str]],
+    pbc: bool = True,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> IntrachainDistanceResult:
+    """Calculate the same intrachain atom-pair distance for selected chains.
+
+    Parameters
+    ----------
+    pdb_file, dcd_files
+        Template PDB and one or more DCD trajectories.
+
+    chains
+        StructureSelector-compatible selection identifying the chains to
+        analyze. It may be one selector or a sequence of selectors. Examples::
+
+            chains="protein"
+            chains="A:B:C"
+            chains=["A", "B", "C"]
+
+    selection
+        StructureSelector-compatible selection that must select exactly two
+        atoms in every requested chain. The same atom definition is applied to
+        all chains. Examples::
+
+            selection="10.CA,90.CA"
+            selection=["10.CA", "90.CA"]
+
+        The two forms above are equivalent. Selection order is not important
+        because only the scalar distance is returned.
+
+    pbc
+        If True, calculate minimum-image distances using an orthorhombic box.
+        If the DCD lacks unit-cell lengths, provide ``box_nm``.
+
+    box_nm
+        Fallback box lengths ``(Lx, Ly, Lz)`` in nm.
+
+    stride, chunk, frame_start, frame_stop
+        Same conventions as ``rg_from_dcd``.
+
+    Returns
+    -------
+    IntrachainDistanceResult
+        ``distance_per_chain_nm`` has shape ``(n_chains, n_frames)``.
+    """
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    chain_indices, chain_labels, atom_to_chain = _chain_indices_from_selection(
+        tmpl,
+        chains,
+    )
+    if not chain_indices:
+        raise ValueError("chains produced no physical chains")
+
+    pair_groups_full = _selection_to_groups(tmpl, selection)
+    if not pair_groups_full:
+        raise ValueError("selection produced no atoms")
+
+    pair_atom_set: set[int] = set()
+    for group in pair_groups_full:
+        pair_atom_set.update(int(i) for i in np.asarray(group, dtype=np.int64).tolist())
+
+    pair_indices_full = np.empty((len(chain_indices), 2), dtype=np.int64)
+    atom_labels: list[tuple[str, str]] = []
+
+    for out_i, chain_i in enumerate(chain_indices):
+        selected_atoms = sorted(
+            ai for ai in pair_atom_set if int(atom_to_chain[int(ai)]) == int(chain_i)
+        )
+
+        if len(selected_atoms) != 2:
+            label = chain_labels[out_i]
+            descriptions = [_atom_pair_label(tmpl_model, ai) for ai in selected_atoms]
+            raise ValueError(
+                f"selection must resolve to exactly two atoms in chain {label!r}; "
+                f"it selected {len(selected_atoms)}: {descriptions}"
+            )
+
+        pair_indices_full[out_i, :] = selected_atoms
+        atom_labels.append(
+            (
+                _atom_pair_label(tmpl_model, selected_atoms[0]),
+                _atom_pair_label(tmpl_model, selected_atoms[1]),
+            )
+        )
+
+    # Read only the atoms that participate in the requested distances.
+    atom_indices_full = sorted(set(pair_indices_full.reshape(-1).tolist()))
+    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+    pair_indices_sel = np.asarray(
+        [[idx_map[int(a)], idx_map[int(b)]] for a, b in pair_indices_full.tolist()],
+        dtype=np.int64,
+    )
+
+    box_fallback = None
+    if bool(pbc) and box_nm is not None:
+        box_fallback = _box_lengths_nm(box_nm)
+
+    distance_frames: list[np.ndarray] = []
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            pair_xyz = xyz[pair_indices_sel, :]  # (n_chains, 2, 3)
+            displacement = pair_xyz[:, 1, :] - pair_xyz[:, 0, :]
+
+            if bool(pbc):
+                if box_frame_nm is None:
+                    if box_fallback is None:
+                        raise ValueError(
+                            "DCD lacks unit-cell lengths; pass box_nm=(Lx,Ly,Lz) "
+                            "in nm or set pbc=False"
+                        )
+                    box = box_fallback
+                else:
+                    box = _box_lengths_nm(box_frame_nm)
+
+                displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
+
+            distances = np.linalg.norm(displacement, axis=1)
+            distance_frames.append(np.asarray(distances, dtype=np.float64))
+
+    if not distance_frames:
+        raise ValueError("no frames selected")
+
+    distance_per_chain = np.stack(distance_frames, axis=1)
+    distance_mean = np.nanmean(distance_per_chain, axis=0)
+
+    n_chains = int(distance_per_chain.shape[0])
+    if n_chains < 2:
+        distance_stderr = np.zeros_like(distance_mean)
+    else:
+        distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
+
+    return IntrachainDistanceResult(
+        distance_per_chain_nm=distance_per_chain,
+        distance_mean_nm=distance_mean,
+        distance_stderr_nm=distance_stderr,
+        chain_labels=chain_labels,
+        atom_labels=tuple(atom_labels),
+        atom_indices=pair_indices_full,
+        n_chains=n_chains,
+        n_frames=int(distance_per_chain.shape[1]),
+        selection=selection,
+        pbc=bool(pbc),
+    )
+
+
+@dataclass(frozen=True)
+class InterchainDistanceResult:
+    """Distances from one reference-chain atom to one atom in target chains.
+
+    The first axis of ``distance_per_chain_nm`` identifies a target chain and
+    the second axis identifies trajectory frames. If the reference chain is
+    included among the target chains and ``exclude_reference=False``, its row
+    contains the corresponding intrachain distance.
+    """
+
+    distance_per_chain_nm: np.ndarray  # (n_target_chains, n_frames)
+    distance_mean_nm: np.ndarray  # (n_frames,)
+    distance_stderr_nm: np.ndarray  # (n_frames,)
+    chain_labels: tuple[str, ...]  # target-chain labels
+    reference_chain_label: str
+    reference_atom_label: str
+    target_atom_labels: tuple[str, ...]
+    reference_atom_index: int  # template atom index
+    target_atom_indices: np.ndarray  # (n_target_chains,), template atom indices
+    n_chains: int  # number of retained target chains
+    n_frames: int
+    selection: Any
+    exclude_reference: bool
+    pbc: bool
+
+
+def _ordered_atom_pair_selection_specs(
+    selection: Union[str, Sequence[str]],
+) -> tuple[str, str]:
+    """Normalize an ordered two-atom selection into two selector strings.
+
+    Accepted forms include::
+
+        ["39.CE2", "69.SG"]
+        ("39.CE2", "69.SG")
+        "39.CE2,69.SG"
+        "39.CE2;69.SG"
+        "39.CE2_69.SG"
+
+    The order matters: the first selector defines the reference-chain atom and
+    the second selector defines the target-chain atom.
+    """
+    if isinstance(selection, str):
+        raw = selection.strip()
+        if not raw:
+            raise ValueError("selection is empty")
+
+        # StructureSelector treats ';' and '_' as group separators. Comma is
+        # also accepted here for consistency with intrachain_distances_from_dcd.
+        normalized = raw.replace(";", ",").replace("_", ",")
+        parts = [part.strip() for part in normalized.split(",") if part.strip()]
+    elif isinstance(selection, Sequence):
+        parts = [str(part).strip() for part in selection]
+    else:
+        raise TypeError("selection must be a string or a sequence of two strings")
+
+    if len(parts) != 2 or any(not part for part in parts):
+        raise ValueError(
+            "selection must contain exactly two ordered atom selectors, for example "
+            "['39.CE2', '69.SG'] or '39.CE2,69.SG'"
+        )
+
+    return parts[0], parts[1]
+
+
+def interchain_distances_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    reference_chain: Union[str, Sequence[str]],
+    target_chains: Union[str, Sequence[str]] = "protein",
+    selection: Union[str, Sequence[str]],
+    exclude_reference: bool = True,
+    pbc: bool = True,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> InterchainDistanceResult:
+    """Calculate distances from one reference-chain atom to target-chain atoms.
+
+    The ordered atom pair is the same for every chain:
+
+    - the first atom selector is evaluated in ``reference_chain``;
+    - the second atom selector is evaluated in every chain selected by
+      ``target_chains``.
+
+    Parameters
+    ----------
+    pdb_file, dcd_files
+        Template PDB and one or more DCD trajectories.
+
+    reference_chain
+        StructureSelector-compatible selection that must resolve to exactly one
+        physical chain. Examples::
+
+            reference_chain="A"
+            reference_chain=["A"]
+
+    target_chains
+        StructureSelector-compatible selection identifying one or more target
+        chains. Examples::
+
+            target_chains="protein"
+            target_chains="A:B:C"
+            target_chains=["A", "B", "C"]
+
+    selection
+        Exactly two ordered StructureSelector atom selections. The first defines
+        the reference atom and the second defines the target atom. Examples::
+
+            selection=["39.CE2", "69.SG"]
+            selection="39.CE2,69.SG"
+
+    exclude_reference
+        If True, remove the reference chain from the target set when it is
+        present, yielding strictly interchain distances. If False, retain it,
+        and its row contains the intrachain distance between the selected atoms.
+
+    pbc
+        If True, use minimum-image distances in an orthorhombic box. If the DCD
+        lacks unit-cell lengths, provide ``box_nm``.
+
+    box_nm
+        Fallback box lengths ``(Lx, Ly, Lz)`` in nm.
+
+    stride, chunk, frame_start, frame_stop
+        Same conventions as ``rg_from_dcd``.
+
+    Returns
+    -------
+    InterchainDistanceResult
+        ``distance_per_chain_nm`` has shape
+        ``(n_retained_target_chains, n_frames)``.
+    """
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    reference_indices, reference_labels, atom_to_chain = _chain_indices_from_selection(
+        tmpl,
+        reference_chain,
+    )
+    if len(reference_indices) != 1:
+        raise ValueError(
+            f"reference_chain must resolve to exactly one physical chain; "
+            f"it resolved to {len(reference_indices)}: {reference_labels}"
+        )
+
+    reference_chain_index = int(reference_indices[0])
+    reference_chain_label = str(reference_labels[0])
+
+    target_indices_all, target_labels_all, _ = _chain_indices_from_selection(
+        tmpl,
+        target_chains,
+    )
+
+    retained_target_indices: list[int] = []
+    retained_target_labels: list[str] = []
+    for chain_index, chain_label in zip(target_indices_all, target_labels_all):
+        if bool(exclude_reference) and int(chain_index) == reference_chain_index:
+            continue
+        retained_target_indices.append(int(chain_index))
+        retained_target_labels.append(str(chain_label))
+
+    if not retained_target_indices:
+        if bool(exclude_reference) and reference_chain_index in target_indices_all:
+            raise ValueError("no target chains remain after excluding the reference chain")
+        raise ValueError("target_chains produced no physical chains")
+
+    reference_atom_spec, target_atom_spec = _ordered_atom_pair_selection_specs(selection)
+
+    reference_groups = _selection_to_groups(tmpl, reference_atom_spec)
+    if not reference_groups:
+        raise ValueError(f"reference atom selection {reference_atom_spec!r} produced no atoms")
+    reference_atom_set: set[int] = set()
+    for group in reference_groups:
+        reference_atom_set.update(int(i) for i in np.asarray(group, dtype=np.int64).tolist())
+
+    reference_atoms = sorted(
+        atom_index
+        for atom_index in reference_atom_set
+        if int(atom_to_chain[int(atom_index)]) == reference_chain_index
+    )
+    if len(reference_atoms) != 1:
+        descriptions = [_atom_pair_label(tmpl_model, atom_index) for atom_index in reference_atoms]
+        raise ValueError(
+            f"reference atom selection {reference_atom_spec!r} must resolve to "
+            f"exactly one atom in chain {reference_chain_label!r}; it selected "
+            f"{len(reference_atoms)}: {descriptions}"
+        )
+    reference_atom_full = int(reference_atoms[0])
+
+    target_groups = _selection_to_groups(tmpl, target_atom_spec)
+    if not target_groups:
+        raise ValueError(f"target atom selection {target_atom_spec!r} produced no atoms")
+    target_atom_set: set[int] = set()
+    for group in target_groups:
+        target_atom_set.update(int(i) for i in np.asarray(group, dtype=np.int64).tolist())
+
+    target_atoms_full = np.empty(len(retained_target_indices), dtype=np.int64)
+    target_atom_labels: list[str] = []
+
+    for out_index, (chain_index, chain_label) in enumerate(
+        zip(retained_target_indices, retained_target_labels)
+    ):
+        selected_atoms = sorted(
+            atom_index
+            for atom_index in target_atom_set
+            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
+        )
+        if len(selected_atoms) != 1:
+            descriptions = [
+                _atom_pair_label(tmpl_model, atom_index) for atom_index in selected_atoms
+            ]
+            raise ValueError(
+                f"target atom selection {target_atom_spec!r} must resolve to "
+                f"exactly one atom in chain {chain_label!r}; it selected "
+                f"{len(selected_atoms)}: {descriptions}"
+            )
+
+        atom_index = int(selected_atoms[0])
+        target_atoms_full[out_index] = atom_index
+        target_atom_labels.append(_atom_pair_label(tmpl_model, atom_index))
+
+    # Read only the reference atom and retained target atoms.
+    atom_indices_full = sorted({reference_atom_full, *target_atoms_full.tolist()})
+    index_map = {old: new for new, old in enumerate(atom_indices_full)}
+    reference_atom_sel = int(index_map[reference_atom_full])
+    target_atoms_sel = np.asarray(
+        [index_map[int(atom_index)] for atom_index in target_atoms_full],
+        dtype=np.int64,
+    )
+
+    box_fallback = None
+    if bool(pbc) and box_nm is not None:
+        box_fallback = _box_lengths_nm(box_nm)
+
+    distance_frames: list[np.ndarray] = []
+
+    for dcd in dcd_list:
+        for frame_index, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if frame_index < int(frame_start):
+                continue
+            if frame_stop is not None and frame_index >= int(frame_stop):
+                break
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            reference_position = xyz[reference_atom_sel, :]
+            target_positions = xyz[target_atoms_sel, :]
+            displacement = target_positions - reference_position.reshape(1, 3)
+
+            if bool(pbc):
+                if box_frame_nm is None:
+                    if box_fallback is None:
+                        raise ValueError(
+                            "DCD lacks unit-cell lengths; pass box_nm=(Lx,Ly,Lz) "
+                            "in nm or set pbc=False"
+                        )
+                    box = box_fallback
+                else:
+                    box = _box_lengths_nm(box_frame_nm)
+
+                displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
+
+            distance_frames.append(
+                np.linalg.norm(displacement, axis=1).astype(
+                    np.float64,
+                    copy=False,
+                )
+            )
+
+    if not distance_frames:
+        raise ValueError("no frames selected")
+
+    distance_per_chain = np.stack(distance_frames, axis=1)
+    distance_mean = np.nanmean(distance_per_chain, axis=0)
+
+    n_chains = int(distance_per_chain.shape[0])
+    if n_chains < 2:
+        distance_stderr = np.zeros_like(distance_mean)
+    else:
+        distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
+
+    return InterchainDistanceResult(
+        distance_per_chain_nm=distance_per_chain,
+        distance_mean_nm=distance_mean,
+        distance_stderr_nm=distance_stderr,
+        chain_labels=tuple(retained_target_labels),
+        reference_chain_label=reference_chain_label,
+        reference_atom_label=_atom_pair_label(
+            tmpl_model,
+            reference_atom_full,
+        ),
+        target_atom_labels=tuple(target_atom_labels),
+        reference_atom_index=reference_atom_full,
+        target_atom_indices=target_atoms_full,
+        n_chains=n_chains,
+        n_frames=int(distance_per_chain.shape[1]),
+        selection=selection,
+        exclude_reference=bool(exclude_reference),
+        pbc=bool(pbc),
+    )
+
+
+@dataclass(frozen=True)
+class ReferenceCenterDistanceResult:
+    """Distances of selected chain centers from a PBC-aware reference center.
+
+    Array conventions follow ``RgResult`` and ``ChainContactResult`` where
+    practical: the first axis of ``distance_per_chain_nm`` identifies a query
+    chain and the second axis identifies trajectory frames.
+    """
+
+    distance_per_chain_nm: np.ndarray  # (n_query_chains, n_frames)
+    distance_mean_nm: np.ndarray  # (n_frames,)
+    distance_stderr_nm: np.ndarray  # (n_frames,)
+    reference_center_nm: np.ndarray  # (n_frames, 3), wrapped into [0, L)
+    reference_center_unwrapped_nm: np.ndarray  # (n_frames, 3), continuous in time
+    chain_labels: tuple[str, ...]
+    reference_label: str
+    reference_chain_labels: tuple[str, ...]
+    n_reference_chains: int
+    n_query_chains: int
+    n_frames: int
+    mode: str  # "com" or "cog"
+
+
+def _one_chain_groups_from_specs(
+    tmpl: Any,
+    specs: Union[str, Sequence[str]],
+    *,
+    argument_name: str,
+) -> tuple[list[np.ndarray], tuple[str, ...]]:
+    """Resolve one selection specification per physical chain.
+
+    The returned labels are the model chain keys, which are normally segment
+    IDs for structures read by ``PDBReader``. Each specification must resolve
+    to exactly one selection group belonging to exactly one physical chain.
+    """
+    if isinstance(specs, str):
+        specs_list = [specs]
+    else:
+        specs_list = [str(s) for s in specs]
+
+    if not specs_list:
+        raise ValueError(f"{argument_name} is empty")
+    if any(not s.strip() for s in specs_list):
+        raise ValueError(f"{argument_name} contains an empty selection")
+
+    model = tmpl.model if hasattr(tmpl, "model") else tmpl
+    atom_index = {id(a): i for i, a in enumerate(model.atoms)}
+    atom_to_chain = np.full(len(model.atoms), -1, dtype=np.int64)
+    chain_keys: list[str] = []
+
+    for ci, (key, chain) in enumerate(model.chain.items()):
+        chain_keys.append(str(key))
+        for residue in chain.residues:
+            for atom in residue.atoms:
+                ai = atom_index.get(id(atom))
+                if ai is not None:
+                    atom_to_chain[int(ai)] = int(ci)
+
+    groups: list[np.ndarray] = []
+    labels: list[str] = []
+
+    for spec in specs_list:
+        resolved = _selection_to_groups(tmpl, spec)
+        if len(resolved) != 1:
+            raise ValueError(
+                f"{argument_name} entry {spec!r} resolved to {len(resolved)} groups; "
+                "provide one segment/chain selection per entry"
+            )
+
+        group = np.asarray(resolved[0], dtype=np.int64)
+        if group.size == 0:
+            raise ValueError(f"{argument_name} entry {spec!r} selected no atoms")
+
+        ci = np.unique(atom_to_chain[group])
+        ci = ci[ci >= 0]
+        if ci.size != 1:
+            raise ValueError(
+                f"{argument_name} entry {spec!r} must select atoms from exactly "
+                f"one physical chain; it selected {ci.size} chains"
+            )
+
+        label = chain_keys[int(ci[0])]
+        groups.append(group)
+        labels.append(label)
+
+    if len(set(labels)) != len(labels):
+        raise ValueError(
+            f"{argument_name} contains duplicate chains after resolving segment aliases: "
+            f"{labels}"
+        )
+
+    return groups, tuple(labels)
+
+
+def _periodic_weighted_center_nm(
+    points_nm: np.ndarray,
+    weights: np.ndarray,
+    box_nm: np.ndarray,
+    *,
+    max_iterations: int = 50,
+    tolerance_nm: float = 1.0e-10,
+) -> np.ndarray:
+    """Weighted center of periodic points using nearest images to the center.
+
+    The points are repeatedly placed in their minimum-image positions relative
+    to the current center. This is appropriate for a localized set of chains.
+    Like any periodic center, it is intrinsically ambiguous for a distribution
+    spread nearly uniformly around the box.
+    """
+    x = np.asarray(points_nm, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    b = np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    if x.ndim != 2 or x.shape[1] != 3:
+        raise ValueError("points_nm must have shape (n_points, 3)")
+    if x.shape[0] < 1:
+        raise ValueError("at least one point is required")
+    if w.shape != (x.shape[0],):
+        raise ValueError("weights must have one value per point")
+    if np.any(~np.isfinite(x)) or np.any(~np.isfinite(w)):
+        raise ValueError("points and weights must be finite")
+    if np.any(b <= 0.0):
+        raise ValueError("box lengths must be positive")
+
+    total = float(np.sum(w))
+    if total <= 0.0:
+        raise ValueError("total center weight must be positive")
+
+    x = x - np.floor(x / b.reshape(1, 3)) * b.reshape(1, 3)
+    center = x[int(np.argmax(w))].copy()
+
+    for _ in range(int(max_iterations)):
+        disp = x - center.reshape(1, 3)
+        disp -= np.rint(disp / b.reshape(1, 3)) * b.reshape(1, 3)
+        x_near = center.reshape(1, 3) + disp
+        center_new = np.sum(x_near * w[:, None], axis=0) / total
+
+        shift = center_new - center
+        shift -= np.rint(shift / b) * b
+        center += shift
+
+        if float(np.linalg.norm(shift)) <= float(tolerance_nm):
+            break
+
+    center -= np.floor(center / b) * b
+    return center
+
+
+def reference_center_distances_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    reference_segments: Union[str, Sequence[str]],
+    query_segments: Union[str, Sequence[str]],
+    reference_label: str = "reference_center",
+    mode: str = "com",
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> ReferenceCenterDistanceResult:
+    """Distances of chain centers from the center of a reference chain set.
+
+    For each frame the routine:
+
+    1. Computes a COM or COG for every reference chain, unwrapping atoms within
+       each chain by minimum image.
+    2. Computes the combined reference center by placing each reference-chain
+       center in its nearest periodic image relative to the evolving center.
+       For ``mode='com'``, chain centers are weighted by their selected mass.
+    3. Computes a COM or COG for each query chain and its minimum-image distance
+       from the combined reference center.
+
+    ``reference_segments`` and ``query_segments`` contain one segment/chain
+    selection per entry. The two sets may overlap. For example::
+
+        reference_segments=["A", "B", "C"]
+        query_segments=["A", "B", "C", "D", "E"]
+
+    Parameters
+    ----------
+    pdb_file, dcd_files
+        Template PDB and one or more DCD trajectories.
+    reference_segments
+        One selection per chain used to construct the reference center.
+    query_segments
+        One selection per chain whose distance from the reference center is
+        returned. These chains may also be in ``reference_segments``.
+    reference_label
+        Label associated with the combined reference-center time series. It
+        must differ from all resolved query and reference chain labels.
+    mode
+        ``"com"`` for center of mass or ``"cog"`` for center of geometry.
+    box_nm
+        Fallback orthorhombic box lengths if they are absent from the DCD.
+    stride, chunk, frame_start, frame_stop
+        Same conventions as ``rg_from_dcd`` and ``contacts_from_dcd``.
+
+    Returns
+    -------
+    ReferenceCenterDistanceResult
+        ``distance_per_chain_nm`` has shape ``(n_query_chains, n_frames)``.
+        ``reference_center_nm`` is wrapped into the primary box, while
+        ``reference_center_unwrapped_nm`` is continuous across PBC in time.
+    """
+    center_mode = str(mode).strip().lower()
+    if center_mode not in {"com", "cog"}:
+        raise ValueError("mode must be 'com' or 'cog'")
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    ref_label = str(reference_label).strip()
+    if not ref_label:
+        raise ValueError("reference_label must be non-empty")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    reference_groups_full, reference_chain_labels = _one_chain_groups_from_specs(
+        tmpl,
+        reference_segments,
+        argument_name="reference_segments",
+    )
+    query_groups_full, query_chain_labels = _one_chain_groups_from_specs(
+        tmpl,
+        query_segments,
+        argument_name="query_segments",
+    )
+
+    if ref_label in set(reference_chain_labels) | set(query_chain_labels):
+        raise ValueError(f"reference_label {ref_label!r} conflicts with a resolved chain label")
+
+    atom_set: set[int] = set()
+    for group in reference_groups_full:
+        atom_set.update(int(i) for i in group.tolist())
+    for group in query_groups_full:
+        atom_set.update(int(i) for i in group.tolist())
+    atom_indices_full = sorted(atom_set)
+
+    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+    reference_groups = [
+        np.asarray([idx_map[int(i)] for i in group.tolist()], dtype=np.int64)
+        for group in reference_groups_full
+    ]
+    query_groups = [
+        np.asarray([idx_map[int(i)] for i in group.tolist()], dtype=np.int64)
+        for group in query_groups_full
+    ]
+
+    masses_all = atom_masses(tmpl_model)
+    masses_sel = np.asarray(masses_all[atom_indices_full], dtype=np.float64)
+
+    if center_mode == "com":
+        reference_weights = np.asarray(
+            [float(np.sum(masses_sel[group])) for group in reference_groups],
+            dtype=np.float64,
+        )
+        if np.any(reference_weights <= 0.0):
+            raise ValueError(
+                "one or more reference chains have non-positive selected mass; "
+                "check atom masses or use mode='cog'"
+            )
+        center_masses: Optional[np.ndarray] = masses_sel
+    else:
+        reference_weights = np.asarray(
+            [float(group.size) for group in reference_groups],
+            dtype=np.float64,
+        )
+        center_masses = None
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    distance_frames: list[np.ndarray] = []
+    reference_centers_wrapped: list[np.ndarray] = []
+    reference_centers_unwrapped: list[np.ndarray] = []
+
+    previous_reference_wrapped: Optional[np.ndarray] = None
+    previous_reference_unwrapped: Optional[np.ndarray] = None
+
+    for dcd in dcd_list:
+        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+                box = box_fallback
+            else:
+                box = _box_lengths_nm(box_frame_nm)
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+
+            reference_chain_centers = group_centers_nm(
+                xyz,
+                reference_groups,
+                masses=center_masses,
+                box_nm=box,
+                center=center_mode,
+                unwrap=True,
+                wrap=True,
+            )
+            reference_center = _periodic_weighted_center_nm(
+                reference_chain_centers,
+                reference_weights,
+                box,
+            )
+
+            query_centers = group_centers_nm(
+                xyz,
+                query_groups,
+                masses=center_masses,
+                box_nm=box,
+                center=center_mode,
+                unwrap=True,
+                wrap=True,
+            )
+
+            displacement = query_centers - reference_center.reshape(1, 3)
+            displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
+            distances = np.linalg.norm(displacement, axis=1)
+
+            if previous_reference_wrapped is None:
+                reference_unwrapped = reference_center.copy()
+            else:
+                assert previous_reference_unwrapped is not None
+                step = reference_center - previous_reference_wrapped
+                step -= np.rint(step / box) * box
+                reference_unwrapped = previous_reference_unwrapped + step
+
+            distance_frames.append(np.asarray(distances, dtype=np.float64))
+            reference_centers_wrapped.append(reference_center.copy())
+            reference_centers_unwrapped.append(reference_unwrapped.copy())
+
+            previous_reference_wrapped = reference_center.copy()
+            previous_reference_unwrapped = reference_unwrapped.copy()
+
+    if not distance_frames:
+        raise ValueError("no frames selected")
+
+    distance_per_chain = np.stack(distance_frames, axis=1)
+    distance_mean = np.nanmean(distance_per_chain, axis=0)
+
+    n_query = int(distance_per_chain.shape[0])
+    if n_query < 2:
+        distance_stderr = np.zeros_like(distance_mean)
+    else:
+        distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_query))
+
+    reference_center_arr = np.stack(reference_centers_wrapped, axis=0)
+    reference_center_unwrapped_arr = np.stack(reference_centers_unwrapped, axis=0)
+
+    return ReferenceCenterDistanceResult(
+        distance_per_chain_nm=distance_per_chain,
+        distance_mean_nm=distance_mean,
+        distance_stderr_nm=distance_stderr,
+        reference_center_nm=reference_center_arr,
+        reference_center_unwrapped_nm=reference_center_unwrapped_arr,
+        chain_labels=query_chain_labels,
+        reference_label=ref_label,
+        reference_chain_labels=reference_chain_labels,
+        n_reference_chains=int(len(reference_groups)),
+        n_query_chains=n_query,
+        n_frames=int(distance_per_chain.shape[1]),
+        mode=center_mode,
+    )
+
+
 # --- binding/contact probability analysis ------------------------------------
 
 
