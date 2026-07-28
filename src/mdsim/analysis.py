@@ -2017,6 +2017,65 @@ class RgResult:
     n_chains: int
     n_frames: int
     mode: str  # "cog" or "com"
+    # Labels correspond one-to-one with rows of rg_per_chain_nm.  The default
+    # keeps older cached/pickled results usable after this field is added; such
+    # older results expose an empty label tuple.
+    chain_labels: tuple[str, ...] = ()
+
+
+def _group_chain_labels(
+    template_model: Any,
+    groups: Sequence[np.ndarray],
+) -> tuple[str, ...]:
+    """Return physical-chain labels for selection groups.
+
+    Each returned label corresponds to one group, preserving group order. A
+    normal per-chain selection produces one chain key such as ``P001``. If a
+    group intentionally spans several physical chains, their labels are joined
+    with ``+``.
+    """
+    n_atoms = int(len(template_model.atoms))
+    atom_index = {id(atom): index for index, atom in enumerate(template_model.atoms)}
+    atom_to_chain = np.full(n_atoms, -1, dtype=np.int64)
+    physical_chain_labels: list[str] = []
+
+    for chain_index, (key, chain) in enumerate(template_model.chain.items()):
+        label = str(key).strip()
+        if not label:
+            label = str(getattr(chain, "seg_id", "") or "").strip()
+        if not label:
+            label = str(getattr(chain, "chain_id", "") or "").strip()
+        if not label:
+            label = str(chain_index)
+        physical_chain_labels.append(label)
+
+        for residue in chain.residues:
+            for atom in residue.atoms:
+                index = atom_index.get(id(atom))
+                if index is not None:
+                    atom_to_chain[int(index)] = int(chain_index)
+
+    labels: list[str] = []
+    for group_index, group in enumerate(groups):
+        indices = np.asarray(group, dtype=np.int64).reshape(-1)
+        if indices.size == 0:
+            labels.append(f"group {group_index}")
+            continue
+        if np.any(indices < 0) or np.any(indices >= n_atoms):
+            raise IndexError(f"Rg group {group_index} contains an out-of-range atom index")
+
+        touched = {
+            int(chain_index)
+            for chain_index in atom_to_chain[indices].tolist()
+            if int(chain_index) >= 0
+        }
+        if not touched:
+            labels.append(f"group {group_index}")
+            continue
+
+        labels.append("+".join(physical_chain_labels[index] for index in sorted(touched)))
+
+    return tuple(labels)
 
 
 def _selection_to_groups(
@@ -2111,6 +2170,7 @@ def rg_from_dcd(
     if not groups_full:
         raise ValueError("selection produced no groups")
 
+    chain_labels = _group_chain_labels(tmpl_model, groups_full)
     n_groups = int(len(groups_full))
     masses_all = atom_masses(tmpl) if m == "com" else None
 
@@ -2229,6 +2289,7 @@ def rg_from_dcd(
         n_chains=n_groups,
         n_frames=int(rg_pf.shape[1]),
         mode=m,
+        chain_labels=chain_labels,
     )
 
 
