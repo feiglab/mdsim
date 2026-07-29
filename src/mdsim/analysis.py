@@ -2911,8 +2911,9 @@ class ReferenceCenterDistanceResult:
     n_query_chains: int
     n_frames: int
     mode: str  # "com" or "cog"
-    # Default preserves access for older cached/pickled results.
+    # Defaults preserve access for older cached/pickled results.
     distance_axes: str = "xyz"
+    reference_image_mode: str = "as_is"
 
 
 def _normalize_distance_axes(distance_axes: str) -> tuple[str, np.ndarray]:
@@ -2945,6 +2946,36 @@ def _normalize_distance_axes(distance_axes: str) -> tuple[str, np.ndarray]:
     index = {"x": 0, "y": 1, "z": 2}
     indices = np.asarray([index[axis] for axis in canonical], dtype=np.int64)
     return canonical, indices
+
+
+def _normalize_reference_image_mode(reference_image_mode: str) -> str:
+    """Normalize how reference-chain centers are placed across PBC.
+
+    ``"as_is"`` uses the whole-chain centers exactly as stored in the
+    trajectory. All selected reference chains must already share the intended
+    common image.
+
+    ``"cluster"`` treats every selected chain as whole, wraps only the chain
+    centers, and reconstructs one connected periodic cluster before averaging.
+    """
+    if not isinstance(reference_image_mode, str):
+        raise TypeError("reference_image_mode must be a string")
+
+    mode = reference_image_mode.strip().lower().replace("-", "_")
+    aliases = {
+        "asis": "as_is",
+        "stored": "as_is",
+        "direct": "as_is",
+        "whole": "as_is",
+        "common_cluster": "cluster",
+        "periodic_cluster": "cluster",
+        "wrapped": "cluster",
+        "periodic": "cluster",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"as_is", "cluster"}:
+        raise ValueError("reference_image_mode must be 'as_is' or 'cluster'")
+    return mode
 
 
 def _one_chain_groups_from_specs(
@@ -3018,58 +3049,76 @@ def _one_chain_groups_from_specs(
     return groups, tuple(labels)
 
 
-def _periodic_weighted_center_nm(
-    points_nm: np.ndarray,
-    weights: np.ndarray,
+def _assemble_periodic_cluster_nm(
+    centers_nm: np.ndarray,
     box_nm: np.ndarray,
-    *,
-    max_iterations: int = 50,
-    tolerance_nm: float = 1.0e-10,
 ) -> np.ndarray:
-    """Weighted center of periodic points using nearest images to the center.
+    """Place whole-chain centers into one connected periodic image.
 
-    The points are repeatedly placed in their minimum-image positions relative
-    to the current center. This is appropriate for a localized set of chains.
-    Like any periodic center, it is intrinsically ambiguous for a distribution
-    spread nearly uniformly around the box.
+    A minimum-distance spanning tree is grown from the first supplied center.
+    Each unplaced center is attached through the shortest minimum-image edge to
+    any center already placed. This reconstructs an extended cluster through
+    local neighbors rather than forcing every center to be near one arbitrary
+    anchor.
+
+    The caller must ensure that all supplied centers belong to one connected
+    physical cluster. If separate clusters are supplied, this procedure will
+    still place them into one periodic image and the resulting center will not
+    have a useful physical interpretation.
     """
-    x = np.asarray(points_nm, dtype=np.float64)
-    w = np.asarray(weights, dtype=np.float64).reshape(-1)
-    b = np.asarray(box_nm, dtype=np.float64).reshape(3)
+    centers = np.asarray(centers_nm, dtype=np.float64)
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
 
-    if x.ndim != 2 or x.shape[1] != 3:
-        raise ValueError("points_nm must have shape (n_points, 3)")
-    if x.shape[0] < 1:
-        raise ValueError("at least one point is required")
-    if w.shape != (x.shape[0],):
-        raise ValueError("weights must have one value per point")
-    if np.any(~np.isfinite(x)) or np.any(~np.isfinite(w)):
-        raise ValueError("points and weights must be finite")
-    if np.any(b <= 0.0):
-        raise ValueError("box lengths must be positive")
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError("centers_nm must have shape (n_centers, 3)")
+    if centers.shape[0] < 1:
+        raise ValueError("centers_nm is empty")
+    if np.any(~np.isfinite(centers)):
+        raise ValueError("centers_nm must contain only finite values")
+    if np.any(~np.isfinite(box)) or np.any(box <= 0.0):
+        raise ValueError("box lengths must be finite and positive")
 
-    total = float(np.sum(w))
-    if total <= 0.0:
-        raise ValueError("total center weight must be positive")
+    # Work from canonical wrapped centers. Only the chain centers are wrapped;
+    # atoms within each chain are never minimum-imaged or reconstructed here.
+    wrapped = centers - np.floor(centers / box.reshape(1, 3)) * box.reshape(1, 3)
 
-    x = x - np.floor(x / b.reshape(1, 3)) * b.reshape(1, 3)
-    center = x[int(np.argmax(w))].copy()
+    n_centers = int(wrapped.shape[0])
+    assembled = np.empty_like(wrapped)
+    placed = np.zeros(n_centers, dtype=bool)
 
-    for _ in range(int(max_iterations)):
-        disp = x - center.reshape(1, 3)
-        disp -= np.rint(disp / b.reshape(1, 3)) * b.reshape(1, 3)
-        x_near = center.reshape(1, 3) + disp
-        center_new = np.sum(x_near * w[:, None], axis=0) / total
+    assembled[0] = wrapped[0]
+    placed[0] = True
 
-        shift = center_new - center
-        shift -= np.rint(shift / b) * b
-        center += shift
+    while not np.all(placed):
+        best_distance2 = float("inf")
+        best_source = -1
+        best_target = -1
+        best_displacement: Optional[np.ndarray] = None
 
-        if float(np.linalg.norm(shift)) <= float(tolerance_nm):
-            break
+        placed_indices = np.flatnonzero(placed)
+        unplaced_indices = np.flatnonzero(~placed)
 
-    center -= np.floor(center / b) * b
-    return center
+        for source_raw in placed_indices:
+            source = int(source_raw)
+            for target_raw in unplaced_indices:
+                target = int(target_raw)
+                displacement = wrapped[target] - wrapped[source]
+                displacement -= np.rint(displacement / box) * box
+                distance2 = float(np.dot(displacement, displacement))
+
+                if distance2 < best_distance2:
+                    best_distance2 = distance2
+                    best_source = source
+                    best_target = target
+                    best_displacement = displacement.copy()
+
+        if best_displacement is None or best_source < 0 or best_target < 0:
+            raise RuntimeError("failed to assemble periodic reference cluster")
+
+        assembled[best_target] = assembled[best_source] + best_displacement
+        placed[best_target] = True
+
+    return assembled
 
 
 def reference_center_distances_from_dcd(
@@ -3081,67 +3130,75 @@ def reference_center_distances_from_dcd(
     reference_label: str = "reference_center",
     mode: str = "com",
     distance_axes: str = "xyz",
+    reference_image_mode: str = "as_is",
     box_nm: Optional[Sequence[float]] = None,
     stride: int = 1,
     chunk: int = 200,
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
 ) -> ReferenceCenterDistanceResult:
-    """Distances of chain centers from the center of a reference chain set.
+    """Distances of whole-chain centers from a reference-chain center.
+
+    Every selected chain is assumed to be whole in each stored trajectory
+    frame. No atom within a chain is wrapped or minimum-imaged. CA-only centers
+    can be requested by supplying CA-restricted selections, as done by the
+    notebook-facing helper by default.
 
     For each frame the routine:
 
-    1. Computes a COM or COG for every reference chain, unwrapping atoms within
-       each chain by minimum image.
-    2. Computes the combined reference center by placing each reference-chain
-       center in its nearest periodic image relative to the evolving center.
-       For ``mode='com'``, chain centers are weighted by their selected mass.
-    3. Computes a COM or COG for each query chain and its minimum-image
-       displacement from the combined reference center.
-    4. Calculates the magnitude using the Cartesian components selected by
-       ``distance_axes``.
+    1. Computes the COM or COG of every reference and query chain directly from
+       its stored coordinates.
+    2. Places the reference-chain centers according to ``reference_image_mode``:
 
-    ``reference_segments`` and ``query_segments`` contain one segment/chain
-    selection per entry. The two sets may overlap. For example::
+       - ``"as_is"``: preserve the stored relative images of the chains.
+       - ``"cluster"``: wrap only the chain centers and assemble them into one
+         connected periodic cluster using a minimum-distance spanning tree.
 
-        reference_segments=["A", "B", "C"]
-        query_segments=["A", "B", "C", "D", "E"]
+    3. Computes the reference center, weighting chain centers by selected mass
+       for ``mode='com'`` or selected atom count for ``mode='cog'``.
+    4. Applies minimum imaging only to each final query-to-reference
+       displacement.
+    5. Calculates the nonnegative distance using the Cartesian components
+       selected by ``distance_axes``.
+
+    ``reference_image_mode='cluster'`` assumes that all supplied reference
+    chains belong to one connected physical cluster. Cluster membership itself
+    is not inferred by this function.
 
     Parameters
     ----------
-    pdb_file, dcd_files
-        Template PDB and one or more DCD trajectories.
     reference_segments
-        One selection per chain used to construct the reference center.
+        One selection per reference chain.
     query_segments
-        One selection per chain whose distance from the reference center is
-        returned. These chains may also be in ``reference_segments``.
-    reference_label
-        Label associated with the combined reference-center time series. It
-        must differ from all resolved query and reference chain labels.
+        One selection per query chain.
     mode
-        ``"com"`` for center of mass or ``"cog"`` for center of geometry.
+        ``"com"`` or ``"cog"``.
     distance_axes
-        Cartesian components included in the distance: ``"x"``, ``"y"``,
-        ``"z"`` for a one-dimensional absolute displacement; ``"xy"``,
-        ``"xz"``, or ``"yz"`` for distance in a plane; and ``"xyz"`` for
-        the conventional three-dimensional distance. Axis order is ignored.
+        ``"x"``, ``"y"`, ``"z"``, ``"xy"``, ``"xz"``, ``"yz"``, or
+        ``"xyz"``. One-dimensional results are absolute displacements; plane
+        and 3D results are Euclidean magnitudes in the selected components.
+    reference_image_mode
+        ``"as_is"`` for chains already stored in a common image, or
+        ``"cluster"`` to assemble whole-chain centers across PBC before
+        calculating the reference center.
     box_nm
-        Fallback orthorhombic box lengths if they are absent from the DCD.
-    stride, chunk, frame_start, frame_stop
-        Same conventions as ``rg_from_dcd`` and ``contacts_from_dcd``.
+        Fallback orthorhombic box lengths when absent from the DCD.
 
     Returns
     -------
     ReferenceCenterDistanceResult
         ``distance_per_chain_nm`` has shape ``(n_query_chains, n_frames)``.
-        ``reference_center_nm`` is wrapped into the primary box, while
-        ``reference_center_unwrapped_nm`` is continuous across PBC in time.
+        ``reference_center_nm`` is wrapped into the primary box.
+        ``reference_center_unwrapped_nm`` is continuous across frames and
+        preserves the direct first-frame center for ``"as_is"`` mode.
     """
     center_mode = str(mode).strip().lower()
     if center_mode not in {"com", "cog"}:
         raise ValueError("mode must be 'com' or 'cog'")
+
     distance_axes_name, distance_axis_indices = _normalize_distance_axes(distance_axes)
+    reference_image_mode_name = _normalize_reference_image_mode(reference_image_mode)
+
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
     if int(chunk) <= 0:
@@ -3212,6 +3269,10 @@ def reference_center_distances_from_dcd(
         )
         center_masses = None
 
+    total_reference_weight = float(np.sum(reference_weights))
+    if total_reference_weight <= 0.0:
+        raise ValueError("total reference-center weight must be positive")
+
     box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
 
     distance_frames: list[np.ndarray] = []
@@ -3219,10 +3280,11 @@ def reference_center_distances_from_dcd(
     reference_centers_unwrapped: list[np.ndarray] = []
 
     previous_reference_wrapped: Optional[np.ndarray] = None
+    previous_reference_raw: Optional[np.ndarray] = None
     previous_reference_unwrapped: Optional[np.ndarray] = None
 
     for dcd in dcd_list:
-        for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
+        for frame_index, (xyz_sel_nm, box_frame_nm) in enumerate(
             iter_dcd(
                 dcd,
                 tmpl_model,
@@ -3231,9 +3293,9 @@ def reference_center_distances_from_dcd(
                 atom_indices=atom_indices_full,
             )
         ):
-            if fi < int(frame_start):
+            if frame_index < int(frame_start):
                 continue
-            if frame_stop is not None and fi >= int(frame_stop):
+            if frame_stop is not None and frame_index >= int(frame_stop):
                 break
 
             if box_frame_nm is None:
@@ -3245,51 +3307,76 @@ def reference_center_distances_from_dcd(
 
             xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
 
-            reference_chain_centers = group_centers_nm(
+            # Chains are already whole. Never minimum-image atoms within a
+            # chain and never wrap a chain center before deciding how the
+            # reference chains should be placed relative to one another.
+            reference_chain_centers_stored = group_centers_nm(
                 xyz,
                 reference_groups,
                 masses=center_masses,
-                box_nm=box,
                 center=center_mode,
-                unwrap=True,
-                wrap=True,
+                unwrap=False,
+                wrap=False,
             )
-            reference_center = _periodic_weighted_center_nm(
-                reference_chain_centers,
-                reference_weights,
-                box,
-            )
-
             query_centers = group_centers_nm(
                 xyz,
                 query_groups,
                 masses=center_masses,
-                box_nm=box,
                 center=center_mode,
-                unwrap=True,
-                wrap=True,
+                unwrap=False,
+                wrap=False,
             )
 
-            displacement = query_centers - reference_center.reshape(1, 3)
+            if reference_image_mode_name == "as_is":
+                reference_chain_centers_common = reference_chain_centers_stored
+            else:
+                reference_chain_centers_common = _assemble_periodic_cluster_nm(
+                    reference_chain_centers_stored,
+                    box,
+                )
+
+            reference_center_raw = (
+                np.sum(
+                    reference_chain_centers_common * reference_weights[:, None],
+                    axis=0,
+                )
+                / total_reference_weight
+            )
+
+            reference_center_wrapped = reference_center_raw.copy()
+            reference_center_wrapped -= np.floor(reference_center_wrapped / box) * box
+
+            displacement = query_centers - reference_center_raw.reshape(1, 3)
             displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
             distances = np.linalg.norm(
                 displacement[:, distance_axis_indices],
                 axis=1,
             )
 
-            if previous_reference_wrapped is None:
-                reference_unwrapped = reference_center.copy()
+            if previous_reference_unwrapped is None:
+                reference_unwrapped = reference_center_raw.copy()
             else:
-                assert previous_reference_unwrapped is not None
-                step = reference_center - previous_reference_wrapped
+                assert previous_reference_raw is not None
+                assert previous_reference_wrapped is not None
+
+                if reference_image_mode_name == "as_is":
+                    step = reference_center_raw - previous_reference_raw
+                else:
+                    # Cluster reconstruction may choose a raw image shifted by
+                    # a whole box as the anchor crosses a boundary. Track the
+                    # wrapped center so the reported unwrapped series remains
+                    # continuous.
+                    step = reference_center_wrapped - previous_reference_wrapped
+
                 step -= np.rint(step / box) * box
                 reference_unwrapped = previous_reference_unwrapped + step
 
             distance_frames.append(np.asarray(distances, dtype=np.float64))
-            reference_centers_wrapped.append(reference_center.copy())
+            reference_centers_wrapped.append(reference_center_wrapped.copy())
             reference_centers_unwrapped.append(reference_unwrapped.copy())
 
-            previous_reference_wrapped = reference_center.copy()
+            previous_reference_wrapped = reference_center_wrapped.copy()
+            previous_reference_raw = reference_center_raw.copy()
             previous_reference_unwrapped = reference_unwrapped.copy()
 
     if not distance_frames:
@@ -3305,7 +3392,10 @@ def reference_center_distances_from_dcd(
         distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_query))
 
     reference_center_arr = np.stack(reference_centers_wrapped, axis=0)
-    reference_center_unwrapped_arr = np.stack(reference_centers_unwrapped, axis=0)
+    reference_center_unwrapped_arr = np.stack(
+        reference_centers_unwrapped,
+        axis=0,
+    )
 
     return ReferenceCenterDistanceResult(
         distance_per_chain_nm=distance_per_chain,
@@ -3321,6 +3411,7 @@ def reference_center_distances_from_dcd(
         n_frames=int(distance_per_chain.shape[1]),
         mode=center_mode,
         distance_axes=distance_axes_name,
+        reference_image_mode=reference_image_mode_name,
     )
 
 
