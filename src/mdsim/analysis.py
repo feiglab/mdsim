@@ -2894,7 +2894,9 @@ class ReferenceCenterDistanceResult:
 
     Array conventions follow ``RgResult`` and ``ChainContactResult`` where
     practical: the first axis of ``distance_per_chain_nm`` identifies a query
-    chain and the second axis identifies trajectory frames.
+    chain and the second axis identifies trajectory frames. Distances may be
+    evaluated in full 3D, along one Cartesian axis, or within one Cartesian
+    plane, as recorded by ``distance_axes``.
     """
 
     distance_per_chain_nm: np.ndarray  # (n_query_chains, n_frames)
@@ -2909,6 +2911,40 @@ class ReferenceCenterDistanceResult:
     n_query_chains: int
     n_frames: int
     mode: str  # "com" or "cog"
+    # Default preserves access for older cached/pickled results.
+    distance_axes: str = "xyz"
+
+
+def _normalize_distance_axes(distance_axes: str) -> tuple[str, np.ndarray]:
+    """Validate Cartesian axes and return a canonical label and indices.
+
+    Accepted values are ``x``, ``y``, ``z``, ``xy``, ``xz``, ``yz``, and
+    ``xyz``. Axis order is ignored, so for example ``yx`` is normalized to
+    ``xy``. ``3d`` is accepted as an alias for ``xyz``.
+    """
+    if not isinstance(distance_axes, str):
+        raise TypeError("distance_axes must be a string")
+
+    text = distance_axes.strip().lower().replace(" ", "")
+    if text == "3d":
+        text = "xyz"
+
+    if not text or any(axis not in "xyz" for axis in text):
+        raise ValueError(
+            "distance_axes must be one of 'x', 'y', 'z', 'xy', 'xz', " "'yz', or 'xyz'"
+        )
+    if len(set(text)) != len(text):
+        raise ValueError("distance_axes must not contain repeated axes")
+
+    canonical = "".join(axis for axis in "xyz" if axis in text)
+    if canonical not in {"x", "y", "z", "xy", "xz", "yz", "xyz"}:
+        raise ValueError(
+            "distance_axes must be one of 'x', 'y', 'z', 'xy', 'xz', " "'yz', or 'xyz'"
+        )
+
+    index = {"x": 0, "y": 1, "z": 2}
+    indices = np.asarray([index[axis] for axis in canonical], dtype=np.int64)
+    return canonical, indices
 
 
 def _one_chain_groups_from_specs(
@@ -3044,6 +3080,7 @@ def reference_center_distances_from_dcd(
     query_segments: Union[str, Sequence[str]],
     reference_label: str = "reference_center",
     mode: str = "com",
+    distance_axes: str = "xyz",
     box_nm: Optional[Sequence[float]] = None,
     stride: int = 1,
     chunk: int = 200,
@@ -3059,8 +3096,10 @@ def reference_center_distances_from_dcd(
     2. Computes the combined reference center by placing each reference-chain
        center in its nearest periodic image relative to the evolving center.
        For ``mode='com'``, chain centers are weighted by their selected mass.
-    3. Computes a COM or COG for each query chain and its minimum-image distance
-       from the combined reference center.
+    3. Computes a COM or COG for each query chain and its minimum-image
+       displacement from the combined reference center.
+    4. Calculates the magnitude using the Cartesian components selected by
+       ``distance_axes``.
 
     ``reference_segments`` and ``query_segments`` contain one segment/chain
     selection per entry. The two sets may overlap. For example::
@@ -3082,6 +3121,11 @@ def reference_center_distances_from_dcd(
         must differ from all resolved query and reference chain labels.
     mode
         ``"com"`` for center of mass or ``"cog"`` for center of geometry.
+    distance_axes
+        Cartesian components included in the distance: ``"x"``, ``"y"``,
+        ``"z"`` for a one-dimensional absolute displacement; ``"xy"``,
+        ``"xz"``, or ``"yz"`` for distance in a plane; and ``"xyz"`` for
+        the conventional three-dimensional distance. Axis order is ignored.
     box_nm
         Fallback orthorhombic box lengths if they are absent from the DCD.
     stride, chunk, frame_start, frame_stop
@@ -3097,6 +3141,7 @@ def reference_center_distances_from_dcd(
     center_mode = str(mode).strip().lower()
     if center_mode not in {"com", "cog"}:
         raise ValueError("mode must be 'com' or 'cog'")
+    distance_axes_name, distance_axis_indices = _normalize_distance_axes(distance_axes)
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
     if int(chunk) <= 0:
@@ -3227,7 +3272,10 @@ def reference_center_distances_from_dcd(
 
             displacement = query_centers - reference_center.reshape(1, 3)
             displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
-            distances = np.linalg.norm(displacement, axis=1)
+            distances = np.linalg.norm(
+                displacement[:, distance_axis_indices],
+                axis=1,
+            )
 
             if previous_reference_wrapped is None:
                 reference_unwrapped = reference_center.copy()
@@ -3272,6 +3320,7 @@ def reference_center_distances_from_dcd(
         n_query_chains=n_query,
         n_frames=int(distance_per_chain.shape[1]),
         mode=center_mode,
+        distance_axes=distance_axes_name,
     )
 
 
