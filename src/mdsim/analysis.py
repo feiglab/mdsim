@@ -12,7 +12,7 @@ from typing import Any, Optional, Union
 
 import numpy as np
 from openmm.app import Topology
-from openmm.unit import Quantity, dimensionless, nanometer
+from openmm.unit import Quantity, dimensionless, nanometer, nanoseconds
 
 from .molecule_data import PDBReader, StructureSelector, iter_dcd
 
@@ -3412,6 +3412,555 @@ def reference_center_distances_from_dcd(
         mode=center_mode,
         distance_axes=distance_axes_name,
         reference_image_mode=reference_image_mode_name,
+    )
+
+
+# --- mass-density profiles relative to a reference center --------------------
+
+# 1 dalton / nm^3 = 1.66053906660 g/L.
+_DALTON_PER_NM3_TO_G_PER_L = 1.66053906660
+
+
+@dataclass(frozen=True)
+class MassDensityProfileResult:
+    """Mass-density profile relative to a PBC-aware reference center.
+
+    ``coordinate_nm`` contains signed Cartesian coordinates for one-dimensional
+    profiles (``profile_axes`` equal to ``"x"``, ``"y"``, or ``"z"``). For
+    two- and three-dimensional profiles it contains the nonnegative radial
+    distance in the selected plane or in full 3D.
+
+    ``density_g_per_l`` is the equal-frame mean mass density. For 1D the bin
+    volume is a Cartesian slab spanning the full perpendicular box area; for 2D
+    it is an annular cylinder spanning the remaining box dimension; for 3D it
+    is a spherical shell. ``density_stderr_g_per_l`` is the standard error over
+    the selected trajectory frames.
+    """
+
+    coordinate_nm: np.ndarray
+    edges_nm: np.ndarray
+    density_g_per_l: np.ndarray
+    density_stderr_g_per_l: np.ndarray
+    n_frames: int
+    n_atoms: int
+    total_selected_mass_da: float
+    profile_axes: str
+    geometry: str
+    signed: bool
+    selection: Any
+    reference_label: str
+    reference_chain_labels: tuple[str, ...]
+    n_reference_chains: int
+    mode: str
+    reference_image_mode: str
+    frame_start: int
+    frame_stop: Optional[int]
+    stride: int
+    element_counts: tuple[tuple[str, int], ...] = ()
+    units: str = "g/L"
+
+    @property
+    def centers(self) -> np.ndarray:
+        """Alias for :attr:`coordinate_nm`."""
+        return self.coordinate_nm
+
+    @property
+    def widths(self) -> np.ndarray:
+        return np.diff(self.edges_nm)
+
+
+def _time_value_ns(value: Any, *, name: str) -> float:
+    """Convert a numeric nanosecond value or OpenMM time Quantity to ns."""
+    if isinstance(value, (float, int, np.floating, np.integer)):
+        out = float(value)
+    else:
+        try:
+            out = float(value.value_in_unit(nanoseconds))
+        except Exception as exc:
+            raise TypeError(f"{name} must be a number in ns or an OpenMM time Quantity") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be finite")
+    return out
+
+
+def _density_profile_frame_limits(
+    *,
+    frame_start: int,
+    frame_stop: Optional[int],
+    time_start: Any,
+    time_stop: Any,
+    delta_t: Any,
+) -> tuple[int, Optional[int]]:
+    """Resolve optional time limits to indices in the analyzed frame stream.
+
+    ``delta_t`` is the interval between consecutive analyzed frames, matching
+    :func:`calculate_histograms` in the notebook-facing module. Stop limits are
+    exclusive.
+    """
+    uses_time = time_start is not None or time_stop is not None
+    if not uses_time:
+        start = int(frame_start)
+        stop = None if frame_stop is None else int(frame_stop)
+        if start < 0:
+            raise ValueError("frame_start must be >= 0")
+        if stop is not None and stop <= start:
+            raise ValueError("frame_stop must be greater than frame_start")
+        return start, stop
+
+    if int(frame_start) != 0 or frame_stop is not None:
+        raise ValueError("specify either frame_start/frame_stop or time_start/time_stop, not both")
+    if delta_t is None:
+        raise ValueError("delta_t is required when time_start or time_stop is specified")
+
+    dt_ns = _time_value_ns(delta_t, name="delta_t")
+    if dt_ns <= 0.0:
+        raise ValueError("delta_t must be > 0")
+    effective_dt_ns = dt_ns
+
+    start_time_ns = 0.0 if time_start is None else _time_value_ns(time_start, name="time_start")
+    if start_time_ns < 0.0:
+        raise ValueError("time_start must be >= 0")
+
+    stop_time_ns = None if time_stop is None else _time_value_ns(time_stop, name="time_stop")
+    if stop_time_ns is not None:
+        if stop_time_ns < 0.0:
+            raise ValueError("time_stop must be >= 0")
+        if stop_time_ns <= start_time_ns:
+            raise ValueError("time_stop must be greater than time_start")
+
+    # First analyzed frame with t >= limit. The small tolerance prevents an
+    # exactly represented multiple such as 4.0/0.2 from rounding just above an
+    # integer and incorrectly skipping one frame.
+    eps = 1.0e-12
+    start = int(math.ceil(start_time_ns / effective_dt_ns - eps))
+    stop = None if stop_time_ns is None else int(math.ceil(stop_time_ns / effective_dt_ns - eps))
+    if stop is not None and stop <= start:
+        raise ValueError("the requested time range selects no frames")
+    return start, stop
+
+
+def _density_profile_edges(
+    bins: Union[int, Sequence[float], np.ndarray],
+    *,
+    value_range: Optional[tuple[float, float]],
+    profile_axes: str,
+    first_boxes_nm: Sequence[np.ndarray],
+) -> np.ndarray:
+    """Validate or construct shared profile bin edges."""
+    n_dim = len(profile_axes)
+
+    if np.isscalar(bins):
+        if isinstance(bins, (bool, np.bool_)):
+            raise TypeError("bins must be an integer or explicit bin edges")
+        n_bins_float = float(bins)
+        if not n_bins_float.is_integer():
+            raise ValueError("bins must be an integer")
+        n_bins = int(n_bins_float)
+        if n_bins < 1:
+            raise ValueError("bins must be at least 1")
+
+        if value_range is None:
+            axis_map = {"x": 0, "y": 1, "z": 2}
+            selected_indices = [axis_map[a] for a in profile_axes]
+            safe_half_width = min(
+                0.5 * float(np.min(np.asarray(box)[selected_indices])) for box in first_boxes_nm
+            )
+            if n_dim == 1:
+                range_min, range_max = -safe_half_width, safe_half_width
+            else:
+                range_min, range_max = 0.0, safe_half_width
+        else:
+            if len(value_range) != 2:
+                raise ValueError("value_range must contain exactly two values")
+            range_min = float(value_range[0])
+            range_max = float(value_range[1])
+
+        if not math.isfinite(range_min) or not math.isfinite(range_max):
+            raise ValueError("value_range values must be finite")
+        if range_max <= range_min:
+            raise ValueError("value_range must be an increasing (min, max) pair")
+        if n_dim > 1 and range_min < 0.0:
+            raise ValueError("radial density profiles require value_range[0] >= 0")
+        return np.linspace(range_min, range_max, n_bins + 1, dtype=np.float64)
+
+    edges = np.asarray(bins, dtype=np.float64)
+    if edges.ndim != 1 or edges.size < 2:
+        raise ValueError(
+            "explicit bin edges must be a one-dimensional array with at least two values"
+        )
+    if not np.all(np.isfinite(edges)):
+        raise ValueError("bin edges must all be finite")
+    if not np.all(np.diff(edges) > 0.0):
+        raise ValueError("bin edges must be strictly increasing")
+    if n_dim > 1 and edges[0] < 0.0:
+        raise ValueError("radial density-profile bin edges must be >= 0")
+    return edges.copy()
+
+
+def _density_profile_bin_volumes_nm3(
+    edges_nm: np.ndarray,
+    *,
+    profile_axes: str,
+    box_nm: np.ndarray,
+) -> np.ndarray:
+    """Return slab, annular-cylinder, or spherical-shell volumes."""
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    selected = [axis_map[a] for a in profile_axes]
+    n_dim = len(selected)
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    if n_dim == 1:
+        axis = selected[0]
+        perpendicular = [i for i in range(3) if i != axis]
+        return np.diff(edges_nm) * float(np.prod(box[perpendicular]))
+
+    if n_dim == 2:
+        remaining = next(i for i in range(3) if i not in selected)
+        annular_area = math.pi * (np.square(edges_nm[1:]) - np.square(edges_nm[:-1]))
+        return annular_area * float(box[remaining])
+
+    return (4.0 * math.pi / 3.0) * (np.power(edges_nm[1:], 3) - np.power(edges_nm[:-1], 3))
+
+
+def _validate_density_profile_range_for_box(
+    edges_nm: np.ndarray,
+    *,
+    profile_axes: str,
+    box_nm: np.ndarray,
+) -> None:
+    """Ensure bins lie inside the non-overlapping minimum-image domain."""
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    selected = [axis_map[a] for a in profile_axes]
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
+    tol = 1.0e-10
+
+    if len(selected) == 1:
+        half = 0.5 * float(box[selected[0]])
+        if float(edges_nm[0]) < -half - tol or float(edges_nm[-1]) > half + tol:
+            raise ValueError(
+                f"1D density-profile edges ({edges_nm[0]}, {edges_nm[-1]}) "
+                f"exceed the minimum-image interval [-{half}, {half}] for "
+                f"axis {profile_axes!r}"
+            )
+        return
+
+    safe_max = 0.5 * float(np.min(box[selected]))
+    if float(edges_nm[-1]) > safe_max + tol:
+        raise ValueError(
+            f"radial density-profile maximum {edges_nm[-1]} nm exceeds the "
+            f"non-overlapping minimum-image radius {safe_max} nm for axes "
+            f"{profile_axes!r}"
+        )
+
+
+def mass_density_profile_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    reference_segments: Union[str, Sequence[str]],
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "all",
+    reference_label: str = "reference_center",
+    mode: str = "cog",
+    profile_axes: str = "xyz",
+    reference_image_mode: str = "as_is",
+    bins: Union[int, Sequence[float], np.ndarray] = 60,
+    value_range: Optional[tuple[float, float]] = None,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    time_start: Any = None,
+    time_stop: Any = None,
+    delta_t: Any = None,
+) -> MassDensityProfileResult:
+    """Calculate mass-density profiles around a condensate reference center.
+
+    The reference center is defined exactly as in
+    :func:`reference_center_distances_from_dcd`: selected reference chains are
+    assumed to be whole; their centers are evaluated directly from stored
+    coordinates and are combined using ``reference_image_mode='as_is'`` or
+    ``'cluster'``. Minimum imaging is applied only to final atom-to-reference
+    displacements.
+
+    Geometry
+    --------
+    ``profile_axes`` accepts ``x``, ``y``, ``z``, ``xy``, ``xz``, ``yz``, or
+    ``xyz``.
+
+    - 1D profiles retain the sign of the selected displacement component and
+      use full-box slabs for normalization.
+    - 2D profiles use radial distance in the selected plane and annular-cylinder
+      volumes spanning the remaining box dimension.
+    - 3D profiles use ordinary radial distance and spherical-shell volumes.
+
+    Atom masses are read from the template model. The bundled PDB reader
+    initializes these from element symbols, so the returned values estimate
+    mass density in g/L rather than atom number density.
+
+    Frame/time selection
+    --------------------
+    Specify either ``frame_start``/``frame_stop`` or
+    ``time_start``/``time_stop`` with ``delta_t``. Numeric time values are in
+    ns. ``delta_t`` is the spacing between analyzed frames, after any stride,
+    matching :func:`calculate_histograms`. Stop limits are exclusive.
+    """
+    center_mode = str(mode).strip().lower()
+    if center_mode not in {"com", "cog"}:
+        raise ValueError("mode must be 'com' or 'cog'")
+
+    profile_axes_name, profile_axis_indices = _normalize_distance_axes(profile_axes)
+    reference_image_mode_name = _normalize_reference_image_mode(reference_image_mode)
+
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+
+    resolved_start, resolved_stop = _density_profile_frame_limits(
+        frame_start=int(frame_start),
+        frame_stop=frame_stop,
+        time_start=time_start,
+        time_stop=time_stop,
+        delta_t=delta_t,
+    )
+
+    ref_label = str(reference_label).strip()
+    if not ref_label:
+        raise ValueError("reference_label must be non-empty")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    reference_groups_full, reference_chain_labels = _one_chain_groups_from_specs(
+        tmpl,
+        reference_segments,
+        argument_name="reference_segments",
+    )
+
+    density_groups_full = _selection_to_groups(tmpl, selection)
+    if not density_groups_full:
+        raise ValueError("selection produced no atoms")
+    density_atom_indices_full = sorted(
+        {
+            int(atom_index)
+            for group in density_groups_full
+            for atom_index in np.asarray(group, dtype=np.int64).tolist()
+        }
+    )
+    if not density_atom_indices_full:
+        raise ValueError("selection produced no atoms")
+
+    atom_set: set[int] = set(density_atom_indices_full)
+    for group in reference_groups_full:
+        atom_set.update(int(i) for i in group.tolist())
+    atom_indices_full = sorted(atom_set)
+
+    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
+    reference_groups = [
+        np.asarray([idx_map[int(i)] for i in group.tolist()], dtype=np.int64)
+        for group in reference_groups_full
+    ]
+    density_atom_indices = np.asarray(
+        [idx_map[int(i)] for i in density_atom_indices_full],
+        dtype=np.int64,
+    )
+
+    masses_all = atom_masses(tmpl_model)
+    masses_selected_all = np.asarray(
+        masses_all[density_atom_indices_full],
+        dtype=np.float64,
+    )
+    if np.any(~np.isfinite(masses_selected_all)) or np.any(masses_selected_all <= 0.0):
+        bad = int(np.sum((~np.isfinite(masses_selected_all)) | (masses_selected_all <= 0.0)))
+        raise ValueError(
+            f"{bad} selected atoms have missing or non-positive masses; "
+            "check element assignments or set atom masses before analysis"
+        )
+
+    masses_subset = np.asarray(masses_all[atom_indices_full], dtype=np.float64)
+    if center_mode == "com":
+        reference_weights = np.asarray(
+            [float(np.sum(masses_subset[group])) for group in reference_groups],
+            dtype=np.float64,
+        )
+        if np.any(reference_weights <= 0.0):
+            raise ValueError(
+                "one or more reference chains have non-positive selected mass; "
+                "check atom masses or use mode='cog'"
+            )
+        center_masses: Optional[np.ndarray] = masses_subset
+    else:
+        reference_weights = np.asarray(
+            [float(group.size) for group in reference_groups],
+            dtype=np.float64,
+        )
+        center_masses = None
+
+    total_reference_weight = float(np.sum(reference_weights))
+    if total_reference_weight <= 0.0:
+        raise ValueError("total reference-center weight must be positive")
+
+    first_boxes = [
+        _peek_first_box_nm(
+            dcd,
+            tmpl_model,
+            atom_indices_full,
+            int(stride),
+            box_nm=box_nm,
+        )
+        for dcd in dcd_list
+    ]
+    edges = _density_profile_edges(
+        bins,
+        value_range=value_range,
+        profile_axes=profile_axes_name,
+        first_boxes_nm=first_boxes,
+    )
+    coordinate = 0.5 * (edges[:-1] + edges[1:])
+    n_bins = int(edges.size - 1)
+
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+    density_sum = np.zeros(n_bins, dtype=np.float64)
+    density_sumsq = np.zeros(n_bins, dtype=np.float64)
+    n_frames = 0
+
+    for dcd in dcd_list:
+        for frame_index, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if frame_index < resolved_start:
+                continue
+            if resolved_stop is not None and frame_index >= resolved_stop:
+                break
+
+            if box_frame_nm is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks unit cell lengths; pass box_nm=(Lx,Ly,Lz) in nm")
+                box = box_fallback
+            else:
+                box = _box_lengths_nm(box_frame_nm)
+
+            _validate_density_profile_range_for_box(
+                edges,
+                profile_axes=profile_axes_name,
+                box_nm=box,
+            )
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            reference_chain_centers_stored = group_centers_nm(
+                xyz,
+                reference_groups,
+                masses=center_masses,
+                center=center_mode,
+                unwrap=False,
+                wrap=False,
+            )
+
+            if reference_image_mode_name == "as_is":
+                reference_chain_centers_common = reference_chain_centers_stored
+            else:
+                reference_chain_centers_common = _assemble_periodic_cluster_nm(
+                    reference_chain_centers_stored,
+                    box,
+                )
+
+            reference_center_raw = (
+                np.sum(
+                    reference_chain_centers_common * reference_weights[:, None],
+                    axis=0,
+                )
+                / total_reference_weight
+            )
+
+            density_xyz = xyz[density_atom_indices, :]
+            displacement = density_xyz - reference_center_raw.reshape(1, 3)
+            displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
+
+            if len(profile_axis_indices) == 1:
+                profile_coordinate = displacement[:, int(profile_axis_indices[0])]
+            else:
+                profile_coordinate = np.linalg.norm(
+                    displacement[:, profile_axis_indices],
+                    axis=1,
+                )
+
+            mass_per_bin_da, _ = np.histogram(
+                profile_coordinate,
+                bins=edges,
+                weights=masses_selected_all,
+            )
+            bin_volumes_nm3 = _density_profile_bin_volumes_nm3(
+                edges,
+                profile_axes=profile_axes_name,
+                box_nm=box,
+            )
+            if np.any(bin_volumes_nm3 <= 0.0):
+                raise ValueError("density-profile bin volumes must be positive")
+
+            density_frame = (
+                np.asarray(mass_per_bin_da, dtype=np.float64)
+                / bin_volumes_nm3
+                * _DALTON_PER_NM3_TO_G_PER_L
+            )
+            density_sum += density_frame
+            density_sumsq += density_frame * density_frame
+            n_frames += 1
+
+    if n_frames <= 0:
+        raise ValueError("no frames selected")
+
+    density_mean = density_sum / float(n_frames)
+    if n_frames < 2:
+        density_stderr = np.zeros_like(density_mean)
+    else:
+        variance = (density_sumsq - density_sum * density_sum / float(n_frames)) / float(
+            n_frames - 1
+        )
+        variance = np.maximum(variance, 0.0)
+        density_stderr = np.sqrt(variance / float(n_frames))
+
+    element_counter: dict[str, int] = {}
+    for atom_index in density_atom_indices_full:
+        symbol = (
+            str(getattr(tmpl_model.atoms[int(atom_index)], "element", "") or "?").strip().upper()
+        )
+        element_counter[symbol] = element_counter.get(symbol, 0) + 1
+
+    n_dim = len(profile_axes_name)
+    geometry = "slab" if n_dim == 1 else ("cylindrical" if n_dim == 2 else "spherical")
+
+    return MassDensityProfileResult(
+        coordinate_nm=coordinate,
+        edges_nm=edges,
+        density_g_per_l=density_mean,
+        density_stderr_g_per_l=density_stderr,
+        n_frames=int(n_frames),
+        n_atoms=int(len(density_atom_indices_full)),
+        total_selected_mass_da=float(np.sum(masses_selected_all)),
+        profile_axes=profile_axes_name,
+        geometry=geometry,
+        signed=bool(n_dim == 1),
+        selection=selection,
+        reference_label=ref_label,
+        reference_chain_labels=reference_chain_labels,
+        n_reference_chains=int(len(reference_groups)),
+        mode=center_mode,
+        reference_image_mode=reference_image_mode_name,
+        frame_start=int(resolved_start),
+        frame_stop=resolved_stop,
+        stride=int(stride),
+        element_counts=tuple(sorted(element_counter.items())),
     )
 
 
