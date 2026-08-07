@@ -2629,6 +2629,335 @@ def _ordered_atom_pair_selection_specs(
     return parts[0], parts[1]
 
 
+@dataclass(frozen=True)
+class MinimumContactDistanceResult:
+    """Per-chain minimum selected atom-pair distance time series.
+
+    For every selected reference chain ``i``, the first atom selector supplies
+    one reference atom and the second atom selector supplies one target atom in
+    every selected chain ``j``.  The result for reference chain ``i`` is the
+    minimum permitted distance ``min_j d(A_i, B_j)`` in each trajectory frame.
+
+    Array conventions match :class:`IntrachainDistanceResult`:
+    ``distance_per_chain_nm`` has shape ``(n_chains, n_frames)`` and row ``i``
+    corresponds to ``chain_labels[i]``.  ``minimum_target_chain_index[i, t]``
+    records which target chain supplied the minimum for reference chain ``i``
+    in frame ``t``.
+    """
+
+    distance_per_chain_nm: np.ndarray  # (n_chains, n_frames)
+    distance_mean_nm: np.ndarray  # (n_frames,)
+    distance_stderr_nm: np.ndarray  # (n_frames,)
+    minimum_target_chain_index: np.ndarray  # (n_chains, n_frames)
+    chain_labels: tuple[str, ...]
+    reference_atom_labels: tuple[str, ...]
+    target_atom_labels: tuple[str, ...]
+    reference_atom_indices: np.ndarray  # (n_chains,), template atom indices
+    target_atom_indices: np.ndarray  # (n_chains,), template atom indices
+    n_chains: int
+    n_frames: int
+    n_pairs_per_reference: int
+    pair_mode: str  # "both" | "intra" | "inter"
+    selection: Any
+    pbc: bool
+
+    @property
+    def minimum_distance_nm(self) -> np.ndarray:
+        """Alias for :attr:`distance_per_chain_nm`."""
+        return self.distance_per_chain_nm
+
+    @property
+    def chain_labels_all(self) -> tuple[str, ...]:
+        """Backward-compatible alias for :attr:`chain_labels`."""
+        return self.chain_labels
+
+    @property
+    def n_pairs(self) -> int:
+        """Total number of directed chain pairs considered per frame."""
+        return int(self.n_chains * self.n_pairs_per_reference)
+
+    @property
+    def minimum_reference_chain_index(self) -> np.ndarray:
+        """Reference-chain indices aligned with the per-chain result array."""
+        return np.broadcast_to(
+            np.arange(self.n_chains, dtype=np.int64).reshape(-1, 1),
+            self.minimum_target_chain_index.shape,
+        )
+
+    @property
+    def minimum_target_chain_labels(self) -> tuple[tuple[str, ...], ...]:
+        """Target-chain labels for each reference-chain row and frame."""
+        return tuple(
+            tuple(self.chain_labels[int(index)] for index in row)
+            for row in self.minimum_target_chain_index
+        )
+
+
+def _normalize_minimum_contact_option(option: Optional[str]) -> str:
+    """Normalize notebook-facing minimum-contact pair-selection options."""
+    if option is None:
+        return "both"
+    if not isinstance(option, str):
+        raise TypeError("option must be a string or None")
+
+    key = option.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": "both",
+        "all": "both",
+        "both": "both",
+        "intra": "intra",
+        "intraonly": "intra",
+        "intra_only": "intra",
+        "intrachain": "intra",
+        "inter": "inter",
+        "interonly": "inter",
+        "inter_only": "inter",
+        "interchain": "inter",
+    }
+    if key not in aliases:
+        raise ValueError("option must be None/'both', 'intraonly', or 'interonly'")
+    return aliases[key]
+
+
+def _minimum_contact_per_reference(
+    distance_matrix_nm: np.ndarray,
+    *,
+    pair_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce one chain-by-chain distance matrix independently by row.
+
+    Row ``i`` contains distances from the first selected atom in reference
+    chain ``i`` to the second selected atom in every target chain ``j``.
+    Returns the minimum distance and the minimizing target-chain index for each
+    reference-chain row.
+    """
+    distances = np.asarray(distance_matrix_nm, dtype=np.float64)
+    if distances.ndim != 2 or distances.shape[0] != distances.shape[1]:
+        raise ValueError("distance_matrix_nm must be a square 2D array")
+
+    n_chains = int(distances.shape[0])
+    if n_chains < 1:
+        raise ValueError("distance_matrix_nm is empty")
+
+    mode = str(pair_mode).strip().lower()
+    reference_indices = np.arange(n_chains, dtype=np.int64)
+
+    if mode == "intra":
+        return np.diag(distances).copy(), reference_indices
+
+    if mode == "both":
+        permitted = distances
+    elif mode == "inter":
+        if n_chains < 2:
+            raise ValueError("interchain minimum requires at least two chains")
+        permitted = distances.copy()
+        np.fill_diagonal(permitted, np.inf)
+    else:
+        raise ValueError("pair_mode must be 'both', 'intra', or 'inter'")
+
+    target_indices = np.argmin(permitted, axis=1).astype(np.int64, copy=False)
+    minimum_distances = permitted[reference_indices, target_indices]
+    if np.any(~np.isfinite(minimum_distances)):
+        raise ValueError("one or more reference chains have no permitted target")
+    return minimum_distances, target_indices
+
+
+def minimum_contact_distances_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    chains: Union[str, Sequence[str]] = "protein",
+    selection: Union[str, Sequence[str]],
+    option: Optional[str] = None,
+    pbc: bool = True,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> MinimumContactDistanceResult:
+    """Return a per-chain minimum selected atom-pair distance in every frame.
+
+    For ``N`` selected chains, the first ordered atom selector supplies one
+    reference atom ``A_i`` in each chain and the second supplies one target atom
+    ``B_j`` in each chain.  For every reference chain ``i`` and frame, this
+    routine stores the minimum permitted value from the row
+    ``d(A_i, B_j)``:
+
+    - ``option=None`` or ``"both"``: minimize over all ``j``, including ``j=i``;
+    - ``option="intraonly"``: retain only ``j=i``.  This is identical to
+      :func:`intrachain_distances_from_dcd` for the same selections;
+    - ``option="interonly"``: minimize over ``j != i``.
+
+    Thus the output contains one time series per selected reference chain, not
+    one global minimum over the complete ``N x N`` matrix.
+    """
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    pair_mode = _normalize_minimum_contact_option(option)
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    chain_indices, chain_labels, atom_to_chain = _chain_indices_from_selection(
+        tmpl,
+        chains,
+    )
+    if not chain_indices:
+        raise ValueError("chains produced no physical chains")
+    if pair_mode == "inter" and len(chain_indices) < 2:
+        raise ValueError("option='interonly' requires at least two selected chains")
+
+    reference_atom_spec, target_atom_spec = _ordered_atom_pair_selection_specs(selection)
+
+    def atoms_for_spec(spec: str, role: str) -> tuple[np.ndarray, tuple[str, ...]]:
+        groups = _selection_to_groups(tmpl, spec)
+        if not groups:
+            raise ValueError(f"{role} atom selection {spec!r} produced no atoms")
+
+        selected_atom_set: set[int] = set()
+        for group in groups:
+            selected_atom_set.update(
+                int(index) for index in np.asarray(group, dtype=np.int64).tolist()
+            )
+
+        atom_indices = np.empty(len(chain_indices), dtype=np.int64)
+        labels: list[str] = []
+        for output_index, (chain_index, chain_label) in enumerate(zip(chain_indices, chain_labels)):
+            matches = sorted(
+                atom_index
+                for atom_index in selected_atom_set
+                if int(atom_to_chain[int(atom_index)]) == int(chain_index)
+            )
+            if len(matches) != 1:
+                descriptions = [_atom_pair_label(tmpl_model, atom_index) for atom_index in matches]
+                raise ValueError(
+                    f"{role} atom selection {spec!r} must resolve to exactly "
+                    f"one atom in chain {chain_label!r}; it selected "
+                    f"{len(matches)}: {descriptions}"
+                )
+            atom_index = int(matches[0])
+            atom_indices[output_index] = atom_index
+            labels.append(_atom_pair_label(tmpl_model, atom_index))
+
+        return atom_indices, tuple(labels)
+
+    reference_atoms_full, reference_atom_labels = atoms_for_spec(
+        reference_atom_spec,
+        "reference",
+    )
+    target_atoms_full, target_atom_labels = atoms_for_spec(
+        target_atom_spec,
+        "target",
+    )
+
+    atom_indices_full = sorted(set(reference_atoms_full.tolist()) | set(target_atoms_full.tolist()))
+    index_map = {old: new for new, old in enumerate(atom_indices_full)}
+    reference_atoms_sel = np.asarray(
+        [index_map[int(atom_index)] for atom_index in reference_atoms_full],
+        dtype=np.int64,
+    )
+    target_atoms_sel = np.asarray(
+        [index_map[int(atom_index)] for atom_index in target_atoms_full],
+        dtype=np.int64,
+    )
+
+    n_chains = int(len(chain_indices))
+    n_pairs_per_reference = (
+        1 if pair_mode == "intra" else n_chains if pair_mode == "both" else n_chains - 1
+    )
+
+    box_fallback = None
+    if bool(pbc) and box_nm is not None:
+        box_fallback = _box_lengths_nm(box_nm)
+
+    distance_frames: list[np.ndarray] = []
+    minimum_target_frames: list[np.ndarray] = []
+
+    for dcd in dcd_list:
+        for frame_index, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if frame_index < int(frame_start):
+                continue
+            if frame_stop is not None and frame_index >= int(frame_stop):
+                break
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            reference_positions = xyz[reference_atoms_sel, :]
+            target_positions = xyz[target_atoms_sel, :]
+            displacement = target_positions[None, :, :] - reference_positions[:, None, :]
+
+            if bool(pbc):
+                if box_frame_nm is None:
+                    if box_fallback is None:
+                        raise ValueError(
+                            "DCD lacks unit-cell lengths; pass box_nm=(Lx,Ly,Lz) "
+                            "in nm or set pbc=False"
+                        )
+                    box = box_fallback
+                else:
+                    box = _box_lengths_nm(box_frame_nm)
+
+                displacement -= np.rint(displacement / box.reshape(1, 1, 3)) * box.reshape(1, 1, 3)
+
+            distance_matrix = np.linalg.norm(displacement, axis=2)
+            minimum_distances, minimum_targets = _minimum_contact_per_reference(
+                distance_matrix,
+                pair_mode=pair_mode,
+            )
+            distance_frames.append(minimum_distances)
+            minimum_target_frames.append(minimum_targets)
+
+    if not distance_frames:
+        raise ValueError("no frames selected")
+
+    distance_per_chain = np.stack(distance_frames, axis=1)
+    minimum_target_array = np.stack(minimum_target_frames, axis=1)
+    distance_mean = np.nanmean(distance_per_chain, axis=0)
+
+    if n_chains < 2:
+        distance_stderr = np.zeros_like(distance_mean)
+    else:
+        distance_stderr = np.nanstd(
+            distance_per_chain,
+            axis=0,
+            ddof=1,
+        ) / math.sqrt(float(n_chains))
+
+    return MinimumContactDistanceResult(
+        distance_per_chain_nm=distance_per_chain,
+        distance_mean_nm=distance_mean,
+        distance_stderr_nm=distance_stderr,
+        minimum_target_chain_index=minimum_target_array,
+        chain_labels=chain_labels,
+        reference_atom_labels=reference_atom_labels,
+        target_atom_labels=target_atom_labels,
+        reference_atom_indices=reference_atoms_full,
+        target_atom_indices=target_atoms_full,
+        n_chains=n_chains,
+        n_frames=int(distance_per_chain.shape[1]),
+        n_pairs_per_reference=int(n_pairs_per_reference),
+        pair_mode=pair_mode,
+        selection=selection,
+        pbc=bool(pbc),
+    )
+
+
 def interchain_distances_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
