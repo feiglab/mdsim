@@ -2043,6 +2043,7 @@ class DistMSDMapResult:
     pair_block_size: int
     origin_chunk: int
     reference_chunk: int
+    reference_chain_labels: tuple[str, ...] = ()
     aggregation: str = "reference_replicates_equal_weight"
     units: str = "nm^2"
 
@@ -2323,6 +2324,7 @@ def _map_process_pair_block(
     do_inter: bool,
     origin_chunk: int,
     reference_chunk: int,
+    reference_indices: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Worker for one block of residue pairs using process-global memmaps."""
     pos = _MAP_POS_TS
@@ -2342,12 +2344,23 @@ def _map_process_pair_block(
     n_frames = int(pos.shape[0])
     n_ch = int(pos.shape[1])
 
+    if reference_indices is None:
+        average_chain_idx = np.arange(n_ch, dtype=np.int64)
+    else:
+        average_chain_idx = np.asarray(reference_indices, dtype=np.int64).reshape(-1)
+        if average_chain_idx.size == 0:
+            raise ValueError("reference_indices selects no chains")
+        if np.any(average_chain_idx < 0) or np.any(average_chain_idx >= n_ch):
+            raise ValueError("reference_indices contains an out-of-range chain index")
+        if np.unique(average_chain_idx).size != average_chain_idx.size:
+            raise ValueError("reference_indices contains duplicate chain indices")
+    n_average_chains = int(average_chain_idx.size)
+
     intra_msd = np.full((n_pairs, n_lags), np.nan, dtype=np.float64)
     inter_msd = np.full((n_pairs, n_lags), np.nan, dtype=np.float64)
     intra_counts = np.zeros((n_pairs, n_lags), dtype=np.int64)
     inter_counts = np.zeros((n_pairs, n_lags), dtype=np.int64)
 
-    chain_idx = np.arange(n_ch, dtype=np.int64)
     oc = max(1, int(origin_chunk))
     rc = max(1, int(reference_chunk))
 
@@ -2361,16 +2374,24 @@ def _map_process_pair_block(
 
         # ---- intrachain: one equal-weight replicate per chain -----------------
         if do_intra and np.any(intra_ok):
-            sum_rep = np.zeros((n_ch, n_pairs), dtype=np.float64)
-            cnt_rep = np.zeros((n_ch, n_pairs), dtype=np.int64)
+            sum_rep = np.zeros((n_average_chains, n_pairs), dtype=np.float64)
+            cnt_rep = np.zeros((n_average_chains, n_pairs), dtype=np.int64)
 
             for o0 in range(0, int(origins.size), oc):
                 t0 = origins[o0 : o0 + oc]
                 t1 = t0 + tau
-                x0_i = pos[t0[:, None, None], chain_idx[None, :, None], ri[None, None, :], :]
-                x0_j = pos[t0[:, None, None], chain_idx[None, :, None], rj[None, None, :], :]
-                x1_i = pos[t1[:, None, None], chain_idx[None, :, None], ri[None, None, :], :]
-                x1_j = pos[t1[:, None, None], chain_idx[None, :, None], rj[None, None, :], :]
+                x0_i = pos[
+                    t0[:, None, None], average_chain_idx[None, :, None], ri[None, None, :], :
+                ]
+                x0_j = pos[
+                    t0[:, None, None], average_chain_idx[None, :, None], rj[None, None, :], :
+                ]
+                x1_i = pos[
+                    t1[:, None, None], average_chain_idx[None, :, None], ri[None, None, :], :
+                ]
+                x1_j = pos[
+                    t1[:, None, None], average_chain_idx[None, :, None], rj[None, None, :], :
+                ]
 
                 d0 = np.asarray(x0_j - x0_i, dtype=np.float64)
                 d1 = np.asarray(x1_j - x1_i, dtype=np.float64)
@@ -2393,7 +2414,7 @@ def _map_process_pair_block(
                 sum_rep += np.sum(np.where(keep, dr2, 0.0), axis=0)
                 cnt_rep += np.sum(keep, axis=0, dtype=np.int64)
 
-            rep_values = np.full((n_ch, n_pairs), np.nan, dtype=np.float64)
+            rep_values = np.full((n_average_chains, n_pairs), np.nan, dtype=np.float64)
             np.divide(sum_rep, cnt_rep, out=rep_values, where=cnt_rep > 0)
             finite = np.isfinite(rep_values)
             n_rep = np.sum(finite, axis=0, dtype=np.int64)
@@ -2408,8 +2429,8 @@ def _map_process_pair_block(
             if targets.ndim != 2 or targets.shape[0] != n_ch:
                 raise RuntimeError("invalid interchain target matrix")
 
-            sum_ref = np.zeros((n_ch, n_pairs), dtype=np.float64)
-            cnt_ref = np.zeros((n_ch, n_pairs), dtype=np.int64)
+            sum_ref = np.zeros((n_average_chains, n_pairs), dtype=np.float64)
+            cnt_ref = np.zeros((n_average_chains, n_pairs), dtype=np.int64)
 
             for o0 in range(0, int(origins.size), oc):
                 t0 = origins[o0 : o0 + oc]
@@ -2417,8 +2438,9 @@ def _map_process_pair_block(
                 b0 = np.asarray(boxes[t0], dtype=np.float64)[:, None, None, None, :]
                 b1 = np.asarray(boxes[t1], dtype=np.float64)[:, None, None, None, :]
 
-                for r0_index in range(0, n_ch, rc):
-                    refs = np.arange(r0_index, min(r0_index + rc, n_ch), dtype=np.int64)
+                for r0_index in range(0, n_average_chains, rc):
+                    r1_index = min(r0_index + rc, n_average_chains)
+                    refs = average_chain_idx[r0_index:r1_index]
                     target_block = targets[refs, :]
 
                     ref0 = pos[
@@ -2461,15 +2483,15 @@ def _map_process_pair_block(
                         distance_max_nm=distance_max_nm,
                     )
                     dr2 = (rr1 - rr0) ** 2
-                    sum_ref[refs, :] += np.sum(np.where(keep, dr2, 0.0), axis=(0, 2))
-                    cnt_ref[refs, :] += np.sum(keep, axis=(0, 2), dtype=np.int64)
+                    sum_ref[r0_index:r1_index, :] += np.sum(np.where(keep, dr2, 0.0), axis=(0, 2))
+                    cnt_ref[r0_index:r1_index, :] += np.sum(keep, axis=(0, 2), dtype=np.int64)
 
-            ref_values = np.full((n_ch, n_pairs), np.nan, dtype=np.float64)
+            ref_values = np.full((n_average_chains, n_pairs), np.nan, dtype=np.float64)
             np.divide(sum_ref, cnt_ref, out=ref_values, where=cnt_ref > 0)
             finite = np.isfinite(ref_values)
-            n_ref = np.sum(finite, axis=0, dtype=np.int64)
+            n_finite_ref = np.sum(finite, axis=0, dtype=np.int64)
             sums = np.sum(np.where(finite, ref_values, 0.0), axis=0)
-            np.divide(sums, n_ref, out=inter_msd[:, li], where=n_ref > 0)
+            np.divide(sums, n_finite_ref, out=inter_msd[:, li], where=n_finite_ref > 0)
             inter_counts[:, li] = np.sum(cnt_ref, axis=0, dtype=np.int64)
 
     # Explicitly keep populated lag-zero MSDs at exactly zero.
@@ -2487,6 +2509,7 @@ def dist_msd_map_from_dcd(
     dcd_files: Union[FileLike, Sequence[FileLike]],
     *,
     chains: Union[str, Sequence[str]] = "protein",
+    reference_chains: Optional[Union[str, Sequence[str]]] = None,
     atom_name: str = "CA",
     mode: str = "both",
     distance_image: str = "hybrid",
@@ -2530,6 +2553,13 @@ def dist_msd_map_from_dcd(
     ``min_intra_sequence_separation`` applies only to intrachain cells. A value of
     1 includes adjacent residues, 2 excludes immediate sequence neighbors, etc.
     Interchain cells include the diagonal and all residue pairs.
+
+    ``reference_chains`` optionally restricts only the chain replicates that are
+    averaged. For intrachain MSDs these are the selected physical chains. For
+    interchain MSDs these are reference chains; their target chains still come
+    from the full ``chains`` selection (excluding self) and are additionally
+    conditioned by the initial-distance window. This permits chain-property
+    filtering of the averaged references without restricting possible neighbors.
     """
     if float(dt_ns) <= 0.0:
         raise ValueError("dt_ns must be > 0")
@@ -2604,6 +2634,48 @@ def dist_msd_map_from_dcd(
     n_res = int(local_sites.shape[1])
     if do_inter and n_ch < 2:
         raise ValueError("need >=2 selected chains for interchain map")
+
+    # The full ``chains`` selection defines all coordinates and all possible
+    # interchain targets.  ``reference_chains`` only chooses which physical chains
+    # contribute equal-weight replicate MSDs to the final average.
+    if reference_chains is None:
+        reference_chain_labels = tuple(chain_labels)
+        reference_indices = np.arange(n_ch, dtype=np.int64)
+    else:
+        (
+            _ref_local_sites,
+            _ref_atom_indices,
+            requested_reference_labels,
+            reference_residue_numbers,
+            _ref_residue_names,
+        ) = _aligned_map_site_atoms(
+            tmpl,
+            chains=reference_chains,
+            atom_name=atom_name,
+        )
+        if not np.array_equal(reference_residue_numbers, residue_numbers):
+            raise ValueError(
+                "reference_chains does not resolve to the same residue-site grid "
+                "as the full chains selection"
+            )
+        chain_index_by_label = {str(label): i for i, label in enumerate(chain_labels)}
+        missing_reference_labels = [
+            str(label)
+            for label in requested_reference_labels
+            if str(label) not in chain_index_by_label
+        ]
+        if missing_reference_labels:
+            raise ValueError(
+                "reference_chains must be a subset of chains; missing labels: "
+                f"{missing_reference_labels}"
+            )
+        reference_chain_labels = tuple(str(label) for label in requested_reference_labels)
+        reference_indices = np.asarray(
+            [chain_index_by_label[label] for label in reference_chain_labels],
+            dtype=np.int64,
+        )
+        if reference_indices.size == 0:
+            raise ValueError("reference_chains selects no chains")
 
     # Inter targets are sampled once and reused for every residue pair, preserving
     # comparable statistics across the entire map.
@@ -2720,6 +2792,7 @@ def dist_msd_map_from_dcd(
                             do_inter=do_inter,
                             origin_chunk=int(origin_chunk),
                             reference_chunk=int(reference_chunk),
+                            reference_indices=reference_indices,
                         )
                     )
             finally:
@@ -2755,6 +2828,7 @@ def dist_msd_map_from_dcd(
                         do_inter=do_inter,
                         origin_chunk=int(origin_chunk),
                         reference_chunk=int(reference_chunk),
+                        reference_indices=reference_indices,
                     )
                     for ri, rj, intra_flag in tasks
                 ]
@@ -2786,6 +2860,12 @@ def dist_msd_map_from_dcd(
         pair_block_size=int(pair_block_size),
         origin_chunk=int(origin_chunk),
         reference_chunk=int(reference_chunk),
+        reference_chain_labels=reference_chain_labels,
+        aggregation=(
+            "reference_replicates_equal_weight"
+            if len(reference_chain_labels) == len(chain_labels)
+            else "selected_reference_replicates_equal_weight"
+        ),
     )
 
 
