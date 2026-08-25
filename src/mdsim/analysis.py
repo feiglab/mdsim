@@ -3217,6 +3217,263 @@ def interchain_distances_from_dcd(
     )
 
 
+def interchain_distances_all_references_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    reference_chains: Union[str, Sequence[str]] = "protein",
+    target_chains: Union[str, Sequence[str]] = "protein",
+    selection: Union[str, Sequence[str]],
+    exclude_reference: bool = True,
+    pbc: bool = True,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+) -> dict[str, InterchainDistanceResult]:
+    """Calculate interchain distances for many reference chains in one DCD pass.
+
+    This is the batched counterpart of :func:`interchain_distances_from_dcd`.
+    The first atom selector is resolved once for every chain in
+    ``reference_chains`` and the second atom selector once for every chain in
+    ``target_chains``.  For each trajectory frame a single vectorized
+    ``(n_reference, n_target)`` distance matrix is evaluated.  The trajectory is
+    therefore read only once, rather than once per reference chain.
+
+    The returned mapping is keyed by the resolved physical reference-chain label.
+    Each value is an ordinary :class:`InterchainDistanceResult`, so downstream
+    code written for the single-reference routine can use the results unchanged.
+
+    Notes
+    -----
+    This routine is primarily an I/O and vectorization optimization.  It normally
+    outperforms launching one process per reference chain because those processes
+    would all reread the same DCD and duplicate topology/trajectory I/O.
+    """
+    if int(stride) <= 0:
+        raise ValueError("stride must be >= 1")
+    if int(chunk) <= 0:
+        raise ValueError("chunk must be >= 1")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    tmpl_model = tmpl.model
+
+    reference_indices, reference_labels, atom_to_chain = _chain_indices_from_selection(
+        tmpl,
+        reference_chains,
+    )
+    if not reference_indices:
+        raise ValueError("reference_chains produced no physical chains")
+
+    target_indices, target_labels, _ = _chain_indices_from_selection(
+        tmpl,
+        target_chains,
+    )
+    if not target_indices:
+        raise ValueError("target_chains produced no physical chains")
+
+    reference_atom_spec, target_atom_spec = _ordered_atom_pair_selection_specs(selection)
+
+    reference_groups = _selection_to_groups(tmpl, reference_atom_spec)
+    if not reference_groups:
+        raise ValueError(f"reference atom selection {reference_atom_spec!r} produced no atoms")
+    reference_atom_set = {
+        int(atom_index)
+        for group in reference_groups
+        for atom_index in np.asarray(group, dtype=np.int64).tolist()
+    }
+
+    target_groups = _selection_to_groups(tmpl, target_atom_spec)
+    if not target_groups:
+        raise ValueError(f"target atom selection {target_atom_spec!r} produced no atoms")
+    target_atom_set = {
+        int(atom_index)
+        for group in target_groups
+        for atom_index in np.asarray(group, dtype=np.int64).tolist()
+    }
+
+    reference_atoms_full = np.empty(len(reference_indices), dtype=np.int64)
+    reference_atom_labels: list[str] = []
+    for out_index, (chain_index, chain_label) in enumerate(
+        zip(reference_indices, reference_labels)
+    ):
+        selected_atoms = sorted(
+            atom_index
+            for atom_index in reference_atom_set
+            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
+        )
+        if len(selected_atoms) != 1:
+            descriptions = [
+                _atom_pair_label(tmpl_model, atom_index) for atom_index in selected_atoms
+            ]
+            raise ValueError(
+                f"reference atom selection {reference_atom_spec!r} must resolve to "
+                f"exactly one atom in chain {chain_label!r}; it selected "
+                f"{len(selected_atoms)}: {descriptions}"
+            )
+        atom_index = int(selected_atoms[0])
+        reference_atoms_full[out_index] = atom_index
+        reference_atom_labels.append(_atom_pair_label(tmpl_model, atom_index))
+
+    target_atoms_full = np.empty(len(target_indices), dtype=np.int64)
+    target_atom_labels: list[str] = []
+    for out_index, (chain_index, chain_label) in enumerate(zip(target_indices, target_labels)):
+        selected_atoms = sorted(
+            atom_index
+            for atom_index in target_atom_set
+            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
+        )
+        if len(selected_atoms) != 1:
+            descriptions = [
+                _atom_pair_label(tmpl_model, atom_index) for atom_index in selected_atoms
+            ]
+            raise ValueError(
+                f"target atom selection {target_atom_spec!r} must resolve to "
+                f"exactly one atom in chain {chain_label!r}; it selected "
+                f"{len(selected_atoms)}: {descriptions}"
+            )
+        atom_index = int(selected_atoms[0])
+        target_atoms_full[out_index] = atom_index
+        target_atom_labels.append(_atom_pair_label(tmpl_model, atom_index))
+
+    atom_indices_full = sorted(set(reference_atoms_full.tolist()) | set(target_atoms_full.tolist()))
+    index_map = {old: new for new, old in enumerate(atom_indices_full)}
+    reference_atoms_sel = np.asarray(
+        [index_map[int(atom_index)] for atom_index in reference_atoms_full],
+        dtype=np.int64,
+    )
+    target_atoms_sel = np.asarray(
+        [index_map[int(atom_index)] for atom_index in target_atoms_full],
+        dtype=np.int64,
+    )
+
+    box_fallback = None
+    if bool(pbc) and box_nm is not None:
+        box_fallback = _box_lengths_nm(box_nm)
+
+    target_index_array = np.asarray(target_indices, dtype=np.int64)
+    reference_index_array = np.asarray(reference_indices, dtype=np.int64)
+    if bool(exclude_reference):
+        keep_matrix = target_index_array[None, :] != reference_index_array[:, None]
+    else:
+        keep_matrix = np.ones(
+            (len(reference_indices), len(target_indices)),
+            dtype=bool,
+        )
+
+    retained_counts = np.sum(keep_matrix, axis=1, dtype=np.int64)
+    if np.any(retained_counts <= 0):
+        bad = int(np.flatnonzero(retained_counts <= 0)[0])
+        raise ValueError(f"no target chains remain for reference chain {reference_labels[bad]!r}")
+
+    # In the usual all-reference/all-target use case every reference retains the
+    # same number of targets (N-1 when self is excluded).  Store only those
+    # retained distances while streaming, avoiding a second full
+    # (n_reference,n_target,n_frames) tensor at finalization.
+    uniform_retained = bool(np.all(retained_counts == retained_counts[0]))
+    n_retained = int(retained_counts[0]) if uniform_retained else -1
+
+    distance_frames: list[np.ndarray] = []
+    for dcd in dcd_list:
+        for frame_index, (xyz_sel_nm, box_frame_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if frame_index < int(frame_start):
+                continue
+            if frame_stop is not None and frame_index >= int(frame_stop):
+                break
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            reference_positions = xyz[reference_atoms_sel, :]
+            target_positions = xyz[target_atoms_sel, :]
+            displacement = target_positions[None, :, :] - reference_positions[:, None, :]
+
+            if bool(pbc):
+                if box_frame_nm is None:
+                    if box_fallback is None:
+                        raise ValueError(
+                            "DCD lacks unit-cell lengths; pass box_nm=(Lx,Ly,Lz) "
+                            "in nm or set pbc=False"
+                        )
+                    box = box_fallback
+                else:
+                    box = _box_lengths_nm(box_frame_nm)
+                displacement -= np.rint(displacement / box.reshape(1, 1, 3)) * box.reshape(1, 1, 3)
+
+            matrix = np.linalg.norm(displacement, axis=2).astype(
+                np.float64,
+                copy=False,
+            )
+            if uniform_retained:
+                distance_frames.append(
+                    matrix[keep_matrix].reshape(len(reference_indices), n_retained)
+                )
+            else:
+                # Rare mixed case (some references are absent from target_chains).
+                # Keep the full matrix so each reference can retain a different
+                # number of target rows during finalization.
+                distance_frames.append(matrix)
+
+    if not distance_frames:
+        raise ValueError("no frames selected")
+
+    all_distances = np.stack(distance_frames, axis=2)
+
+    results: dict[str, InterchainDistanceResult] = {}
+    for ref_out, (reference_chain_index, reference_chain_label) in enumerate(
+        zip(reference_indices, reference_labels)
+    ):
+        keep = keep_matrix[ref_out]
+        if uniform_retained:
+            distance_per_chain = all_distances[ref_out, :, :]
+        else:
+            distance_per_chain = all_distances[ref_out, keep, :]
+        distance_mean = np.nanmean(distance_per_chain, axis=0)
+        n_chains = int(distance_per_chain.shape[0])
+        if n_chains < 2:
+            distance_stderr = np.zeros_like(distance_mean)
+        else:
+            distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(
+                float(n_chains)
+            )
+
+        results[str(reference_chain_label)] = InterchainDistanceResult(
+            distance_per_chain_nm=np.asarray(distance_per_chain, dtype=np.float64),
+            distance_mean_nm=np.asarray(distance_mean, dtype=np.float64),
+            distance_stderr_nm=np.asarray(distance_stderr, dtype=np.float64),
+            chain_labels=tuple(
+                str(label) for label, retain in zip(target_labels, keep.tolist()) if retain
+            ),
+            reference_chain_label=str(reference_chain_label),
+            reference_atom_label=reference_atom_labels[ref_out],
+            target_atom_labels=tuple(
+                label for label, retain in zip(target_atom_labels, keep.tolist()) if retain
+            ),
+            reference_atom_index=int(reference_atoms_full[ref_out]),
+            target_atom_indices=np.asarray(target_atoms_full[keep], dtype=np.int64),
+            n_chains=n_chains,
+            n_frames=int(distance_per_chain.shape[1]),
+            selection=selection,
+            exclude_reference=bool(exclude_reference),
+            pbc=bool(pbc),
+        )
+
+    return results
+
+
 @dataclass(frozen=True)
 class ReferenceCenterDistanceResult:
     """Distances of selected chain centers from a PBC-aware reference center.
