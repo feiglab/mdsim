@@ -9,22 +9,23 @@ also be processed without importing the analysis module.
 Two *different* trajectory observables are provided and must not be treated as
 mathematically interchangeable:
 
-* ``quench`` / ``quench_all`` calculate a first-quenching survival function
-  from the integrated conditional hazard ``q[r(t)] dt``. This is an absorbing,
-  renewal-style model: the first quenching event ends that observation window
-  and all paths that have quenched receive zero subsequent weight. It is useful
-  when adopting the reaction--diffusion/first-passage interpretation of the
-  Atto--Trp experiment.
-* ``fluorescence_autocorrelation`` calculates the equilibrium autocorrelation
-  of a simulated fluorescence-brightness signal. This is the more direct
-  analogue of what FCS measures and allows quenching/rebrightening cycles
-  between the two endpoints of a correlation interval.
+* ``reactive_quenching_correlation`` / ``reactive_quenching_correlation_all``
+  calculate the finite-``q(r)`` first-quenching survival propagator from the
+  integrated conditional hazard ``q[r(t)] dt``.  This is the preferred
+  simulation counterpart of the Trp-quenching ``k_obs`` used in the
+  reaction--diffusion interpretation of the Atto--Trp FCS experiment.  It does
+  **not** assume diffusion-limited quenching: finite ``q(r)`` is retained.
+* ``brightness_autocorrelation`` / ``brightness_autocorrelation_all`` calculate
+  the equilibrium autocorrelation of an instantaneous relative-brightness
+  signal.  This is useful as a diagnostic of the persistence/relaxation of
+  quenching-competent configurations, but its fitted rate is not generally the
+  experimental Trp-quenching ``k_obs``.
 
-The two decays can share a characteristic time in a diffusion-limited,
-fast-reset limit, but they generally differ when recovery/dissociation and
-rebinding are important. The approximately 2 ns Atto singlet lifetime is
-coarse-grained out of the microsecond first-quenching survival calculation; it
-enters only the optional instantaneous dynamic-yield brightness mapping.
+The older names ``quench`` / ``quench_all`` and
+``fluorescence_autocorrelation`` / ``fluorescence_autocorrelation_all`` remain
+for backward compatibility.  The approximately 2 ns Atto singlet lifetime is
+coarse-grained out of the microsecond reactive-quenching correlation; it enters
+only the optional instantaneous dynamic-yield brightness mapping.
 """
 
 from __future__ import annotations
@@ -604,7 +605,7 @@ def quench_all(
     return transform(data, "data")
 
 
-# --- FCS-like fluorescence signal and autocorrelation -------------------------
+# --- instantaneous brightness signal and brightness autocorrelation ------------
 
 
 @dataclass(frozen=True)
@@ -621,13 +622,16 @@ class FluorescenceSignalResult:
     ``brightness(r) = k_intrinsic / (k_intrinsic + q(r))``.
 
     This mapping coarse-grains rapid repeated excitation/emission cycles and is
-    suitable for constructing an equilibrium FCS-like intensity signal. It
-    does not explicitly model a persistent nonfluorescent ground-state
+    suitable for constructing an equilibrium brightness signal.  Its
+    autocorrelation is a diagnostic of persistence/relaxation of
+    quenching-competent configurations; it should not in general be identified
+    with the experimental Trp-quenching k_obs.  It does not explicitly model a
+    persistent nonfluorescent ground-state
     Atto--Trp complex; such a state would require an additional association /
     dissociation kinetic model.
 
     ``brightness_per_chain`` has shape ``(n_chains, n_frames)``.  This is an
-    equilibrium fluorescence observable for constructing an FCS-like intensity
+    equilibrium fluorescence observable for constructing a brightness
     autocorrelation; it is distinct from :class:`QuenchingDecayResult`, whose
     interval hazards are integrated to make an irreversible survival curve.
     """
@@ -691,13 +695,15 @@ class FluorescenceSignalResult:
 
 @dataclass(frozen=True)
 class FluorescenceAutocorrelationResult:
-    """Per-chain autocorrelation of a simulated fluorescence signal.
+    """Per-chain autocorrelation of the simulated instantaneous brightness.
 
     For ``normalization='fcs'`` the returned curve is
 
     ``<delta I(t) delta I(t+lag)> / <I>**2``,
 
-    matching the internal-state contribution to a normalized FCS correlation.
+    as a normalized brightness-fluctuation correlation.  This observable
+    characterizes persistence/relaxation of quenching propensity and is not, in
+    general, the same as the reactive Trp-quenching k_obs.
     ``normalization='coefficient'`` instead divides by the zero-lag variance so
     that the curve begins at one, and ``'covariance'`` leaves the covariance in
     signal-squared units.
@@ -1090,15 +1096,15 @@ def fluorescence_autocorrelation(
     unbiased: bool = True,
     min_pairs: int = 2,
 ) -> FluorescenceAutocorrelationResult:
-    """Calculate per-chain fluorescence autocorrelations using FFTs.
+    """Calculate per-chain instantaneous-brightness autocorrelations using FFTs.
 
     The default ``normalization='fcs'`` returns
 
-    ``G_internal(lag) = <delta B(t) delta B(t+lag)> / <B>**2``.
+    ``C_B(lag) = <delta B(t) delta B(t+lag)> / <B>**2``.
 
-    This quantity can be compared with the fitted intramolecular term
-    ``A_I exp(-lag/tau_I)`` after translational diffusion and dye-specific
-    photophysical components have been separated experimentally.
+    This is an equilibrium brightness/contact-persistence diagnostic.  Its
+    fitted relaxation rate is not, in general, the experimental Trp-quenching
+    ``k_obs``; use :func:`reactive_quenching_correlation` for that comparison.
 
     ``lag_spacing_ps`` thins the regularly sampled correlation to the nearest
     integer number of trajectory frames. It is mutually exclusive with a
@@ -1235,7 +1241,7 @@ def fluorescence_autocorrelation_all(
     unbiased: bool = True,
     min_pairs: int = 2,
 ) -> FluorescenceCorrelationOutput:
-    """Recursively calculate FCS-like autocorrelations for signal results."""
+    """Recursively calculate instantaneous-brightness autocorrelations."""
 
     def transform(value: Any, path: str) -> FluorescenceCorrelationOutput:
         if _result_has_field(value, signal_field) and _result_has_field(value, "time_ps"):
@@ -1263,17 +1269,53 @@ def fluorescence_autocorrelation_all(
     return transform(data, "data")
 
 
-# Explicit names that distinguish the absorbing first-event observable from FCS.
-first_quench_survival = quench
-first_quench_survival_all = quench_all
+# Preferred terminology ---------------------------------------------------------
+#
+# The reactive-quenching correlation is the finite-q(r) first-event/survival
+# propagator used as the simulation counterpart of the experimental Trp-quenching
+# k_obs.  The brightness autocorrelation is a separate equilibrium diagnostic of
+# persistence/relaxation of the instantaneous quenching propensity.
+ReactiveQuenchingHazardResult = QuenchingDecayResult
+ReactiveQuenchingCorrelationResult = QuenchingCurveResult
+ReactiveQuenchingOutput = QuenchingOutput
+BrightnessSignalResult = FluorescenceSignalResult
+BrightnessAutocorrelationResult = FluorescenceAutocorrelationResult
+BrightnessSignalOutput = FluorescenceSignalOutput
+BrightnessCorrelationOutput = FluorescenceCorrelationOutput
 
-# Concise aliases for notebook code that prefers explicit FCS terminology.
-apply_fcs_signal = apply_fluorescence_signal
-fcs_autocorrelation = fluorescence_autocorrelation
-fcs_autocorrelation_all = fluorescence_autocorrelation_all
+apply_reactive_quenching_hazard = apply_decay
+reactive_quenching_correlation = quench
+reactive_quenching_correlation_all = quench_all
+
+apply_brightness_signal = apply_fluorescence_signal
+brightness_autocorrelation = fluorescence_autocorrelation
+brightness_autocorrelation_all = fluorescence_autocorrelation_all
+
+# Backward-compatible aliases retained for existing notebooks.
+first_quench_survival = reactive_quenching_correlation
+first_quench_survival_all = reactive_quenching_correlation_all
+apply_fcs_signal = apply_brightness_signal
+fcs_autocorrelation = brightness_autocorrelation
+fcs_autocorrelation_all = brightness_autocorrelation_all
 
 
 __all__ = [
+    # Preferred reactive-quenching names
+    "ReactiveQuenchingHazardResult",
+    "ReactiveQuenchingCorrelationResult",
+    "ReactiveQuenchingOutput",
+    "apply_reactive_quenching_hazard",
+    "reactive_quenching_correlation",
+    "reactive_quenching_correlation_all",
+    # Preferred brightness-autocorrelation names
+    "BrightnessSignalResult",
+    "BrightnessAutocorrelationResult",
+    "BrightnessSignalOutput",
+    "BrightnessCorrelationOutput",
+    "apply_brightness_signal",
+    "brightness_autocorrelation",
+    "brightness_autocorrelation_all",
+    # Original class/function names retained for compatibility
     "FluorescenceAutocorrelationResult",
     "FluorescenceCorrelationOutput",
     "FluorescenceSignalOutput",
@@ -1283,14 +1325,15 @@ __all__ = [
     "QuenchingInput",
     "QuenchingOutput",
     "apply_decay",
-    "apply_fcs_signal",
     "apply_fluorescence_signal",
-    "fcs_autocorrelation",
-    "fcs_autocorrelation_all",
-    "first_quench_survival",
-    "first_quench_survival_all",
     "fluorescence_autocorrelation",
     "fluorescence_autocorrelation_all",
     "quench",
     "quench_all",
+    # Older explicit aliases
+    "apply_fcs_signal",
+    "fcs_autocorrelation",
+    "fcs_autocorrelation_all",
+    "first_quench_survival",
+    "first_quench_survival_all",
 ]
