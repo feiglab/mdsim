@@ -407,35 +407,64 @@ def apply_decay(
     return transform(data, "data")
 
 
-def quench(arr: np.ndarray, tres: float = 100.0) -> np.ndarray:
+def _normalize_condition_mode(mode: str) -> str:
+    """Normalize trajectory-conditioning names used by :func:`quench`."""
+    if not isinstance(mode, str):
+        raise TypeError("condition_mode must be a string")
+    value = mode.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "origin": "origin",
+        "t0": "origin",
+        "initial": "origin",
+        "start": "origin",
+        "continuous": "continuous",
+        "path": "continuous",
+        "all_times": "continuous",
+        "until_violation": "continuous",
+        "endpoint": "endpoint",
+        "final": "endpoint",
+        "current": "endpoint",
+        "origin_endpoint": "origin_endpoint",
+        "start_end": "origin_endpoint",
+        "t0_endpoint": "origin_endpoint",
+        "both_ends": "origin_endpoint",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "condition_mode must be 'origin', 'continuous', 'endpoint', " "or 'origin_endpoint'"
+        )
+    return aliases[value]
+
+
+def quench(
+    arr: np.ndarray,
+    tres: float = 100.0,
+    *,
+    condition: Optional[np.ndarray] = None,
+    condition_mode: str = "origin",
+) -> np.ndarray:
     """Calculate one time-origin-averaged first-quenching survival curve.
 
     For a time origin ``t0`` and lag ``tau`` this evaluates
 
     ``S(tau|t0) = exp[-integral(t0,t0+tau) q(r(t)) dt]``
 
-    and averages over time origins. The construction assumes that ``q(r)`` is
-    a conditional Poisson hazard and that the first quenching event is an
-    absorbing event which completely erases the correlation memory for that
-    observation window. Rebrightening or dissociation followed by renewed
-    emission inside the same interval is therefore excluded. This is not, in
-    general, the same quantity as a fluorescence-intensity autocorrelation.
+    and averages over admitted time origins/endpoints.  With ``condition=None``
+    this is the original unconditioned calculation.  A boolean ``condition``
+    array with one value per trajectory frame enables four conditioning rules:
 
-    Parameters
-    ----------
-    arr
-        Two-column array ``(time_ps, interval_hazard)``.  Hazard value ``k``
-        applies to interval ``[time[k], time[k+1]]``; the final hazard value is
-        therefore not integrated.
-    tres
-        Lag-time bin spacing in picoseconds.  Lag times are assigned to the
-        nearest bin, reproducing the original implementation.
+    ``origin``
+        Require the condition only at the time origin.
+    ``continuous``
+        Require it at the origin and every sampled frame through the endpoint.
+        Once it fails, later endpoints from that origin are excluded.
+    ``endpoint``
+        Require it only at the endpoint; the path before that endpoint is ignored.
+    ``origin_endpoint``
+        Require it at both the origin and endpoint, ignoring intermediate frames.
 
-    Returns
-    -------
-    ndarray
-        ``(n_populated_bins, 3)`` with columns ``lag_time_ps``, mean survival,
-        and the number of time-origin pairs contributing to the bin.
+    ``counts`` in the returned third column is the number of admitted
+    time-origin/endpoint pairs in each lag bin.
     """
     tres_value = _finite_scalar(tres, name="tres")
     if tres_value <= 0.0:
@@ -455,6 +484,30 @@ def quench(arr: np.ndarray, tres: float = 100.0) -> np.ndarray:
     if not np.all(np.diff(t) > 0.0):
         raise ValueError("time values must be strictly increasing")
 
+    mode = _normalize_condition_mode(condition_mode)
+    if condition is None:
+        condition_values = None
+        fail_prefix = None
+    else:
+        raw_condition = np.asarray(condition)
+        if raw_condition.shape != (n,):
+            raise ValueError(f"condition must have shape ({n},); got {raw_condition.shape}")
+        # Numeric/object masks are deliberately converted through bool only after
+        # rejecting non-finite floating values.  The notebook wrapper normally
+        # passes an already thresholded boolean mask.
+        if np.issubdtype(raw_condition.dtype, np.number):
+            numeric = np.asarray(raw_condition, dtype=np.float64)
+            if not np.all(np.isfinite(numeric)):
+                raise ValueError("condition values must be finite")
+        condition_values = np.asarray(raw_condition, dtype=bool)
+        if mode == "continuous":
+            failures = (~condition_values).astype(np.int64)
+            fail_prefix = np.empty(n + 1, dtype=np.int64)
+            fail_prefix[0] = 0
+            np.cumsum(failures, out=fail_prefix[1:])
+        else:
+            fail_prefix = None
+
     # ex[k] is the integrated hazard on [t[k], t[k+1]].
     ex_step = ex[:-1]
 
@@ -473,11 +526,28 @@ def quench(arr: np.ndarray, tres: float = 100.0) -> np.ndarray:
     nacc = np.zeros(nmaxacc, dtype=np.int64)
 
     for i in range(n - 1):
+        endpoints = np.arange(i + 1, n, dtype=np.int64)
         dt = t[i + 1 :] - t[i]
         bins = (dt / tres_value + 0.5).astype(np.int64)
         integrated_hazard = prefix[i + 1 :] - prefix[i]
 
         keep = (bins > 0) & (bins < nmaxacc)
+        if condition_values is not None:
+            if mode == "origin":
+                if not bool(condition_values[i]):
+                    continue
+            elif mode == "endpoint":
+                keep &= condition_values[endpoints]
+            elif mode == "origin_endpoint":
+                if not bool(condition_values[i]):
+                    continue
+                keep &= condition_values[endpoints]
+            else:  # continuous
+                assert fail_prefix is not None
+                # Inclusive [i, endpoint]: the condition must still hold at the
+                # frame at which S(tau) is evaluated.
+                keep &= (fail_prefix[endpoints + 1] - fail_prefix[i]) == 0
+
         if np.any(keep):
             acc += np.bincount(
                 bins[keep],
