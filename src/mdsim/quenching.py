@@ -89,9 +89,11 @@ class QuenchingDecayResult:
 class QuenchingCurveResult:
     """Time-origin-averaged first-quenching survival curves.
 
-    ``survival_per_chain`` and ``counts_per_chain`` have shape
-    ``(n_chains, n_lag_bins)``. The values reproduce :func:`quench` applied
-    independently to every chain in a :class:`QuenchingDecayResult`.
+    ``survival_per_chain`` and ``counts_per_chain`` normally have shape
+    ``(n_chains, n_lag_bins)`` and contain one row per physical chain.  For
+    ``row_kind='segment'`` they instead contain one row per qualifying contiguous
+    condition-satisfying trajectory segment.  The legacy field names are retained
+    so existing averaging and fitting code can consume either representation.
 
     This object is an absorbing first-event observable, not an equilibrium
     fluorescence autocorrelation. A path contributes at lag ``tau`` only when
@@ -99,13 +101,20 @@ class QuenchingCurveResult:
     """
 
     lag_time_ps: np.ndarray  # (n_lag_bins,)
-    survival_per_chain: np.ndarray  # (n_chains, n_lag_bins)
-    counts_per_chain: np.ndarray  # (n_chains, n_lag_bins)
-    chain_labels: tuple[str, ...]
-    n_chains: int
+    survival_per_chain: np.ndarray  # (n_rows, n_lag_bins)
+    counts_per_chain: np.ndarray  # (n_rows, n_lag_bins)
+    chain_labels: tuple[str, ...]  # one label per row
+    n_chains: int  # number of rows; segments for row_kind='segment'
     n_frames: int
     n_lag_bins: int
     tres_ps: float
+    row_kind: str = "chain"
+    source_chain_labels: tuple[str, ...] = ()
+    segment_start_frames: tuple[int, ...] = ()  # original trajectory indices
+    segment_stop_frames: tuple[int, ...] = ()  # exclusive
+    segment_origin_counts: tuple[int, ...] = ()
+    fixed_horizon_ps: Optional[float] = None
+    condition_mode: Optional[str] = None
 
     @property
     def time_ps(self) -> np.ndarray:
@@ -119,11 +128,35 @@ class QuenchingCurveResult:
 
     @property
     def series(self) -> tuple[np.ndarray, ...]:
-        """Return one ``(lag time, mean survival, count)`` array per chain."""
+        """Return one ``(lag time, mean survival, count)`` array per row."""
         return tuple(
             np.column_stack((self.lag_time_ps, values, counts))
             for values, counts in zip(self.survival_per_chain, self.counts_per_chain)
         )
+
+
+@dataclass(frozen=True)
+class FixedHorizonSegmentCurveResult:
+    """Fixed-cohort survival curves for qualifying contiguous trajectory segments.
+
+    Every row represents one maximal contiguous ``True`` segment that is long
+    enough to support at least one time origin with ``fixed_horizon_ps`` of
+    qualifying trajectory remaining.  Within a segment, the same eligible time
+    origins contribute at every reported lag.  Segment start/stop indices refer
+    to the input array, and stop indices are exclusive.
+    """
+
+    lag_time_ps: np.ndarray
+    survival_per_segment: np.ndarray
+    counts_per_segment: np.ndarray
+    segment_start_frames: tuple[int, ...]
+    segment_stop_frames: tuple[int, ...]
+    segment_origin_counts: tuple[int, ...]
+    n_segments: int
+    n_frames: int
+    delta_t_ps: float
+    fixed_horizon_ps: float
+    tres_ps: float
 
 
 QuenchingInput = Union[Any, Mapping[Any, "QuenchingInput"]]
@@ -405,6 +438,195 @@ def apply_decay(
         )
 
     return transform(data, "data")
+
+
+def _fixed_horizon_timestep_ps(time_ps: np.ndarray) -> float:
+    """Return and validate the regular trajectory timestep used by segment mode."""
+    time = np.asarray(time_ps, dtype=np.float64).reshape(-1)
+    if time.size < 2:
+        raise ValueError("time values must contain at least two frames")
+    if not np.all(np.isfinite(time)):
+        raise ValueError("time values must be finite")
+    steps = np.diff(time)
+    if np.any(steps <= 0.0):
+        raise ValueError("time values must be strictly increasing")
+    dt = float(np.median(steps))
+    tolerance = max(1.0e-9, abs(dt) * 1.0e-8)
+    if not np.allclose(steps, dt, rtol=1.0e-8, atol=tolerance):
+        raise ValueError("fixed-horizon segment mode requires regularly spaced trajectory frames")
+    return dt
+
+
+def _boolean_condition(condition: Any, *, n_frames: int) -> np.ndarray:
+    """Validate one frame mask and return it as a boolean array."""
+    raw = np.asarray(condition)
+    if raw.shape != (int(n_frames),):
+        raise ValueError(f"condition must have shape ({int(n_frames)},); got {raw.shape}")
+    if np.issubdtype(raw.dtype, np.number):
+        numeric = np.asarray(raw, dtype=np.float64)
+        if not np.all(np.isfinite(numeric)):
+            raise ValueError("condition values must be finite")
+    return np.asarray(raw, dtype=bool)
+
+
+def quench_fixed_horizon_segments(
+    arr: np.ndarray,
+    *,
+    condition: np.ndarray,
+    fixed_horizon_ps: float,
+    tres: float = 100.0,
+) -> FixedHorizonSegmentCurveResult:
+    """Calculate one fixed-cohort survival curve per qualifying trajectory segment.
+
+    The boolean ``condition`` is split into maximal contiguous ``True`` segments.
+    A segment is retained only when it contains at least one origin ``i`` for
+    which the condition remains true through the first sampled frame at or after
+    ``fixed_horizon_ps``.  All such origins within that segment form a fixed
+    cohort.  Exactly that cohort is used for every reported lag not exceeding the
+    horizon, so the contributing origin population cannot change with lag.
+
+    A segment longer than the horizon can contribute several time origins, just
+    as a separately simulated single-chain trajectory would.  The returned rows
+    remain separate so callers can average segment survival curves equally rather
+    than implicitly weighting long segments by their number of windows.
+
+    ``counts_per_segment`` retains the number of raw origin/endpoint pairs in each
+    lag bin.  With regularly spaced input, every selected origin contributes the
+    same endpoint offsets to every segment curve.
+    """
+    tres_value = _finite_scalar(tres, name="tres")
+    horizon_value = _finite_scalar(fixed_horizon_ps, name="fixed_horizon_ps")
+    if tres_value <= 0.0:
+        raise ValueError("tres must be > 0")
+    if horizon_value <= 0.0:
+        raise ValueError("fixed_horizon_ps must be > 0")
+
+    values = np.asarray(arr, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 2:
+        raise ValueError(f"arr must have shape (n_frames, 2); got {values.shape}")
+
+    time = values[:, 0]
+    ex = values[:, 1]
+    n_frames = int(time.size)
+    if n_frames < 2:
+        raise ValueError("fixed-horizon segment mode requires at least two frames")
+
+    dt_ps = _fixed_horizon_timestep_ps(time)
+    mask = _boolean_condition(condition, n_frames=n_frames)
+
+    # The cohort must remain in the selected state through the first trajectory
+    # frame at or after the requested horizon.  Reported lags use actual sampled
+    # endpoints at or before the horizon.
+    frame_tolerance = 1.0e-10
+    horizon_intervals = int(math.ceil(horizon_value / dt_ps - frame_tolerance))
+    output_intervals = int(math.floor(horizon_value / dt_ps + frame_tolerance))
+    if output_intervals < 1:
+        raise ValueError(
+            "fixed_horizon_ps is shorter than one trajectory timestep; "
+            "no positive lag can be calculated"
+        )
+    horizon_intervals = max(1, horizon_intervals)
+
+    offsets = np.arange(1, output_intervals + 1, dtype=np.int64)
+    actual_lags = offsets.astype(np.float64) * dt_ps
+    bins = np.floor(actual_lags / tres_value + 0.5).astype(np.int64)
+    time_tolerance = max(1.0e-9, abs(horizon_value) * 1.0e-12, abs(dt_ps) * 1.0e-8)
+    use_offset = (bins > 0) & (
+        bins.astype(np.float64) * tres_value <= horizon_value + time_tolerance
+    )
+    if not np.any(use_offset):
+        raise ValueError(
+            "fixed_horizon_ps and tres produce no positive lag bins at the "
+            "trajectory sampling interval"
+        )
+    offsets = offsets[use_offset]
+    bins = bins[use_offset]
+    populated_bins = np.unique(bins)
+    max_bin = int(populated_bins[-1])
+
+    # ex[k] is the integrated interval hazard on [time[k], time[k+1]].
+    # Treat +inf as an absorbing zero-survival interval without allowing the
+    # usual inf-inf prefix-subtraction ambiguity. NaN and negative hazards are
+    # invalid for a survival process.
+    ex_step = np.asarray(ex[:-1], dtype=np.float64)
+    if np.any(np.isnan(ex_step)) or np.any(ex_step < 0.0):
+        raise ValueError("interval hazards must be non-negative and not NaN")
+    infinite_step = np.isposinf(ex_step)
+
+    prefix = np.empty(n_frames, dtype=np.float64)
+    prefix[0] = 0.0
+    np.cumsum(np.where(infinite_step, 0.0, ex_step), out=prefix[1:])
+
+    infinite_prefix = np.empty(n_frames, dtype=np.int64)
+    infinite_prefix[0] = 0
+    np.cumsum(infinite_step.astype(np.int64), out=infinite_prefix[1:])
+
+    padded = np.concatenate((np.asarray([False]), mask, np.asarray([False])))
+    segment_starts_all = np.flatnonzero((~padded[:-1]) & padded[1:])
+    segment_stops_all = np.flatnonzero(padded[:-1] & (~padded[1:]))
+
+    survival_rows: list[np.ndarray] = []
+    count_rows: list[np.ndarray] = []
+    segment_starts: list[int] = []
+    segment_stops: list[int] = []
+    origin_counts: list[int] = []
+
+    for start_raw, stop_raw in zip(segment_starts_all, segment_stops_all):
+        start = int(start_raw)
+        stop = int(stop_raw)  # exclusive
+        n_origins = int(stop - start - horizon_intervals)
+        if n_origins <= 0:
+            continue
+
+        # origin + horizon_intervals must still be a True frame, hence the
+        # exclusive upper bound stop - horizon_intervals.
+        origins = range(start, stop - horizon_intervals)
+        acc = np.zeros(max_bin + 1, dtype=np.float64)
+        nacc = np.zeros(max_bin + 1, dtype=np.int64)
+
+        for origin in origins:
+            endpoint_indices = origin + offsets
+            integrated_hazard = prefix[endpoint_indices] - prefix[origin]
+            integrated_hazard = np.maximum(integrated_hazard, 0.0)
+            contains_infinite = (infinite_prefix[endpoint_indices] - infinite_prefix[origin]) > 0
+            if np.any(contains_infinite):
+                integrated_hazard[contains_infinite] = np.inf
+            weights = np.exp(-integrated_hazard)
+            acc += np.bincount(bins, weights=weights, minlength=max_bin + 1)
+            nacc += np.bincount(bins, minlength=max_bin + 1)
+
+        if np.any(nacc[populated_bins] <= 0):
+            raise RuntimeError(
+                "internal fixed-horizon error: a retained segment has an empty lag bin"
+            )
+
+        survival_rows.append(acc[populated_bins] / nacc[populated_bins])
+        count_rows.append(nacc[populated_bins].astype(np.float64))
+        segment_starts.append(start)
+        segment_stops.append(stop)
+        origin_counts.append(n_origins)
+
+    lag_time = populated_bins.astype(np.float64) * tres_value
+    if survival_rows:
+        survival = np.stack(survival_rows, axis=0)
+        counts = np.stack(count_rows, axis=0)
+    else:
+        survival = np.zeros((0, lag_time.size), dtype=np.float64)
+        counts = np.zeros((0, lag_time.size), dtype=np.float64)
+
+    return FixedHorizonSegmentCurveResult(
+        lag_time_ps=lag_time,
+        survival_per_segment=survival,
+        counts_per_segment=counts,
+        segment_start_frames=tuple(segment_starts),
+        segment_stop_frames=tuple(segment_stops),
+        segment_origin_counts=tuple(origin_counts),
+        n_segments=int(len(segment_starts)),
+        n_frames=n_frames,
+        delta_t_ps=float(dt_ps),
+        fixed_horizon_ps=float(horizon_value),
+        tres_ps=float(tres_value),
+    )
 
 
 def _normalize_condition_mode(mode: str) -> str:
@@ -1392,6 +1614,7 @@ __all__ = [
     "FluorescenceSignalResult",
     "QuenchingCurveResult",
     "QuenchingDecayResult",
+    "FixedHorizonSegmentCurveResult",
     "QuenchingInput",
     "QuenchingOutput",
     "apply_decay",
@@ -1400,6 +1623,7 @@ __all__ = [
     "fluorescence_autocorrelation_all",
     "quench",
     "quench_all",
+    "quench_fixed_horizon_segments",
     # Older explicit aliases
     "apply_fcs_signal",
     "fcs_autocorrelation",
