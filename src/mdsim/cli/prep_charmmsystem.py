@@ -87,7 +87,7 @@ def _expand_forcefields(paths: Sequence[str]) -> list[str]:
 
 def _default_forcefields() -> list[str]:
     ffdir = Path.home() / "ff"
-    return _expand_forcefields([str(ffdir / "par_all36m_prot.prm"), str(ffdir / "waters_ions.prm")])
+    return _expand_forcefields([str(ffdir / "par_all36m_prot.prm"), str(ffdir / "water_ions.prm")])
 
 
 def _validate_forcefields(ff: Sequence[str]) -> None:
