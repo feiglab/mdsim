@@ -2435,6 +2435,9 @@ _AMINO_ACID_RESNAMES: set[str] = {
     "TRP",
     "TYR",
     "VAL",
+    # Project-specific noncanonical amino-acid residue.  Including it here makes
+    # StructureSelector("protein") / StructureSelector("protein.CA") retain CAT.
+    "CAT",
 }
 
 # Simple solvent/ion classes.

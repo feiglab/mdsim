@@ -159,6 +159,27 @@ class ResidueContactMapResult:
         return "contacts per reference chain per frame"
 
 
+# Residue-name aliases that represent the same sequence position for contact-map
+# purposes.  Contact maps are indexed by residue number and one selected atom
+# (normally CA), so force-field/protonation-state aliases should not make
+# otherwise homologous chains incompatible.
+_CONTACT_RESIDUE_NAME_ALIASES: dict[str, str] = {
+    "HIS": "HIS",
+    "HSD": "HIS",
+    "HSE": "HIS",
+    "HSP": "HIS",
+    "HID": "HIS",
+    "HIE": "HIS",
+    "HIP": "HIS",
+}
+
+
+def _canonical_contact_residue_name(name: Any) -> str:
+    """Normalize residue names used to verify homologous contact-map axes."""
+    raw = str(name or "").strip().upper()
+    return _CONTACT_RESIDUE_NAME_ALIASES.get(raw, raw)
+
+
 def _ca_atom_matrix_for_chains(
     template: Any,
     chain_selection: Union[str, Sequence[str]],
@@ -209,7 +230,7 @@ def _ca_atom_matrix_for_chains(
                 raise RuntimeError("selected atom is missing from the model atom list")
             atoms.append(int(index))
             numbers.append(int(getattr(residue, "resnum")))
-            names.append(str(getattr(residue, "resname", "") or ""))
+            names.append(_canonical_contact_residue_name(getattr(residue, "resname", "")))
 
         if not atoms:
             raise ValueError(f"{argument_name} chain {chain_label!r} contains no residues")
@@ -232,7 +253,8 @@ def _ca_atom_matrix_for_chains(
         if names != reference_names:
             raise ValueError(
                 f"{argument_name} chain {chain_label!r} does not share the same "
-                "residue-name sequence as the first selected chain"
+                "canonical residue-name sequence as the first selected chain: "
+                f"{names} vs. {reference_names}"
             )
 
     return (
