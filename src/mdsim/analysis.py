@@ -4,7 +4,7 @@ import io
 import math
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -2312,6 +2312,10 @@ class IntrachainDistanceResult:
     n_frames: int
     selection: Any
     pbc: bool
+    selection_mode: str = "atom"  # "atom" | "residue"
+    include_hydrogens: bool = False
+    sidechain_only: bool = False
+    site_atom_indices: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = ()
 
 
 def _chain_indices_from_selection(
@@ -2382,12 +2386,208 @@ def _atom_pair_label(model: Any, atom_index: int) -> str:
     return f"{resname}{resnum}.{name}"
 
 
+# Backbone/terminal atoms excluded by residue-pair side-chain-only analyses.
+# This list intentionally follows the notebook-facing definition rather than
+# trying to infer molecular connectivity.
+_PAIR_BACKBONE_ATOM_NAMES = frozenset(
+    {
+        "CA",
+        "N",
+        "C",
+        "O",
+        "HN",
+        "HA",
+        "HA1",
+        "HA2",
+        "OT1",
+        "OT2",
+        "OXT",
+        "HT1",
+        "HT2",
+        "HT3",
+        "H",
+    }
+)
+
+
+def _pair_atom_is_hydrogen(atom: Any) -> bool:
+    """Return whether *atom* is hydrogen, using element first and name as fallback."""
+    element = str(getattr(atom, "element", "") or "").strip().upper()
+    if element:
+        return element == "H"
+    name = str(getattr(atom, "name", "") or "").strip().upper()
+    name = name.lstrip("0123456789")
+    return name.startswith("H")
+
+
+def _pair_site_label(model: Any, atom_indices: Sequence[int]) -> str:
+    """Return one residue label for a site and verify that it is one residue."""
+    indices = [int(index) for index in atom_indices]
+    if not indices:
+        raise ValueError("site contains no atoms")
+    first = model.atoms[indices[0]]
+    resname = str(getattr(first, "resname", "") or "").strip()
+    resnum = int(getattr(first, "resnum", 0))
+    for index in indices[1:]:
+        atom = model.atoms[index]
+        if (
+            int(getattr(atom, "resnum", 0)) != resnum
+            or str(getattr(atom, "resname", "") or "").strip() != resname
+        ):
+            descriptions = [_atom_pair_label(model, item) for item in indices]
+            raise ValueError(
+                "residue-pair selector must resolve to exactly one residue per chain; "
+                f"selected atoms span multiple residues: {descriptions}"
+            )
+    return f"{resname}{resnum}"
+
+
+def _pair_sites_for_spec(
+    tmpl: Any,
+    spec: str,
+    *,
+    chain_indices: Sequence[int],
+    chain_labels: Sequence[str],
+    atom_to_chain: np.ndarray,
+    residue_pair: bool,
+    include_hydrogens: bool,
+    sidechain_only: bool,
+    role: str,
+) -> tuple[tuple[np.ndarray, ...], tuple[str, ...]]:
+    """Resolve one ordered atom/residue selector independently in each chain."""
+    model = tmpl.model if hasattr(tmpl, "model") else tmpl
+    groups = _selection_to_groups(tmpl, spec)
+    if not groups:
+        kind = "residue" if residue_pair else "atom"
+        raise ValueError(f"{role} {kind} selection {spec!r} produced no atoms")
+
+    selected_atom_set = {
+        int(index) for group in groups for index in np.asarray(group, dtype=np.int64).tolist()
+    }
+
+    sites: list[np.ndarray] = []
+    labels: list[str] = []
+    for chain_index, chain_label in zip(chain_indices, chain_labels):
+        matches = sorted(
+            atom_index
+            for atom_index in selected_atom_set
+            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
+        )
+        if not matches:
+            kind = "residue" if residue_pair else "atom"
+            raise ValueError(
+                f"{role} {kind} selection {spec!r} selected no atoms in " f"chain {chain_label!r}"
+            )
+
+        if not residue_pair:
+            if len(matches) != 1:
+                descriptions = [_atom_pair_label(model, atom_index) for atom_index in matches]
+                raise ValueError(
+                    f"{role} atom selection {spec!r} must resolve to exactly one atom "
+                    f"in chain {chain_label!r}; it selected {len(matches)}: {descriptions}. "
+                    "Use two bare residue-number selectors such as '39,69' to "
+                    "calculate a minimum distance between residues."
+                )
+            sites.append(np.asarray(matches, dtype=np.int64))
+            labels.append(_atom_pair_label(model, matches[0]))
+            continue
+
+        # Validate the unfiltered selector first, so an accidental multi-residue
+        # selection cannot be hidden by heavy-atom or side-chain filtering.
+        residue_label = _pair_site_label(model, matches)
+        filtered: list[int] = []
+        for atom_index in matches:
+            atom = model.atoms[int(atom_index)]
+            if not bool(include_hydrogens) and _pair_atom_is_hydrogen(atom):
+                continue
+            if bool(sidechain_only):
+                atom_name = str(getattr(atom, "name", "") or "").strip().upper()
+                if atom_name in _PAIR_BACKBONE_ATOM_NAMES:
+                    continue
+            filtered.append(int(atom_index))
+
+        if not filtered:
+            detail = "side-chain " if sidechain_only else ""
+            detail += "all-atom" if include_hydrogens else "heavy-atom"
+            raise ValueError(
+                f"{role} residue selection {spec!r} in chain {chain_label!r} "
+                f"contains no atoms after the {detail} filter ({residue_label})"
+            )
+
+        sites.append(np.asarray(filtered, dtype=np.int64))
+        labels.append(residue_label)
+
+    return tuple(sites), tuple(labels)
+
+
+def _remap_pair_sites(
+    sites_full: Sequence[np.ndarray],
+    index_map: Mapping[int, int],
+) -> tuple[np.ndarray, ...]:
+    return tuple(
+        np.asarray([index_map[int(index)] for index in site], dtype=np.int64) for site in sites_full
+    )
+
+
+def _minimum_site_distance_matrix_nm(
+    xyz_nm: np.ndarray,
+    reference_sites: Sequence[np.ndarray],
+    target_sites: Sequence[np.ndarray],
+    *,
+    box_nm: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Minimum atom-atom distance for every reference-site/target-site pair."""
+    xyz = np.asarray(xyz_nm, dtype=np.float64)
+    n_ref = len(reference_sites)
+    n_target = len(target_sites)
+    if n_ref < 1 or n_target < 1:
+        raise ValueError("reference_sites and target_sites must be non-empty")
+
+    ref_rect = _groups_to_rect_index(reference_sites)
+    target_rect = _groups_to_rect_index(target_sites)
+    minimum_sq = np.full((n_ref, n_target), np.inf, dtype=np.float64)
+
+    box = None if box_nm is None else np.asarray(box_nm, dtype=np.float64).reshape(3)
+
+    # Homologous amino-acid selections normally have equal atom counts across
+    # chains. Loop over atom positions while vectorizing the chain-by-chain
+    # matrix; this avoids a potentially very large 5-D temporary array.
+    if ref_rect is not None and target_rect is not None:
+        for ref_atom_column in range(ref_rect.shape[1]):
+            reference_position = xyz[ref_rect[:, ref_atom_column], :]  # (n_ref,3)
+            for target_atom_column in range(target_rect.shape[1]):
+                target_position = xyz[target_rect[:, target_atom_column], :]  # (n_target,3)
+                displacement = target_position[None, :, :] - reference_position[:, None, :]
+                if box is not None:
+                    displacement -= np.rint(displacement / box.reshape(1, 1, 3)) * box.reshape(
+                        1, 1, 3
+                    )
+                distance_sq = np.einsum("ijk,ijk->ij", displacement, displacement)
+                np.minimum(minimum_sq, distance_sq, out=minimum_sq)
+        return np.sqrt(minimum_sq)
+
+    # Variable-size fallback. This is uncommon for homologous chains but keeps
+    # residue-pair analysis correct for heterogeneous selections.
+    for i, ref_site in enumerate(reference_sites):
+        reference_position = xyz[np.asarray(ref_site, dtype=np.int64), :]
+        for j, target_site in enumerate(target_sites):
+            target_position = xyz[np.asarray(target_site, dtype=np.int64), :]
+            displacement = target_position[None, :, :] - reference_position[:, None, :]
+            if box is not None:
+                displacement -= np.rint(displacement / box.reshape(1, 1, 3)) * box.reshape(1, 1, 3)
+            distance_sq = np.einsum("ijk,ijk->ij", displacement, displacement)
+            minimum_sq[i, j] = float(np.min(distance_sq))
+    return np.sqrt(minimum_sq)
+
+
 def intrachain_distances_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
     *,
     chains: Union[str, Sequence[str]] = "protein",
     selection: Union[str, Sequence[str]],
+    include_hydrogens: bool = False,
+    sidechain_only: bool = False,
     pbc: bool = True,
     box_nm: Optional[Sequence[float]] = None,
     stride: int = 1,
@@ -2395,46 +2595,15 @@ def intrachain_distances_from_dcd(
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
 ) -> IntrachainDistanceResult:
-    """Calculate the same intrachain atom-pair distance for selected chains.
+    """Calculate an intrachain atom-pair or residue-pair minimum distance.
 
-    Parameters
-    ----------
-    pdb_file, dcd_files
-        Template PDB and one or more DCD trajectories.
-
-    chains
-        StructureSelector-compatible selection identifying the chains to
-        analyze. It may be one selector or a sequence of selectors. Examples::
-
-            chains="protein"
-            chains="A:B:C"
-            chains=["A", "B", "C"]
-
-    selection
-        StructureSelector-compatible selection that must select exactly two
-        atoms in every requested chain. The same atom definition is applied to
-        all chains. Examples::
-
-            selection="10.CA,90.CA"
-            selection=["10.CA", "90.CA"]
-
-        The two forms above are equivalent. Selection order is not important
-        because only the scalar distance is returned.
-
-    pbc
-        If True, calculate minimum-image distances using an orthorhombic box.
-        If the DCD lacks unit-cell lengths, provide ``box_nm``.
-
-    box_nm
-        Fallback box lengths ``(Lx, Ly, Lz)`` in nm.
-
-    stride, chunk, frame_start, frame_stop
-        Same conventions as ``rg_from_dcd``.
-
-    Returns
-    -------
-    IntrachainDistanceResult
-        ``distance_per_chain_nm`` has shape ``(n_chains, n_frames)``.
+    Pair mode is inferred from ``selection``. Two bare residue numbers, for
+    example ``"39,69"``, select residue-residue mode; selectors containing atom
+    names, for example ``"39.CE2,69.SG"``, retain the original atom-pair mode.
+    In residue mode the reported value is the minimum distance between any
+    retained atom in the two residues. Heavy atoms are used by default. Set
+    ``include_hydrogens=True`` to include hydrogens and ``sidechain_only=True``
+    to exclude the configured backbone/terminal atom names.
     """
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -2442,6 +2611,10 @@ def intrachain_distances_from_dcd(
         raise ValueError("chunk must be >= 1")
     if int(frame_start) < 0:
         raise ValueError("frame_start must be >= 0")
+    if not isinstance(include_hydrogens, (bool, np.bool_)):
+        raise TypeError("include_hydrogens must be a boolean")
+    if not isinstance(sidechain_only, (bool, np.bool_)):
+        raise TypeError("sidechain_only must be a boolean")
 
     dcd_list = _as_file_list(dcd_files)
     if not dcd_list:
@@ -2449,60 +2622,56 @@ def intrachain_distances_from_dcd(
 
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
-
-    chain_indices, chain_labels, atom_to_chain = _chain_indices_from_selection(
-        tmpl,
-        chains,
-    )
+    chain_indices, chain_labels, atom_to_chain = _chain_indices_from_selection(tmpl, chains)
     if not chain_indices:
         raise ValueError("chains produced no physical chains")
 
-    pair_groups_full = _selection_to_groups(tmpl, selection)
-    if not pair_groups_full:
-        raise ValueError("selection produced no atoms")
-
-    pair_atom_set: set[int] = set()
-    for group in pair_groups_full:
-        pair_atom_set.update(int(i) for i in np.asarray(group, dtype=np.int64).tolist())
-
-    pair_indices_full = np.empty((len(chain_indices), 2), dtype=np.int64)
-    atom_labels: list[tuple[str, str]] = []
-
-    for out_i, chain_i in enumerate(chain_indices):
-        selected_atoms = sorted(
-            ai for ai in pair_atom_set if int(atom_to_chain[int(ai)]) == int(chain_i)
+    first_spec, second_spec = _ordered_atom_pair_selection_specs(selection)
+    residue_pair = _pair_specs_use_residue_mode(first_spec, second_spec)
+    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
+        raise ValueError(
+            "include_hydrogens and sidechain_only apply only to residue-pair "
+            "selections such as '39,69'"
         )
-
-        if len(selected_atoms) != 2:
-            label = chain_labels[out_i]
-            descriptions = [_atom_pair_label(tmpl_model, ai) for ai in selected_atoms]
-            raise ValueError(
-                f"selection must resolve to exactly two atoms in chain {label!r}; "
-                f"it selected {len(selected_atoms)}: {descriptions}"
-            )
-
-        pair_indices_full[out_i, :] = selected_atoms
-        atom_labels.append(
-            (
-                _atom_pair_label(tmpl_model, selected_atoms[0]),
-                _atom_pair_label(tmpl_model, selected_atoms[1]),
-            )
-        )
-
-    # Read only the atoms that participate in the requested distances.
-    atom_indices_full = sorted(set(pair_indices_full.reshape(-1).tolist()))
-    idx_map = {old: new for new, old in enumerate(atom_indices_full)}
-    pair_indices_sel = np.asarray(
-        [[idx_map[int(a)], idx_map[int(b)]] for a, b in pair_indices_full.tolist()],
-        dtype=np.int64,
+    first_sites_full, first_labels = _pair_sites_for_spec(
+        tmpl,
+        first_spec,
+        chain_indices=chain_indices,
+        chain_labels=chain_labels,
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="first",
     )
+    second_sites_full, second_labels = _pair_sites_for_spec(
+        tmpl,
+        second_spec,
+        chain_indices=chain_indices,
+        chain_labels=chain_labels,
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="second",
+    )
+
+    atom_indices_full = sorted(
+        {
+            int(index)
+            for site in (*first_sites_full, *second_sites_full)
+            for index in np.asarray(site, dtype=np.int64).tolist()
+        }
+    )
+    index_map = {old: new for new, old in enumerate(atom_indices_full)}
+    first_sites = _remap_pair_sites(first_sites_full, index_map)
+    second_sites = _remap_pair_sites(second_sites_full, index_map)
 
     box_fallback = None
     if bool(pbc) and box_nm is not None:
         box_fallback = _box_lengths_nm(box_nm)
 
     distance_frames: list[np.ndarray] = []
-
     for dcd in dcd_list:
         for fi, (xyz_sel_nm, box_frame_nm) in enumerate(
             iter_dcd(
@@ -2518,10 +2687,7 @@ def intrachain_distances_from_dcd(
             if frame_stop is not None and fi >= int(frame_stop):
                 break
 
-            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
-            pair_xyz = xyz[pair_indices_sel, :]  # (n_chains, 2, 3)
-            displacement = pair_xyz[:, 1, :] - pair_xyz[:, 0, :]
-
+            box = None
             if bool(pbc):
                 if box_frame_nm is None:
                     if box_fallback is None:
@@ -2533,34 +2699,54 @@ def intrachain_distances_from_dcd(
                 else:
                     box = _box_lengths_nm(box_frame_nm)
 
-                displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
-
-            distances = np.linalg.norm(displacement, axis=1)
-            distance_frames.append(np.asarray(distances, dtype=np.float64))
+            matrix = _minimum_site_distance_matrix_nm(
+                np.asarray(xyz_sel_nm, dtype=np.float64),
+                first_sites,
+                second_sites,
+                box_nm=box,
+            )
+            distance_frames.append(np.diag(matrix).astype(np.float64, copy=False))
 
     if not distance_frames:
         raise ValueError("no frames selected")
 
     distance_per_chain = np.stack(distance_frames, axis=1)
     distance_mean = np.nanmean(distance_per_chain, axis=0)
-
     n_chains = int(distance_per_chain.shape[0])
     if n_chains < 2:
         distance_stderr = np.zeros_like(distance_mean)
     else:
         distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
 
+    if bool(residue_pair):
+        legacy_indices = np.full((n_chains, 2), -1, dtype=np.int64)
+    else:
+        legacy_indices = np.asarray(
+            [[int(a[0]), int(b[0])] for a, b in zip(first_sites_full, second_sites_full)],
+            dtype=np.int64,
+        )
+
     return IntrachainDistanceResult(
         distance_per_chain_nm=distance_per_chain,
         distance_mean_nm=distance_mean,
         distance_stderr_nm=distance_stderr,
         chain_labels=chain_labels,
-        atom_labels=tuple(atom_labels),
-        atom_indices=pair_indices_full,
+        atom_labels=tuple(zip(first_labels, second_labels)),
+        atom_indices=legacy_indices,
         n_chains=n_chains,
         n_frames=int(distance_per_chain.shape[1]),
         selection=selection,
         pbc=bool(pbc),
+        selection_mode="residue" if bool(residue_pair) else "atom",
+        include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
+        sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
+        site_atom_indices=tuple(
+            (
+                tuple(int(x) for x in a.tolist()),
+                tuple(int(x) for x in b.tolist()),
+            )
+            for a, b in zip(first_sites_full, second_sites_full)
+        ),
     )
 
 
@@ -2588,12 +2774,17 @@ class InterchainDistanceResult:
     selection: Any
     exclude_reference: bool
     pbc: bool
+    selection_mode: str = "atom"  # "atom" | "residue"
+    include_hydrogens: bool = False
+    sidechain_only: bool = False
+    reference_site_atom_indices: tuple[int, ...] = ()
+    target_site_atom_indices: tuple[tuple[int, ...], ...] = ()
 
 
 def _ordered_atom_pair_selection_specs(
     selection: Union[str, Sequence[str]],
 ) -> tuple[str, str]:
-    """Normalize an ordered two-atom selection into two selector strings.
+    """Normalize an ordered two-site selection into two selector strings.
 
     Accepted forms include::
 
@@ -2622,11 +2813,40 @@ def _ordered_atom_pair_selection_specs(
 
     if len(parts) != 2 or any(not part for part in parts):
         raise ValueError(
-            "selection must contain exactly two ordered atom selectors, for example "
-            "['39.CE2', '69.SG'] or '39.CE2,69.SG'"
+            "selection must contain exactly two ordered selectors, for example "
+            "['39.CE2', '69.SG'], '39.CE2,69.SG', or residue selectors '39,69'"
         )
 
     return parts[0], parts[1]
+
+
+def _pair_specs_use_residue_mode(first_spec: str, second_spec: str) -> bool:
+    """Infer residue-pair mode when both selectors are bare residue numbers.
+
+    Examples
+    --------
+    ``"39,69"`` -> residue mode
+    ``"39.CE2,69.SG"`` -> atom mode
+
+    Mixing one bare residue number with one atom selector is rejected because it
+    would otherwise make the intended distance definition unclear.
+    """
+
+    def is_bare_residue_number(spec: str) -> bool:
+        value = str(spec).strip()
+        if value.startswith(("+", "-")):
+            value = value[1:]
+        return bool(value) and value.isdigit()
+
+    first_is_residue = is_bare_residue_number(first_spec)
+    second_is_residue = is_bare_residue_number(second_spec)
+    if first_is_residue != second_is_residue:
+        raise ValueError(
+            "pair selection mixes a bare residue number with an atom selector. "
+            "Use either two residue numbers (for example '39,69') or two atom "
+            "selectors (for example '39.CE2,69.SG')."
+        )
+    return first_is_residue
 
 
 @dataclass(frozen=True)
@@ -2660,6 +2880,11 @@ class MinimumContactDistanceResult:
     pair_mode: str  # "both" | "intra" | "inter"
     selection: Any
     pbc: bool
+    selection_mode: str = "atom"  # "atom" | "residue"
+    include_hydrogens: bool = False
+    sidechain_only: bool = False
+    reference_site_atom_indices: tuple[tuple[int, ...], ...] = ()
+    target_site_atom_indices: tuple[tuple[int, ...], ...] = ()
 
     @property
     def minimum_distance_nm(self) -> np.ndarray:
@@ -2769,6 +2994,8 @@ def minimum_contact_distances_from_dcd(
     chains: Union[str, Sequence[str]] = "protein",
     selection: Union[str, Sequence[str]],
     option: Optional[str] = None,
+    include_hydrogens: bool = False,
+    sidechain_only: bool = False,
     pbc: bool = True,
     box_nm: Optional[Sequence[float]] = None,
     stride: int = 1,
@@ -2776,21 +3003,14 @@ def minimum_contact_distances_from_dcd(
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
 ) -> MinimumContactDistanceResult:
-    """Return a per-chain minimum selected atom-pair distance in every frame.
+    """Return a per-chain minimum atom-pair or residue-pair distance.
 
-    For ``N`` selected chains, the first ordered atom selector supplies one
-    reference atom ``A_i`` in each chain and the second supplies one target atom
-    ``B_j`` in each chain.  For every reference chain ``i`` and frame, this
-    routine stores the minimum permitted value from the row
-    ``d(A_i, B_j)``:
-
-    - ``option=None`` or ``"both"``: minimize over all ``j``, including ``j=i``;
-    - ``option="intraonly"``: retain only ``j=i``.  This is identical to
-      :func:`intrachain_distances_from_dcd` for the same selections;
-    - ``option="interonly"``: minimize over ``j != i``.
-
-    Thus the output contains one time series per selected reference chain, not
-    one global minimum over the complete ``N x N`` matrix.
+    Two bare residue-number selectors (for example ``"39,69"``) automatically
+    select residue mode; atom selectors such as ``"39.CE2,69.SG"`` retain the
+    original atom-pair behavior. In residue mode every chain-chain distance is
+    the minimum over all retained atom pairs between those residues. Heavy atoms
+    are used by default; ``include_hydrogens=True`` includes hydrogens and
+    ``sidechain_only=True`` excludes the configured backbone/terminal atom names.
     """
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -2798,6 +3018,12 @@ def minimum_contact_distances_from_dcd(
         raise ValueError("chunk must be >= 1")
     if int(frame_start) < 0:
         raise ValueError("frame_start must be >= 0")
+    for value, name in (
+        (include_hydrogens, "include_hydrogens"),
+        (sidechain_only, "sidechain_only"),
+    ):
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a boolean")
 
     pair_mode = _normalize_minimum_contact_option(option)
     dcd_list = _as_file_list(dcd_files)
@@ -2806,69 +3032,52 @@ def minimum_contact_distances_from_dcd(
 
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
-
-    chain_indices, chain_labels, atom_to_chain = _chain_indices_from_selection(
-        tmpl,
-        chains,
-    )
+    chain_indices, chain_labels, atom_to_chain = _chain_indices_from_selection(tmpl, chains)
     if not chain_indices:
         raise ValueError("chains produced no physical chains")
     if pair_mode == "inter" and len(chain_indices) < 2:
         raise ValueError("option='interonly' requires at least two selected chains")
 
-    reference_atom_spec, target_atom_spec = _ordered_atom_pair_selection_specs(selection)
-
-    def atoms_for_spec(spec: str, role: str) -> tuple[np.ndarray, tuple[str, ...]]:
-        groups = _selection_to_groups(tmpl, spec)
-        if not groups:
-            raise ValueError(f"{role} atom selection {spec!r} produced no atoms")
-
-        selected_atom_set: set[int] = set()
-        for group in groups:
-            selected_atom_set.update(
-                int(index) for index in np.asarray(group, dtype=np.int64).tolist()
-            )
-
-        atom_indices = np.empty(len(chain_indices), dtype=np.int64)
-        labels: list[str] = []
-        for output_index, (chain_index, chain_label) in enumerate(zip(chain_indices, chain_labels)):
-            matches = sorted(
-                atom_index
-                for atom_index in selected_atom_set
-                if int(atom_to_chain[int(atom_index)]) == int(chain_index)
-            )
-            if len(matches) != 1:
-                descriptions = [_atom_pair_label(tmpl_model, atom_index) for atom_index in matches]
-                raise ValueError(
-                    f"{role} atom selection {spec!r} must resolve to exactly "
-                    f"one atom in chain {chain_label!r}; it selected "
-                    f"{len(matches)}: {descriptions}"
-                )
-            atom_index = int(matches[0])
-            atom_indices[output_index] = atom_index
-            labels.append(_atom_pair_label(tmpl_model, atom_index))
-
-        return atom_indices, tuple(labels)
-
-    reference_atoms_full, reference_atom_labels = atoms_for_spec(
-        reference_atom_spec,
-        "reference",
+    reference_spec, target_spec = _ordered_atom_pair_selection_specs(selection)
+    residue_pair = _pair_specs_use_residue_mode(reference_spec, target_spec)
+    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
+        raise ValueError(
+            "include_hydrogens and sidechain_only apply only to residue-pair "
+            "selections such as '39,69'"
+        )
+    reference_sites_full, reference_labels = _pair_sites_for_spec(
+        tmpl,
+        reference_spec,
+        chain_indices=chain_indices,
+        chain_labels=chain_labels,
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="reference",
     )
-    target_atoms_full, target_atom_labels = atoms_for_spec(
-        target_atom_spec,
-        "target",
+    target_sites_full, target_labels = _pair_sites_for_spec(
+        tmpl,
+        target_spec,
+        chain_indices=chain_indices,
+        chain_labels=chain_labels,
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="target",
     )
 
-    atom_indices_full = sorted(set(reference_atoms_full.tolist()) | set(target_atoms_full.tolist()))
+    atom_indices_full = sorted(
+        {
+            int(index)
+            for site in (*reference_sites_full, *target_sites_full)
+            for index in np.asarray(site, dtype=np.int64).tolist()
+        }
+    )
     index_map = {old: new for new, old in enumerate(atom_indices_full)}
-    reference_atoms_sel = np.asarray(
-        [index_map[int(atom_index)] for atom_index in reference_atoms_full],
-        dtype=np.int64,
-    )
-    target_atoms_sel = np.asarray(
-        [index_map[int(atom_index)] for atom_index in target_atoms_full],
-        dtype=np.int64,
-    )
+    reference_sites = _remap_pair_sites(reference_sites_full, index_map)
+    target_sites = _remap_pair_sites(target_sites_full, index_map)
 
     n_chains = int(len(chain_indices))
     n_pairs_per_reference = (
@@ -2881,7 +3090,6 @@ def minimum_contact_distances_from_dcd(
 
     distance_frames: list[np.ndarray] = []
     minimum_target_frames: list[np.ndarray] = []
-
     for dcd in dcd_list:
         for frame_index, (xyz_sel_nm, box_frame_nm) in enumerate(
             iter_dcd(
@@ -2897,11 +3105,7 @@ def minimum_contact_distances_from_dcd(
             if frame_stop is not None and frame_index >= int(frame_stop):
                 break
 
-            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
-            reference_positions = xyz[reference_atoms_sel, :]
-            target_positions = xyz[target_atoms_sel, :]
-            displacement = target_positions[None, :, :] - reference_positions[:, None, :]
-
+            box = None
             if bool(pbc):
                 if box_frame_nm is None:
                     if box_fallback is None:
@@ -2913,9 +3117,12 @@ def minimum_contact_distances_from_dcd(
                 else:
                     box = _box_lengths_nm(box_frame_nm)
 
-                displacement -= np.rint(displacement / box.reshape(1, 1, 3)) * box.reshape(1, 1, 3)
-
-            distance_matrix = np.linalg.norm(displacement, axis=2)
+            distance_matrix = _minimum_site_distance_matrix_nm(
+                np.asarray(xyz_sel_nm, dtype=np.float64),
+                reference_sites,
+                target_sites,
+                box_nm=box,
+            )
             minimum_distances, minimum_targets = _minimum_contact_per_reference(
                 distance_matrix,
                 pair_mode=pair_mode,
@@ -2929,15 +3136,21 @@ def minimum_contact_distances_from_dcd(
     distance_per_chain = np.stack(distance_frames, axis=1)
     minimum_target_array = np.stack(minimum_target_frames, axis=1)
     distance_mean = np.nanmean(distance_per_chain, axis=0)
-
     if n_chains < 2:
         distance_stderr = np.zeros_like(distance_mean)
     else:
-        distance_stderr = np.nanstd(
-            distance_per_chain,
-            axis=0,
-            ddof=1,
-        ) / math.sqrt(float(n_chains))
+        distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
+
+    if bool(residue_pair):
+        reference_atom_indices = np.full(n_chains, -1, dtype=np.int64)
+        target_atom_indices = np.full(n_chains, -1, dtype=np.int64)
+    else:
+        reference_atom_indices = np.asarray(
+            [int(site[0]) for site in reference_sites_full], dtype=np.int64
+        )
+        target_atom_indices = np.asarray(
+            [int(site[0]) for site in target_sites_full], dtype=np.int64
+        )
 
     return MinimumContactDistanceResult(
         distance_per_chain_nm=distance_per_chain,
@@ -2945,16 +3158,25 @@ def minimum_contact_distances_from_dcd(
         distance_stderr_nm=distance_stderr,
         minimum_target_chain_index=minimum_target_array,
         chain_labels=chain_labels,
-        reference_atom_labels=reference_atom_labels,
-        target_atom_labels=target_atom_labels,
-        reference_atom_indices=reference_atoms_full,
-        target_atom_indices=target_atoms_full,
+        reference_atom_labels=reference_labels,
+        target_atom_labels=target_labels,
+        reference_atom_indices=reference_atom_indices,
+        target_atom_indices=target_atom_indices,
         n_chains=n_chains,
         n_frames=int(distance_per_chain.shape[1]),
         n_pairs_per_reference=int(n_pairs_per_reference),
         pair_mode=pair_mode,
         selection=selection,
         pbc=bool(pbc),
+        selection_mode="residue" if bool(residue_pair) else "atom",
+        include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
+        sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
+        reference_site_atom_indices=tuple(
+            tuple(int(x) for x in site.tolist()) for site in reference_sites_full
+        ),
+        target_site_atom_indices=tuple(
+            tuple(int(x) for x in site.tolist()) for site in target_sites_full
+        ),
     )
 
 
@@ -2966,6 +3188,8 @@ def interchain_distances_from_dcd(
     target_chains: Union[str, Sequence[str]] = "protein",
     selection: Union[str, Sequence[str]],
     exclude_reference: bool = True,
+    include_hydrogens: bool = False,
+    sidechain_only: bool = False,
     pbc: bool = True,
     box_nm: Optional[Sequence[float]] = None,
     stride: int = 1,
@@ -2973,61 +3197,10 @@ def interchain_distances_from_dcd(
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
 ) -> InterchainDistanceResult:
-    """Calculate distances from one reference-chain atom to target-chain atoms.
+    """Distances from one reference-chain site to target-chain sites.
 
-    The ordered atom pair is the same for every chain:
-
-    - the first atom selector is evaluated in ``reference_chain``;
-    - the second atom selector is evaluated in every chain selected by
-      ``target_chains``.
-
-    Parameters
-    ----------
-    pdb_file, dcd_files
-        Template PDB and one or more DCD trajectories.
-
-    reference_chain
-        StructureSelector-compatible selection that must resolve to exactly one
-        physical chain. Examples::
-
-            reference_chain="A"
-            reference_chain=["A"]
-
-    target_chains
-        StructureSelector-compatible selection identifying one or more target
-        chains. Examples::
-
-            target_chains="protein"
-            target_chains="A:B:C"
-            target_chains=["A", "B", "C"]
-
-    selection
-        Exactly two ordered StructureSelector atom selections. The first defines
-        the reference atom and the second defines the target atom. Examples::
-
-            selection=["39.CE2", "69.SG"]
-            selection="39.CE2,69.SG"
-
-    exclude_reference
-        If True, remove the reference chain from the target set when it is
-        present, yielding strictly interchain distances. If False, retain it,
-        and its row contains the intrachain distance between the selected atoms.
-
-    pbc
-        If True, use minimum-image distances in an orthorhombic box. If the DCD
-        lacks unit-cell lengths, provide ``box_nm``.
-
-    box_nm
-        Fallback box lengths ``(Lx, Ly, Lz)`` in nm.
-
-    stride, chunk, frame_start, frame_stop
-        Same conventions as ``rg_from_dcd``.
-
-    Returns
-    -------
-    InterchainDistanceResult
-        ``distance_per_chain_nm`` has shape
-        ``(n_retained_target_chains, n_frames)``.
+    Two bare residue numbers in ``selection`` automatically select residue mode;
+    atom selectors retain the original atom-pair mode.
     """
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -3035,32 +3208,31 @@ def interchain_distances_from_dcd(
         raise ValueError("chunk must be >= 1")
     if int(frame_start) < 0:
         raise ValueError("frame_start must be >= 0")
+    for value, name in (
+        (include_hydrogens, "include_hydrogens"),
+        (sidechain_only, "sidechain_only"),
+    ):
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a boolean")
 
     dcd_list = _as_file_list(dcd_files)
     if not dcd_list:
         raise ValueError("no DCD files provided")
-
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
     reference_indices, reference_labels, atom_to_chain = _chain_indices_from_selection(
-        tmpl,
-        reference_chain,
+        tmpl, reference_chain
     )
     if len(reference_indices) != 1:
         raise ValueError(
             f"reference_chain must resolve to exactly one physical chain; "
             f"it resolved to {len(reference_indices)}: {reference_labels}"
         )
-
     reference_chain_index = int(reference_indices[0])
     reference_chain_label = str(reference_labels[0])
 
-    target_indices_all, target_labels_all, _ = _chain_indices_from_selection(
-        tmpl,
-        target_chains,
-    )
-
+    target_indices_all, target_labels_all, _ = _chain_indices_from_selection(tmpl, target_chains)
     retained_target_indices: list[int] = []
     retained_target_labels: list[str] = []
     for chain_index, chain_label in zip(target_indices_all, target_labels_all):
@@ -3068,80 +3240,55 @@ def interchain_distances_from_dcd(
             continue
         retained_target_indices.append(int(chain_index))
         retained_target_labels.append(str(chain_label))
-
     if not retained_target_indices:
         if bool(exclude_reference) and reference_chain_index in target_indices_all:
             raise ValueError("no target chains remain after excluding the reference chain")
         raise ValueError("target_chains produced no physical chains")
 
-    reference_atom_spec, target_atom_spec = _ordered_atom_pair_selection_specs(selection)
-
-    reference_groups = _selection_to_groups(tmpl, reference_atom_spec)
-    if not reference_groups:
-        raise ValueError(f"reference atom selection {reference_atom_spec!r} produced no atoms")
-    reference_atom_set: set[int] = set()
-    for group in reference_groups:
-        reference_atom_set.update(int(i) for i in np.asarray(group, dtype=np.int64).tolist())
-
-    reference_atoms = sorted(
-        atom_index
-        for atom_index in reference_atom_set
-        if int(atom_to_chain[int(atom_index)]) == reference_chain_index
-    )
-    if len(reference_atoms) != 1:
-        descriptions = [_atom_pair_label(tmpl_model, atom_index) for atom_index in reference_atoms]
+    reference_spec, target_spec = _ordered_atom_pair_selection_specs(selection)
+    residue_pair = _pair_specs_use_residue_mode(reference_spec, target_spec)
+    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
         raise ValueError(
-            f"reference atom selection {reference_atom_spec!r} must resolve to "
-            f"exactly one atom in chain {reference_chain_label!r}; it selected "
-            f"{len(reference_atoms)}: {descriptions}"
+            "include_hydrogens and sidechain_only apply only to residue-pair "
+            "selections such as '39,69'"
         )
-    reference_atom_full = int(reference_atoms[0])
-
-    target_groups = _selection_to_groups(tmpl, target_atom_spec)
-    if not target_groups:
-        raise ValueError(f"target atom selection {target_atom_spec!r} produced no atoms")
-    target_atom_set: set[int] = set()
-    for group in target_groups:
-        target_atom_set.update(int(i) for i in np.asarray(group, dtype=np.int64).tolist())
-
-    target_atoms_full = np.empty(len(retained_target_indices), dtype=np.int64)
-    target_atom_labels: list[str] = []
-
-    for out_index, (chain_index, chain_label) in enumerate(
-        zip(retained_target_indices, retained_target_labels)
-    ):
-        selected_atoms = sorted(
-            atom_index
-            for atom_index in target_atom_set
-            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
-        )
-        if len(selected_atoms) != 1:
-            descriptions = [
-                _atom_pair_label(tmpl_model, atom_index) for atom_index in selected_atoms
-            ]
-            raise ValueError(
-                f"target atom selection {target_atom_spec!r} must resolve to "
-                f"exactly one atom in chain {chain_label!r}; it selected "
-                f"{len(selected_atoms)}: {descriptions}"
-            )
-
-        atom_index = int(selected_atoms[0])
-        target_atoms_full[out_index] = atom_index
-        target_atom_labels.append(_atom_pair_label(tmpl_model, atom_index))
-
-    # Read only the reference atom and retained target atoms.
-    atom_indices_full = sorted({reference_atom_full, *target_atoms_full.tolist()})
-    index_map = {old: new for new, old in enumerate(atom_indices_full)}
-    reference_atom_sel = int(index_map[reference_atom_full])
-    target_atoms_sel = np.asarray(
-        [index_map[int(atom_index)] for atom_index in target_atoms_full],
-        dtype=np.int64,
+    reference_sites_full, reference_site_labels = _pair_sites_for_spec(
+        tmpl,
+        reference_spec,
+        chain_indices=[reference_chain_index],
+        chain_labels=[reference_chain_label],
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="reference",
     )
+    target_sites_full, target_site_labels = _pair_sites_for_spec(
+        tmpl,
+        target_spec,
+        chain_indices=retained_target_indices,
+        chain_labels=retained_target_labels,
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="target",
+    )
+
+    atom_indices_full = sorted(
+        {
+            int(index)
+            for site in (*reference_sites_full, *target_sites_full)
+            for index in np.asarray(site, dtype=np.int64).tolist()
+        }
+    )
+    index_map = {old: new for new, old in enumerate(atom_indices_full)}
+    reference_sites = _remap_pair_sites(reference_sites_full, index_map)
+    target_sites = _remap_pair_sites(target_sites_full, index_map)
 
     box_fallback = None
     if bool(pbc) and box_nm is not None:
         box_fallback = _box_lengths_nm(box_nm)
-
     distance_frames: list[np.ndarray] = []
 
     for dcd in dcd_list:
@@ -3158,12 +3305,7 @@ def interchain_distances_from_dcd(
                 continue
             if frame_stop is not None and frame_index >= int(frame_stop):
                 break
-
-            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
-            reference_position = xyz[reference_atom_sel, :]
-            target_positions = xyz[target_atoms_sel, :]
-            displacement = target_positions - reference_position.reshape(1, 3)
-
+            box = None
             if bool(pbc):
                 if box_frame_nm is None:
                     if box_fallback is None:
@@ -3174,27 +3316,32 @@ def interchain_distances_from_dcd(
                     box = box_fallback
                 else:
                     box = _box_lengths_nm(box_frame_nm)
-
-                displacement -= np.rint(displacement / box.reshape(1, 3)) * box.reshape(1, 3)
-
-            distance_frames.append(
-                np.linalg.norm(displacement, axis=1).astype(
-                    np.float64,
-                    copy=False,
-                )
+            matrix = _minimum_site_distance_matrix_nm(
+                np.asarray(xyz_sel_nm, dtype=np.float64),
+                reference_sites,
+                target_sites,
+                box_nm=box,
             )
+            distance_frames.append(matrix[0].astype(np.float64, copy=False))
 
     if not distance_frames:
         raise ValueError("no frames selected")
-
     distance_per_chain = np.stack(distance_frames, axis=1)
     distance_mean = np.nanmean(distance_per_chain, axis=0)
-
     n_chains = int(distance_per_chain.shape[0])
     if n_chains < 2:
         distance_stderr = np.zeros_like(distance_mean)
     else:
         distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
+
+    if bool(residue_pair):
+        reference_atom_index = -1
+        target_atom_indices = np.full(n_chains, -1, dtype=np.int64)
+    else:
+        reference_atom_index = int(reference_sites_full[0][0])
+        target_atom_indices = np.asarray(
+            [int(site[0]) for site in target_sites_full], dtype=np.int64
+        )
 
     return InterchainDistanceResult(
         distance_per_chain_nm=distance_per_chain,
@@ -3202,18 +3349,22 @@ def interchain_distances_from_dcd(
         distance_stderr_nm=distance_stderr,
         chain_labels=tuple(retained_target_labels),
         reference_chain_label=reference_chain_label,
-        reference_atom_label=_atom_pair_label(
-            tmpl_model,
-            reference_atom_full,
-        ),
-        target_atom_labels=tuple(target_atom_labels),
-        reference_atom_index=reference_atom_full,
-        target_atom_indices=target_atoms_full,
+        reference_atom_label=reference_site_labels[0],
+        target_atom_labels=target_site_labels,
+        reference_atom_index=reference_atom_index,
+        target_atom_indices=target_atom_indices,
         n_chains=n_chains,
         n_frames=int(distance_per_chain.shape[1]),
         selection=selection,
         exclude_reference=bool(exclude_reference),
         pbc=bool(pbc),
+        selection_mode="residue" if bool(residue_pair) else "atom",
+        include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
+        sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
+        reference_site_atom_indices=tuple(int(x) for x in reference_sites_full[0].tolist()),
+        target_site_atom_indices=tuple(
+            tuple(int(x) for x in site.tolist()) for site in target_sites_full
+        ),
     )
 
 
@@ -3225,6 +3376,8 @@ def interchain_distances_all_references_from_dcd(
     target_chains: Union[str, Sequence[str]] = "protein",
     selection: Union[str, Sequence[str]],
     exclude_reference: bool = True,
+    include_hydrogens: bool = False,
+    sidechain_only: bool = False,
     pbc: bool = True,
     box_nm: Optional[Sequence[float]] = None,
     stride: int = 1,
@@ -3232,24 +3385,10 @@ def interchain_distances_all_references_from_dcd(
     frame_start: int = 0,
     frame_stop: Optional[int] = None,
 ) -> dict[str, InterchainDistanceResult]:
-    """Calculate interchain distances for many reference chains in one DCD pass.
+    """Batched all-reference pair distances in one DCD pass.
 
-    This is the batched counterpart of :func:`interchain_distances_from_dcd`.
-    The first atom selector is resolved once for every chain in
-    ``reference_chains`` and the second atom selector once for every chain in
-    ``target_chains``.  For each trajectory frame a single vectorized
-    ``(n_reference, n_target)`` distance matrix is evaluated.  The trajectory is
-    therefore read only once, rather than once per reference chain.
-
-    The returned mapping is keyed by the resolved physical reference-chain label.
-    Each value is an ordinary :class:`InterchainDistanceResult`, so downstream
-    code written for the single-reference routine can use the results unchanged.
-
-    Notes
-    -----
-    This routine is primarily an I/O and vectorization optimization.  It normally
-    outperforms launching one process per reference chain because those processes
-    would all reread the same DCD and duplicate topology/trajectory I/O.
+    Two bare residue numbers in ``selection`` automatically select residue mode;
+    atom selectors retain the original atom-pair mode.
     """
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -3257,128 +3396,85 @@ def interchain_distances_all_references_from_dcd(
         raise ValueError("chunk must be >= 1")
     if int(frame_start) < 0:
         raise ValueError("frame_start must be >= 0")
+    for value, name in (
+        (include_hydrogens, "include_hydrogens"),
+        (sidechain_only, "sidechain_only"),
+    ):
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a boolean")
 
     dcd_list = _as_file_list(dcd_files)
     if not dcd_list:
         raise ValueError("no DCD files provided")
-
     tmpl = PDBReader().read(pdb_file)
     tmpl_model = tmpl.model
 
     reference_indices, reference_labels, atom_to_chain = _chain_indices_from_selection(
-        tmpl,
-        reference_chains,
+        tmpl, reference_chains
     )
     if not reference_indices:
         raise ValueError("reference_chains produced no physical chains")
-
-    target_indices, target_labels, _ = _chain_indices_from_selection(
-        tmpl,
-        target_chains,
-    )
+    target_indices, target_labels, _ = _chain_indices_from_selection(tmpl, target_chains)
     if not target_indices:
         raise ValueError("target_chains produced no physical chains")
 
-    reference_atom_spec, target_atom_spec = _ordered_atom_pair_selection_specs(selection)
-
-    reference_groups = _selection_to_groups(tmpl, reference_atom_spec)
-    if not reference_groups:
-        raise ValueError(f"reference atom selection {reference_atom_spec!r} produced no atoms")
-    reference_atom_set = {
-        int(atom_index)
-        for group in reference_groups
-        for atom_index in np.asarray(group, dtype=np.int64).tolist()
-    }
-
-    target_groups = _selection_to_groups(tmpl, target_atom_spec)
-    if not target_groups:
-        raise ValueError(f"target atom selection {target_atom_spec!r} produced no atoms")
-    target_atom_set = {
-        int(atom_index)
-        for group in target_groups
-        for atom_index in np.asarray(group, dtype=np.int64).tolist()
-    }
-
-    reference_atoms_full = np.empty(len(reference_indices), dtype=np.int64)
-    reference_atom_labels: list[str] = []
-    for out_index, (chain_index, chain_label) in enumerate(
-        zip(reference_indices, reference_labels)
-    ):
-        selected_atoms = sorted(
-            atom_index
-            for atom_index in reference_atom_set
-            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
+    reference_spec, target_spec = _ordered_atom_pair_selection_specs(selection)
+    residue_pair = _pair_specs_use_residue_mode(reference_spec, target_spec)
+    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
+        raise ValueError(
+            "include_hydrogens and sidechain_only apply only to residue-pair "
+            "selections such as '39,69'"
         )
-        if len(selected_atoms) != 1:
-            descriptions = [
-                _atom_pair_label(tmpl_model, atom_index) for atom_index in selected_atoms
-            ]
-            raise ValueError(
-                f"reference atom selection {reference_atom_spec!r} must resolve to "
-                f"exactly one atom in chain {chain_label!r}; it selected "
-                f"{len(selected_atoms)}: {descriptions}"
-            )
-        atom_index = int(selected_atoms[0])
-        reference_atoms_full[out_index] = atom_index
-        reference_atom_labels.append(_atom_pair_label(tmpl_model, atom_index))
+    reference_sites_full, reference_site_labels = _pair_sites_for_spec(
+        tmpl,
+        reference_spec,
+        chain_indices=reference_indices,
+        chain_labels=reference_labels,
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="reference",
+    )
+    target_sites_full, target_site_labels = _pair_sites_for_spec(
+        tmpl,
+        target_spec,
+        chain_indices=target_indices,
+        chain_labels=target_labels,
+        atom_to_chain=atom_to_chain,
+        residue_pair=bool(residue_pair),
+        include_hydrogens=bool(include_hydrogens),
+        sidechain_only=bool(sidechain_only),
+        role="target",
+    )
 
-    target_atoms_full = np.empty(len(target_indices), dtype=np.int64)
-    target_atom_labels: list[str] = []
-    for out_index, (chain_index, chain_label) in enumerate(zip(target_indices, target_labels)):
-        selected_atoms = sorted(
-            atom_index
-            for atom_index in target_atom_set
-            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
-        )
-        if len(selected_atoms) != 1:
-            descriptions = [
-                _atom_pair_label(tmpl_model, atom_index) for atom_index in selected_atoms
-            ]
-            raise ValueError(
-                f"target atom selection {target_atom_spec!r} must resolve to "
-                f"exactly one atom in chain {chain_label!r}; it selected "
-                f"{len(selected_atoms)}: {descriptions}"
-            )
-        atom_index = int(selected_atoms[0])
-        target_atoms_full[out_index] = atom_index
-        target_atom_labels.append(_atom_pair_label(tmpl_model, atom_index))
-
-    atom_indices_full = sorted(set(reference_atoms_full.tolist()) | set(target_atoms_full.tolist()))
+    atom_indices_full = sorted(
+        {
+            int(index)
+            for site in (*reference_sites_full, *target_sites_full)
+            for index in np.asarray(site, dtype=np.int64).tolist()
+        }
+    )
     index_map = {old: new for new, old in enumerate(atom_indices_full)}
-    reference_atoms_sel = np.asarray(
-        [index_map[int(atom_index)] for atom_index in reference_atoms_full],
-        dtype=np.int64,
-    )
-    target_atoms_sel = np.asarray(
-        [index_map[int(atom_index)] for atom_index in target_atoms_full],
-        dtype=np.int64,
-    )
-
-    box_fallback = None
-    if bool(pbc) and box_nm is not None:
-        box_fallback = _box_lengths_nm(box_nm)
+    reference_sites = _remap_pair_sites(reference_sites_full, index_map)
+    target_sites = _remap_pair_sites(target_sites_full, index_map)
 
     target_index_array = np.asarray(target_indices, dtype=np.int64)
     reference_index_array = np.asarray(reference_indices, dtype=np.int64)
     if bool(exclude_reference):
         keep_matrix = target_index_array[None, :] != reference_index_array[:, None]
     else:
-        keep_matrix = np.ones(
-            (len(reference_indices), len(target_indices)),
-            dtype=bool,
-        )
-
+        keep_matrix = np.ones((len(reference_indices), len(target_indices)), dtype=bool)
     retained_counts = np.sum(keep_matrix, axis=1, dtype=np.int64)
     if np.any(retained_counts <= 0):
         bad = int(np.flatnonzero(retained_counts <= 0)[0])
         raise ValueError(f"no target chains remain for reference chain {reference_labels[bad]!r}")
 
-    # In the usual all-reference/all-target use case every reference retains the
-    # same number of targets (N-1 when self is excluded).  Store only those
-    # retained distances while streaming, avoiding a second full
-    # (n_reference,n_target,n_frames) tensor at finalization.
     uniform_retained = bool(np.all(retained_counts == retained_counts[0]))
     n_retained = int(retained_counts[0]) if uniform_retained else -1
+    box_fallback = None
+    if bool(pbc) and box_nm is not None:
+        box_fallback = _box_lengths_nm(box_nm)
 
     distance_frames: list[np.ndarray] = []
     for dcd in dcd_list:
@@ -3395,12 +3491,7 @@ def interchain_distances_all_references_from_dcd(
                 continue
             if frame_stop is not None and frame_index >= int(frame_stop):
                 break
-
-            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
-            reference_positions = xyz[reference_atoms_sel, :]
-            target_positions = xyz[target_atoms_sel, :]
-            displacement = target_positions[None, :, :] - reference_positions[:, None, :]
-
+            box = None
             if bool(pbc):
                 if box_frame_nm is None:
                     if box_fallback is None:
@@ -3411,25 +3502,22 @@ def interchain_distances_all_references_from_dcd(
                     box = box_fallback
                 else:
                     box = _box_lengths_nm(box_frame_nm)
-                displacement -= np.rint(displacement / box.reshape(1, 1, 3)) * box.reshape(1, 1, 3)
 
-            matrix = np.linalg.norm(displacement, axis=2).astype(
-                np.float64,
-                copy=False,
+            matrix = _minimum_site_distance_matrix_nm(
+                np.asarray(xyz_sel_nm, dtype=np.float64),
+                reference_sites,
+                target_sites,
+                box_nm=box,
             )
             if uniform_retained:
                 distance_frames.append(
                     matrix[keep_matrix].reshape(len(reference_indices), n_retained)
                 )
             else:
-                # Rare mixed case (some references are absent from target_chains).
-                # Keep the full matrix so each reference can retain a different
-                # number of target rows during finalization.
                 distance_frames.append(matrix)
 
     if not distance_frames:
         raise ValueError("no frames selected")
-
     all_distances = np.stack(distance_frames, axis=2)
 
     results: dict[str, InterchainDistanceResult] = {}
@@ -3437,10 +3525,9 @@ def interchain_distances_all_references_from_dcd(
         zip(reference_indices, reference_labels)
     ):
         keep = keep_matrix[ref_out]
-        if uniform_retained:
-            distance_per_chain = all_distances[ref_out, :, :]
-        else:
-            distance_per_chain = all_distances[ref_out, keep, :]
+        distance_per_chain = (
+            all_distances[ref_out, :, :] if uniform_retained else all_distances[ref_out, keep, :]
+        )
         distance_mean = np.nanmean(distance_per_chain, axis=0)
         n_chains = int(distance_per_chain.shape[0])
         if n_chains < 2:
@@ -3448,6 +3535,16 @@ def interchain_distances_all_references_from_dcd(
         else:
             distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(
                 float(n_chains)
+            )
+
+        if bool(residue_pair):
+            reference_atom_index = -1
+            target_atom_indices = np.full(n_chains, -1, dtype=np.int64)
+        else:
+            reference_atom_index = int(reference_sites_full[ref_out][0])
+            target_atom_indices = np.asarray(
+                [int(site[0]) for site, retain in zip(target_sites_full, keep.tolist()) if retain],
+                dtype=np.int64,
             )
 
         results[str(reference_chain_label)] = InterchainDistanceResult(
@@ -3458,17 +3555,28 @@ def interchain_distances_all_references_from_dcd(
                 str(label) for label, retain in zip(target_labels, keep.tolist()) if retain
             ),
             reference_chain_label=str(reference_chain_label),
-            reference_atom_label=reference_atom_labels[ref_out],
+            reference_atom_label=reference_site_labels[ref_out],
             target_atom_labels=tuple(
-                label for label, retain in zip(target_atom_labels, keep.tolist()) if retain
+                label for label, retain in zip(target_site_labels, keep.tolist()) if retain
             ),
-            reference_atom_index=int(reference_atoms_full[ref_out]),
-            target_atom_indices=np.asarray(target_atoms_full[keep], dtype=np.int64),
+            reference_atom_index=reference_atom_index,
+            target_atom_indices=target_atom_indices,
             n_chains=n_chains,
             n_frames=int(distance_per_chain.shape[1]),
             selection=selection,
             exclude_reference=bool(exclude_reference),
             pbc=bool(pbc),
+            selection_mode="residue" if bool(residue_pair) else "atom",
+            include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
+            sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
+            reference_site_atom_indices=tuple(
+                int(x) for x in reference_sites_full[ref_out].tolist()
+            ),
+            target_site_atom_indices=tuple(
+                tuple(int(x) for x in site.tolist())
+                for site, retain in zip(target_sites_full, keep.tolist())
+                if retain
+            ),
         )
 
     return results
