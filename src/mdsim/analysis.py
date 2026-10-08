@@ -2312,7 +2312,7 @@ class IntrachainDistanceResult:
     n_frames: int
     selection: Any
     pbc: bool
-    selection_mode: str = "atom"  # "atom" | "residue"
+    selection_mode: str = "atom"  # "atom" | "atom_set" | "residue"
     include_hydrogens: bool = False
     sidechain_only: bool = False
     site_atom_indices: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = ()
@@ -2442,82 +2442,138 @@ def _pair_site_label(model: Any, atom_indices: Sequence[int]) -> str:
     return f"{resname}{resnum}"
 
 
-def _pair_sites_for_spec(
+def _pair_sites_for_specs(
     tmpl: Any,
-    spec: str,
+    specs: Sequence[str],
     *,
     chain_indices: Sequence[int],
     chain_labels: Sequence[str],
     atom_to_chain: np.ndarray,
-    residue_pair: bool,
+    selection_mode: str,
     include_hydrogens: bool,
     sidechain_only: bool,
     role: str,
 ) -> tuple[tuple[np.ndarray, ...], tuple[str, ...]]:
-    """Resolve one ordered atom/residue selector independently in each chain."""
+    """Resolve one ordered pair-selection side independently in each chain.
+
+    ``selection_mode`` may be:
+
+    - ``"atom"``: one explicit atom selector on this side;
+    - ``"atom_set"``: one or more explicit atom selectors on this side;
+    - ``"residue"``: one bare residue-number selector, expanded to the
+      requested residue atom subset.
+
+    Explicit atom selectors are resolved separately so every selector must yield
+    exactly one atom per selected physical chain. The atoms from all selectors
+    on the side are then combined into one site, and downstream distance
+    calculations take the minimum over all atom pairs between the two sites.
+    """
     model = tmpl.model if hasattr(tmpl, "model") else tmpl
-    groups = _selection_to_groups(tmpl, spec)
-    if not groups:
-        kind = "residue" if residue_pair else "atom"
-        raise ValueError(f"{role} {kind} selection {spec!r} produced no atoms")
+    mode = str(selection_mode).strip().lower()
+    if mode not in {"atom", "atom_set", "residue"}:
+        raise ValueError("selection_mode must be 'atom', 'atom_set', or 'residue'")
 
-    selected_atom_set = {
-        int(index) for group in groups for index in np.asarray(group, dtype=np.int64).tolist()
-    }
+    site_specs = tuple(str(spec).strip() for spec in specs)
+    if not site_specs or any(not spec for spec in site_specs):
+        raise ValueError(f"{role} site contains an empty selector")
 
-    sites: list[np.ndarray] = []
-    labels: list[str] = []
-    for chain_index, chain_label in zip(chain_indices, chain_labels):
-        matches = sorted(
-            atom_index
-            for atom_index in selected_atom_set
-            if int(atom_to_chain[int(atom_index)]) == int(chain_index)
-        )
-        if not matches:
-            kind = "residue" if residue_pair else "atom"
-            raise ValueError(
-                f"{role} {kind} selection {spec!r} selected no atoms in " f"chain {chain_label!r}"
+    if mode == "residue":
+        if len(site_specs) != 1:
+            raise ValueError("residue mode requires exactly one residue selector per side")
+        spec = site_specs[0]
+        groups = _selection_to_groups(tmpl, spec)
+        if not groups:
+            raise ValueError(f"{role} residue selection {spec!r} produced no atoms")
+
+        selected_atom_set = {
+            int(index) for group in groups for index in np.asarray(group, dtype=np.int64).tolist()
+        }
+
+        sites: list[np.ndarray] = []
+        labels: list[str] = []
+        for chain_index, chain_label in zip(chain_indices, chain_labels):
+            matches = sorted(
+                atom_index
+                for atom_index in selected_atom_set
+                if int(atom_to_chain[int(atom_index)]) == int(chain_index)
             )
+            if not matches:
+                raise ValueError(
+                    f"{role} residue selection {spec!r} selected no atoms in "
+                    f"chain {chain_label!r}"
+                )
 
-        if not residue_pair:
+            # Validate the unfiltered selector first, so an accidental
+            # multi-residue selection cannot be hidden by atom filtering.
+            residue_label = _pair_site_label(model, matches)
+            filtered: list[int] = []
+            for atom_index in matches:
+                atom = model.atoms[int(atom_index)]
+                if not bool(include_hydrogens) and _pair_atom_is_hydrogen(atom):
+                    continue
+                if bool(sidechain_only):
+                    atom_name = str(getattr(atom, "name", "") or "").strip().upper()
+                    if atom_name in _PAIR_BACKBONE_ATOM_NAMES:
+                        continue
+                filtered.append(int(atom_index))
+
+            if not filtered:
+                detail = "side-chain " if sidechain_only else ""
+                detail += "all-atom" if include_hydrogens else "heavy-atom"
+                raise ValueError(
+                    f"{role} residue selection {spec!r} in chain {chain_label!r} "
+                    f"contains no atoms after the {detail} filter ({residue_label})"
+                )
+
+            sites.append(np.asarray(filtered, dtype=np.int64))
+            labels.append(residue_label)
+
+        return tuple(sites), tuple(labels)
+
+    # Explicit atom / atom-set mode. Resolve every selector separately so that
+    # a selector cannot silently contribute a variable or unintended atom set.
+    per_chain_atoms: list[list[int]] = [[] for _ in chain_indices]
+    per_chain_labels: list[list[str]] = [[] for _ in chain_indices]
+
+    for spec in site_specs:
+        groups = _selection_to_groups(tmpl, spec)
+        if not groups:
+            raise ValueError(f"{role} atom selection {spec!r} produced no atoms")
+        selected_atom_set = {
+            int(index) for group in groups for index in np.asarray(group, dtype=np.int64).tolist()
+        }
+
+        for out_index, (chain_index, chain_label) in enumerate(zip(chain_indices, chain_labels)):
+            matches = sorted(
+                atom_index
+                for atom_index in selected_atom_set
+                if int(atom_to_chain[int(atom_index)]) == int(chain_index)
+            )
+            if not matches:
+                raise ValueError(
+                    f"{role} atom selection {spec!r} selected no atoms in " f"chain {chain_label!r}"
+                )
             if len(matches) != 1:
                 descriptions = [_atom_pair_label(model, atom_index) for atom_index in matches]
                 raise ValueError(
                     f"{role} atom selection {spec!r} must resolve to exactly one atom "
                     f"in chain {chain_label!r}; it selected {len(matches)}: {descriptions}. "
-                    "Use two bare residue-number selectors such as '39,69' to "
-                    "calculate a minimum distance between residues."
+                    "List multiple explicit atoms with '+' within one pairsel side, "
+                    "for example '39.CE2+39.CD2,69.SG+69.CB'."
                 )
-            sites.append(np.asarray(matches, dtype=np.int64))
-            labels.append(_atom_pair_label(model, matches[0]))
-            continue
 
-        # Validate the unfiltered selector first, so an accidental multi-residue
-        # selection cannot be hidden by heavy-atom or side-chain filtering.
-        residue_label = _pair_site_label(model, matches)
-        filtered: list[int] = []
-        for atom_index in matches:
-            atom = model.atoms[int(atom_index)]
-            if not bool(include_hydrogens) and _pair_atom_is_hydrogen(atom):
-                continue
-            if bool(sidechain_only):
-                atom_name = str(getattr(atom, "name", "") or "").strip().upper()
-                if atom_name in _PAIR_BACKBONE_ATOM_NAMES:
-                    continue
-            filtered.append(int(atom_index))
+            atom_index = int(matches[0])
+            # Repeated selectors are harmless mathematically but almost always
+            # accidental; de-duplicate them while preserving the user's order.
+            if atom_index not in per_chain_atoms[out_index]:
+                per_chain_atoms[out_index].append(atom_index)
+                per_chain_labels[out_index].append(_atom_pair_label(model, atom_index))
 
-        if not filtered:
-            detail = "side-chain " if sidechain_only else ""
-            detail += "all-atom" if include_hydrogens else "heavy-atom"
-            raise ValueError(
-                f"{role} residue selection {spec!r} in chain {chain_label!r} "
-                f"contains no atoms after the {detail} filter ({residue_label})"
-            )
-
-        sites.append(np.asarray(filtered, dtype=np.int64))
-        labels.append(residue_label)
-
-    return tuple(sites), tuple(labels)
+    sites = tuple(np.asarray(values, dtype=np.int64) for values in per_chain_atoms)
+    labels = tuple("+".join(values) for values in per_chain_labels)
+    if any(site.size == 0 for site in sites):
+        raise RuntimeError("internal pair-site resolution produced an empty atom set")
+    return sites, labels
 
 
 def _remap_pair_sites(
@@ -2585,7 +2641,7 @@ def intrachain_distances_from_dcd(
     dcd_files: Union[FileLike, Sequence[FileLike]],
     *,
     chains: Union[str, Sequence[str]] = "protein",
-    selection: Union[str, Sequence[str]],
+    selection: Union[str, Sequence[Any]],
     include_hydrogens: bool = False,
     sidechain_only: bool = False,
     pbc: bool = True,
@@ -2597,11 +2653,12 @@ def intrachain_distances_from_dcd(
 ) -> IntrachainDistanceResult:
     """Calculate an intrachain atom-pair or residue-pair minimum distance.
 
-    Pair mode is inferred from ``selection``. Two bare residue numbers, for
-    example ``"39,69"``, select residue-residue mode; selectors containing atom
-    names, for example ``"39.CE2,69.SG"``, retain the original atom-pair mode.
-    In residue mode the reported value is the minimum distance between any
-    retained atom in the two residues. Heavy atoms are used by default. Set
+    Pair mode is inferred from ``selection``. Each comma-separated side is a
+    site. ``"39.CE2,69.SG"`` is the one-atom-per-site special case.
+    ``"39.CE2+CD2,69.SG+CB"`` defines two explicit atom sets and returns
+    the minimum distance over all cross-set atom pairs. Two bare residue numbers,
+    for example ``"39,69"``, select residue-residue mode and compare all retained
+    atoms in the residues. Heavy atoms are used by default in residue mode; set
     ``include_hydrogens=True`` to include hydrogens and ``sidechain_only=True``
     to exclude the configured backbone/terminal atom names.
     """
@@ -2626,31 +2683,32 @@ def intrachain_distances_from_dcd(
     if not chain_indices:
         raise ValueError("chains produced no physical chains")
 
-    first_spec, second_spec = _ordered_atom_pair_selection_specs(selection)
-    residue_pair = _pair_specs_use_residue_mode(first_spec, second_spec)
-    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
+    first_specs, second_specs, selection_mode = _ordered_pair_selection_specs(selection)
+    residue_pair = selection_mode == "residue"
+    if selection_mode != "residue" and (bool(include_hydrogens) or bool(sidechain_only)):
         raise ValueError(
             "include_hydrogens and sidechain_only apply only to residue-pair "
-            "selections such as '39,69'"
+            "selections such as '39,69'; explicit atom sets already define "
+            "exactly which atoms are included"
         )
-    first_sites_full, first_labels = _pair_sites_for_spec(
+    first_sites_full, first_labels = _pair_sites_for_specs(
         tmpl,
-        first_spec,
+        first_specs,
         chain_indices=chain_indices,
         chain_labels=chain_labels,
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="first",
     )
-    second_sites_full, second_labels = _pair_sites_for_spec(
+    second_sites_full, second_labels = _pair_sites_for_specs(
         tmpl,
-        second_spec,
+        second_specs,
         chain_indices=chain_indices,
         chain_labels=chain_labels,
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="second",
@@ -2718,7 +2776,7 @@ def intrachain_distances_from_dcd(
     else:
         distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
 
-    if bool(residue_pair):
+    if selection_mode != "atom":
         legacy_indices = np.full((n_chains, 2), -1, dtype=np.int64)
     else:
         legacy_indices = np.asarray(
@@ -2737,7 +2795,7 @@ def intrachain_distances_from_dcd(
         n_frames=int(distance_per_chain.shape[1]),
         selection=selection,
         pbc=bool(pbc),
-        selection_mode="residue" if bool(residue_pair) else "atom",
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
         sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
         site_atom_indices=tuple(
@@ -2774,79 +2832,173 @@ class InterchainDistanceResult:
     selection: Any
     exclude_reference: bool
     pbc: bool
-    selection_mode: str = "atom"  # "atom" | "residue"
+    selection_mode: str = "atom"  # "atom" | "atom_set" | "residue"
     include_hydrogens: bool = False
     sidechain_only: bool = False
     reference_site_atom_indices: tuple[int, ...] = ()
     target_site_atom_indices: tuple[tuple[int, ...], ...] = ()
 
 
-def _ordered_atom_pair_selection_specs(
-    selection: Union[str, Sequence[str]],
-) -> tuple[str, str]:
-    """Normalize an ordered two-site selection into two selector strings.
+def _is_bare_residue_pair_selector(spec: str) -> bool:
+    """Return whether *spec* is one bare integer residue number."""
+    value = str(spec).strip()
+    if value.startswith(("+", "-")):
+        value = value[1:]
+    return bool(value) and value.isdigit()
 
-    Accepted forms include::
 
-        ["39.CE2", "69.SG"]
+def _pair_side_specs(value: Any, *, role: str) -> tuple[str, ...]:
+    """Normalize one side of ``pairsel`` and expand residue-number shorthand.
+
+    Within one side of ``pairsel``, an atom name without a residue prefix
+    inherits the most recently specified residue number. For example::
+
+        "39.CE2+CD2+NE1"
+
+    is expanded to::
+
+        ("39.CE2", "39.CD2", "39.NE1")
+
+    An explicitly qualified selector updates the inherited residue number, so::
+
+        "39.CE2+CD2+40.CB+CG"
+
+    becomes::
+
+        ("39.CE2", "39.CD2", "40.CB", "40.CG")
+
+    A bare residue number remains bare. This preserves the special
+    residue-residue form ``"39,69"`` and allows the higher-level parser to
+    distinguish it from explicit atom-set mode.
+    """
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError(f"{role} pair-selection side is empty")
+        parts = [part.strip() for part in raw.split("+")]
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        parts = [str(part).strip() for part in value]
+    else:
+        raise TypeError(
+            f"{role} pair-selection side must be a selector string or a "
+            "sequence of selector strings"
+        )
+
+    if not parts or any(not part for part in parts):
+        raise ValueError(f"{role} pair-selection side contains an empty atom selector")
+
+    expanded: list[str] = []
+    inherited_residue: Optional[str] = None
+
+    for part in parts:
+        # Bare signed/unsigned integer: preserve it as a residue selector.
+        residue_test = part
+        if residue_test.startswith(("+", "-")):
+            residue_test = residue_test[1:]
+        if residue_test.isdigit():
+            inherited_residue = part
+            expanded.append(part)
+            continue
+
+        if "." in part:
+            head, tail = part.split(".", 1)
+            head_test = head
+            if head_test.startswith(("+", "-")):
+                head_test = head_test[1:]
+            if head_test.isdigit():
+                if not tail:
+                    raise ValueError(f"{role} pair-selection selector {part!r} has no atom name")
+                inherited_residue = head
+                expanded.append(part)
+                continue
+
+        # No residue-number prefix: inherit from the most recent qualified
+        # selector on this side.
+        if inherited_residue is None:
+            raise ValueError(
+                f"{role} pair-selection atom {part!r} has no residue number to "
+                "inherit. Qualify the first atom on each side, for example "
+                "'39.CE2+CD2,69.SG+CB'."
+            )
+
+        expanded.append(f"{inherited_residue}.{part}")
+
+    return tuple(expanded)
+
+
+def _ordered_pair_selection_specs(
+    selection: Union[str, Sequence[Any]],
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    """Normalize ``pairsel`` into two sites and infer their selection mode.
+
+    Compact string forms::
+
+        "39.CE2,69.SG"                    # one atom versus one atom
+        "39.CE2+CD2,69.SG+CB"            # atom set shorthand
+        "39.CE2+CD2,69.SG+CB"      # fully qualified equivalent
+        "39,69"                           # all selected atoms in two residues
+
+    Structured forms are also accepted::
+
         ("39.CE2", "69.SG")
-        "39.CE2,69.SG"
-        "39.CE2;69.SG"
-        "39.CE2_69.SG"
+        (["39.CE2", "CD2"], ["69.SG", "CB"])
+        (["39.CE2", "39.CD2"], ["69.SG", "69.CB"])
 
-    The order matters: the first selector defines the reference-chain atom and
-    the second selector defines the target-chain atom.
+    Comma is the preferred separator between the two sites. Semicolon and
+    underscore remain accepted for backward compatibility. ``+`` is reserved
+    for joining explicit atom selectors within one site. After the first
+    residue-qualified atom on a side, subsequent atom names inherit that residue
+    number, so ``"39.CE2+CD2"`` is shorthand for
+    ``"39.CE2+39.CD2"``.
+
+    Returns
+    -------
+    first_specs, second_specs, selection_mode
+        ``selection_mode`` is ``"atom"`` for the one-atom special case,
+        ``"atom_set"`` when either explicit site contains multiple atoms, and
+        ``"residue"`` when both sites are single bare residue numbers.
     """
     if isinstance(selection, str):
         raw = selection.strip()
         if not raw:
             raise ValueError("selection is empty")
-
-        # StructureSelector treats ';' and '_' as group separators. Comma is
-        # also accepted here for consistency with intrachain_distances_from_dcd.
         normalized = raw.replace(";", ",").replace("_", ",")
-        parts = [part.strip() for part in normalized.split(",") if part.strip()]
-    elif isinstance(selection, Sequence):
-        parts = [str(part).strip() for part in selection]
+        sides: list[Any] = [part.strip() for part in normalized.split(",")]
+    elif isinstance(selection, Sequence) and not isinstance(selection, (str, bytes)):
+        sides = list(selection)
     else:
-        raise TypeError("selection must be a string or a sequence of two strings")
+        raise TypeError("selection must be a pair-selection string or a two-element sequence")
 
-    if len(parts) != 2 or any(not part for part in parts):
+    if len(sides) != 2:
         raise ValueError(
-            "selection must contain exactly two ordered selectors, for example "
-            "['39.CE2', '69.SG'], '39.CE2,69.SG', or residue selectors '39,69'"
+            "selection must contain exactly two ordered sites. Examples: "
+            "'39.CE2,69.SG', '39.CE2+CD2,69.SG+CB', or '39,69'"
         )
 
-    return parts[0], parts[1]
+    first_specs = _pair_side_specs(sides[0], role="first")
+    second_specs = _pair_side_specs(sides[1], role="second")
 
+    first_is_residue = len(first_specs) == 1 and _is_bare_residue_pair_selector(first_specs[0])
+    second_is_residue = len(second_specs) == 1 and _is_bare_residue_pair_selector(second_specs[0])
 
-def _pair_specs_use_residue_mode(first_spec: str, second_spec: str) -> bool:
-    """Infer residue-pair mode when both selectors are bare residue numbers.
+    if first_is_residue and second_is_residue:
+        return first_specs, second_specs, "residue"
 
-    Examples
-    --------
-    ``"39,69"`` -> residue mode
-    ``"39.CE2,69.SG"`` -> atom mode
-
-    Mixing one bare residue number with one atom selector is rejected because it
-    would otherwise make the intended distance definition unclear.
-    """
-
-    def is_bare_residue_number(spec: str) -> bool:
-        value = str(spec).strip()
-        if value.startswith(("+", "-")):
-            value = value[1:]
-        return bool(value) and value.isdigit()
-
-    first_is_residue = is_bare_residue_number(first_spec)
-    second_is_residue = is_bare_residue_number(second_spec)
-    if first_is_residue != second_is_residue:
+    # A bare residue number means "all selected atoms in that residue" and is
+    # therefore only legal in the unambiguous residue-residue form above.
+    bare_in_explicit = [
+        spec for spec in (*first_specs, *second_specs) if _is_bare_residue_pair_selector(spec)
+    ]
+    if bare_in_explicit:
         raise ValueError(
-            "pair selection mixes a bare residue number with an atom selector. "
-            "Use either two residue numbers (for example '39,69') or two atom "
-            "selectors (for example '39.CE2,69.SG')."
+            "bare residue numbers can only be used as a residue-residue pair "
+            "(for example '39,69'). For an explicit atom set, qualify every "
+            "first atom on each side with its residue number, for example "
+            "'39.CE2+CD2,69.SG+CB'."
         )
-    return first_is_residue
+
+    selection_mode = "atom" if len(first_specs) == 1 and len(second_specs) == 1 else "atom_set"
+    return first_specs, second_specs, selection_mode
 
 
 @dataclass(frozen=True)
@@ -2880,7 +3032,7 @@ class MinimumContactDistanceResult:
     pair_mode: str  # "both" | "intra" | "inter"
     selection: Any
     pbc: bool
-    selection_mode: str = "atom"  # "atom" | "residue"
+    selection_mode: str = "atom"  # "atom" | "atom_set" | "residue"
     include_hydrogens: bool = False
     sidechain_only: bool = False
     reference_site_atom_indices: tuple[tuple[int, ...], ...] = ()
@@ -2992,7 +3144,7 @@ def minimum_contact_distances_from_dcd(
     dcd_files: Union[FileLike, Sequence[FileLike]],
     *,
     chains: Union[str, Sequence[str]] = "protein",
-    selection: Union[str, Sequence[str]],
+    selection: Union[str, Sequence[Any]],
     option: Optional[str] = None,
     include_hydrogens: bool = False,
     sidechain_only: bool = False,
@@ -3005,12 +3157,13 @@ def minimum_contact_distances_from_dcd(
 ) -> MinimumContactDistanceResult:
     """Return a per-chain minimum atom-pair or residue-pair distance.
 
-    Two bare residue-number selectors (for example ``"39,69"``) automatically
-    select residue mode; atom selectors such as ``"39.CE2,69.SG"`` retain the
-    original atom-pair behavior. In residue mode every chain-chain distance is
-    the minimum over all retained atom pairs between those residues. Heavy atoms
-    are used by default; ``include_hydrogens=True`` includes hydrogens and
-    ``sidechain_only=True`` excludes the configured backbone/terminal atom names.
+    Each side of ``selection`` is a site. Explicit atom sets may be written as
+    ``"39.CE2+CD2,69.SG+CB"``; every chain-chain distance is then the
+    minimum over all cross-set atom pairs. ``"39.CE2,69.SG"`` is the one-atom
+    special case. Two bare residue numbers (for example ``"39,69"``) compare
+    all retained residue atoms. Heavy atoms are used by default in residue mode;
+    ``include_hydrogens=True`` includes hydrogens and ``sidechain_only=True``
+    excludes the configured backbone/terminal atom names.
     """
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -3038,31 +3191,32 @@ def minimum_contact_distances_from_dcd(
     if pair_mode == "inter" and len(chain_indices) < 2:
         raise ValueError("option='interonly' requires at least two selected chains")
 
-    reference_spec, target_spec = _ordered_atom_pair_selection_specs(selection)
-    residue_pair = _pair_specs_use_residue_mode(reference_spec, target_spec)
-    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
+    reference_specs, target_specs, selection_mode = _ordered_pair_selection_specs(selection)
+    residue_pair = selection_mode == "residue"
+    if selection_mode != "residue" and (bool(include_hydrogens) or bool(sidechain_only)):
         raise ValueError(
             "include_hydrogens and sidechain_only apply only to residue-pair "
-            "selections such as '39,69'"
+            "selections such as '39,69'; explicit atom sets already define "
+            "exactly which atoms are included"
         )
-    reference_sites_full, reference_labels = _pair_sites_for_spec(
+    reference_sites_full, reference_labels = _pair_sites_for_specs(
         tmpl,
-        reference_spec,
+        reference_specs,
         chain_indices=chain_indices,
         chain_labels=chain_labels,
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="reference",
     )
-    target_sites_full, target_labels = _pair_sites_for_spec(
+    target_sites_full, target_labels = _pair_sites_for_specs(
         tmpl,
-        target_spec,
+        target_specs,
         chain_indices=chain_indices,
         chain_labels=chain_labels,
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="target",
@@ -3141,7 +3295,7 @@ def minimum_contact_distances_from_dcd(
     else:
         distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
 
-    if bool(residue_pair):
+    if selection_mode != "atom":
         reference_atom_indices = np.full(n_chains, -1, dtype=np.int64)
         target_atom_indices = np.full(n_chains, -1, dtype=np.int64)
     else:
@@ -3168,7 +3322,7 @@ def minimum_contact_distances_from_dcd(
         pair_mode=pair_mode,
         selection=selection,
         pbc=bool(pbc),
-        selection_mode="residue" if bool(residue_pair) else "atom",
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
         sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
         reference_site_atom_indices=tuple(
@@ -3186,7 +3340,7 @@ def interchain_distances_from_dcd(
     *,
     reference_chain: Union[str, Sequence[str]],
     target_chains: Union[str, Sequence[str]] = "protein",
-    selection: Union[str, Sequence[str]],
+    selection: Union[str, Sequence[Any]],
     exclude_reference: bool = True,
     include_hydrogens: bool = False,
     sidechain_only: bool = False,
@@ -3199,8 +3353,10 @@ def interchain_distances_from_dcd(
 ) -> InterchainDistanceResult:
     """Distances from one reference-chain site to target-chain sites.
 
-    Two bare residue numbers in ``selection`` automatically select residue mode;
-    atom selectors retain the original atom-pair mode.
+    Each side of ``selection`` is a site. Use ``+`` to list several explicit
+    atoms within a site, for example ``"39.CE2+CD2,69.SG+CB"``.
+    One atom per side remains supported, and two bare residue numbers compare all
+    retained atoms in the two residues.
     """
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -3245,31 +3401,32 @@ def interchain_distances_from_dcd(
             raise ValueError("no target chains remain after excluding the reference chain")
         raise ValueError("target_chains produced no physical chains")
 
-    reference_spec, target_spec = _ordered_atom_pair_selection_specs(selection)
-    residue_pair = _pair_specs_use_residue_mode(reference_spec, target_spec)
-    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
+    reference_specs, target_specs, selection_mode = _ordered_pair_selection_specs(selection)
+    residue_pair = selection_mode == "residue"
+    if selection_mode != "residue" and (bool(include_hydrogens) or bool(sidechain_only)):
         raise ValueError(
             "include_hydrogens and sidechain_only apply only to residue-pair "
-            "selections such as '39,69'"
+            "selections such as '39,69'; explicit atom sets already define "
+            "exactly which atoms are included"
         )
-    reference_sites_full, reference_site_labels = _pair_sites_for_spec(
+    reference_sites_full, reference_site_labels = _pair_sites_for_specs(
         tmpl,
-        reference_spec,
+        reference_specs,
         chain_indices=[reference_chain_index],
         chain_labels=[reference_chain_label],
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="reference",
     )
-    target_sites_full, target_site_labels = _pair_sites_for_spec(
+    target_sites_full, target_site_labels = _pair_sites_for_specs(
         tmpl,
-        target_spec,
+        target_specs,
         chain_indices=retained_target_indices,
         chain_labels=retained_target_labels,
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="target",
@@ -3334,7 +3491,7 @@ def interchain_distances_from_dcd(
     else:
         distance_stderr = np.nanstd(distance_per_chain, axis=0, ddof=1) / math.sqrt(float(n_chains))
 
-    if bool(residue_pair):
+    if selection_mode != "atom":
         reference_atom_index = -1
         target_atom_indices = np.full(n_chains, -1, dtype=np.int64)
     else:
@@ -3358,7 +3515,7 @@ def interchain_distances_from_dcd(
         selection=selection,
         exclude_reference=bool(exclude_reference),
         pbc=bool(pbc),
-        selection_mode="residue" if bool(residue_pair) else "atom",
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
         sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
         reference_site_atom_indices=tuple(int(x) for x in reference_sites_full[0].tolist()),
@@ -3374,7 +3531,7 @@ def interchain_distances_all_references_from_dcd(
     *,
     reference_chains: Union[str, Sequence[str]] = "protein",
     target_chains: Union[str, Sequence[str]] = "protein",
-    selection: Union[str, Sequence[str]],
+    selection: Union[str, Sequence[Any]],
     exclude_reference: bool = True,
     include_hydrogens: bool = False,
     sidechain_only: bool = False,
@@ -3387,8 +3544,10 @@ def interchain_distances_all_references_from_dcd(
 ) -> dict[str, InterchainDistanceResult]:
     """Batched all-reference pair distances in one DCD pass.
 
-    Two bare residue numbers in ``selection`` automatically select residue mode;
-    atom selectors retain the original atom-pair mode.
+    Each side of ``selection`` is a site. Use ``+`` to list several explicit
+    atoms within a site, for example ``"39.CE2+CD2,69.SG+CB"``.
+    One atom per side remains supported, and two bare residue numbers compare all
+    retained atoms in the two residues.
     """
     if int(stride) <= 0:
         raise ValueError("stride must be >= 1")
@@ -3418,31 +3577,32 @@ def interchain_distances_all_references_from_dcd(
     if not target_indices:
         raise ValueError("target_chains produced no physical chains")
 
-    reference_spec, target_spec = _ordered_atom_pair_selection_specs(selection)
-    residue_pair = _pair_specs_use_residue_mode(reference_spec, target_spec)
-    if not residue_pair and (bool(include_hydrogens) or bool(sidechain_only)):
+    reference_specs, target_specs, selection_mode = _ordered_pair_selection_specs(selection)
+    residue_pair = selection_mode == "residue"
+    if selection_mode != "residue" and (bool(include_hydrogens) or bool(sidechain_only)):
         raise ValueError(
             "include_hydrogens and sidechain_only apply only to residue-pair "
-            "selections such as '39,69'"
+            "selections such as '39,69'; explicit atom sets already define "
+            "exactly which atoms are included"
         )
-    reference_sites_full, reference_site_labels = _pair_sites_for_spec(
+    reference_sites_full, reference_site_labels = _pair_sites_for_specs(
         tmpl,
-        reference_spec,
+        reference_specs,
         chain_indices=reference_indices,
         chain_labels=reference_labels,
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="reference",
     )
-    target_sites_full, target_site_labels = _pair_sites_for_spec(
+    target_sites_full, target_site_labels = _pair_sites_for_specs(
         tmpl,
-        target_spec,
+        target_specs,
         chain_indices=target_indices,
         chain_labels=target_labels,
         atom_to_chain=atom_to_chain,
-        residue_pair=bool(residue_pair),
+        selection_mode=selection_mode,
         include_hydrogens=bool(include_hydrogens),
         sidechain_only=bool(sidechain_only),
         role="target",
@@ -3537,7 +3697,7 @@ def interchain_distances_all_references_from_dcd(
                 float(n_chains)
             )
 
-        if bool(residue_pair):
+        if selection_mode != "atom":
             reference_atom_index = -1
             target_atom_indices = np.full(n_chains, -1, dtype=np.int64)
         else:
@@ -3566,7 +3726,7 @@ def interchain_distances_all_references_from_dcd(
             selection=selection,
             exclude_reference=bool(exclude_reference),
             pbc=bool(pbc),
-            selection_mode="residue" if bool(residue_pair) else "atom",
+            selection_mode=selection_mode,
             include_hydrogens=bool(include_hydrogens) if bool(residue_pair) else False,
             sidechain_only=bool(sidechain_only) if bool(residue_pair) else False,
             reference_site_atom_indices=tuple(
