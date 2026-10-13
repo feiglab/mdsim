@@ -3074,3 +3074,363 @@ def fit_dist_msd_map_linear(
 
 # More descriptive alias.
 fit_dist_diffusion_map = fit_dist_msd_map_linear
+
+
+# ---- unconditioned intrachain distance-coordinate MSD -------------------------
+
+
+@dataclass(frozen=True)
+class DistanceMSD1DResult:
+    """Unconditional mean square increments of a 1D distance coordinate.
+
+    The chain axis is first; lag-time averages are calculated independently
+    for each chain, and msd_nm2 is their equal-weight mean. NaN endpoints
+    do not contribute. All times are in ns and distances in nm.
+    """
+
+    t_ns: np.ndarray  # (n_lags,)
+    lags_frames: np.ndarray  # (n_lags,)
+    msd_nm2: np.ndarray  # (n_lags,)
+    msd_stderr_nm2: np.ndarray  # (n_lags,), SEM across chains
+    msd_per_chain_nm2: np.ndarray  # (n_chains, n_lags)
+    counts_per_chain: np.ndarray  # (n_chains, n_lags)
+    counts: np.ndarray  # (n_lags,), valid time-origin pairs
+    n_chains: int
+    n_frames: int
+    dt_ns: float
+    origin_stride: int
+    chain_labels: tuple[str, ...] = ()
+    selection: object = None
+    atom_labels: tuple[tuple[str, str], ...] = ()
+    selection_mode: str = "unknown"
+    pbc: Optional[bool] = None
+    units: str = "nm^2"
+
+
+@dataclass(frozen=True)
+class DistanceDiffusion1DFitResult:
+    """Finite-window effective 1D diffusion fitted from an unconditional MSD."""
+
+    d_nm2_per_ns: float
+    d_stderr_nm2_per_ns: float
+    slope_nm2_per_ns: float
+    intercept_nm2: float
+    fit_tmin_ns: float
+    fit_tmax_ns: float
+    dims: int
+    fit_intercept: bool
+    per_chain_d_nm2_per_ns: np.ndarray
+    n_chains: int
+    n_sets: int = 1
+    set_labels: tuple[str, ...] = ()
+    per_set_d_nm2_per_ns: Optional[np.ndarray] = None
+    per_set_d_stderr_nm2_per_ns: Optional[np.ndarray] = None
+    aggregation: str = "chains_equal_weight"
+
+
+def distance_msd_1d_from_series(
+    data: object,
+    *,
+    dt_ns: float,
+    distance_field: str = "distance_per_chain_nm",
+    lags_frames: Optional[Sequence[int]] = None,
+    max_lag_frames: int = 200,
+    lag_stride: int = 1,
+    origin_stride: int = 1,
+) -> DistanceMSD1DResult:
+    """Compute <[r(t+tau)-r(t)]^2> without initial-distance binning.
+
+    ``data`` may be a 1D/2D numeric time series, or an existing result from
+    mdsim.analysis.intrachain_distances_from_dcd (one row per chain). For arrays,
+    axis 0 is the chain axis and axis 1 is the frame axis. A 1D array becomes
+    one chain. ``dt_ns`` is the spacing of the supplied time-series frames, not
+    the original unsampled DCD interval.
+
+    Each chain's valid time origins receive equal weight, then chains are
+    averaged equally; the SEM measures chain-to-chain variability. Finite
+    endpoints are required at both times. No equilibrium-distance subtraction
+    is applied (the increment eliminates a constant offset).
+    """
+    if not np.isfinite(dt_ns) or float(dt_ns) <= 0:
+        raise ValueError("dt_ns must be finite and > 0")
+    if (
+        isinstance(origin_stride, (bool, np.bool_))
+        or int(origin_stride) != origin_stride
+        or int(origin_stride) < 1
+    ):
+        raise ValueError("origin_stride must be an integer >= 1")
+
+    if hasattr(data, distance_field):
+        x = np.asarray(getattr(data, distance_field), dtype=np.float64)
+        labels = tuple(str(v) for v in getattr(data, "chain_labels", ()))
+        selection = getattr(data, "selection", None)
+        atom_labels = tuple(getattr(data, "atom_labels", ()))
+        selection_mode = str(getattr(data, "selection_mode", "unknown"))
+        pbc = getattr(data, "pbc", None)
+    elif isinstance(data, Mapping) and distance_field in data:
+        x = np.asarray(data[distance_field], dtype=np.float64)
+        labels = tuple(str(v) for v in data.get("chain_labels", ()))
+        selection = data.get("selection")
+        atom_labels = tuple(data.get("atom_labels", ()))
+        selection_mode = str(data.get("selection_mode", "unknown"))
+        pbc = data.get("pbc")
+    else:
+        x = np.asarray(data, dtype=np.float64)
+        labels, selection, atom_labels, selection_mode, pbc = (), None, (), "unknown", None
+
+    if x.ndim == 1:
+        x = x[None, :]
+    if x.ndim != 2 or x.shape[0] < 1 or x.shape[1] < 2:
+        raise ValueError("distance data must have shape (n_chains, n_frames>=2)")
+    n_chains, n_frames = x.shape
+    if labels and len(labels) != n_chains:
+        raise ValueError("chain_labels does not match distance data")
+    if not labels:
+        labels = tuple(f"chain {i}" for i in range(n_chains))
+
+    lags = _make_lags(
+        max_lag_frames=max_lag_frames,
+        lag_stride=lag_stride,
+        lags_frames=lags_frames,
+    )
+    if int(lags[-1]) >= n_frames:
+        raise ValueError(
+            f"largest lag ({int(lags[-1])}) must be shorter than "
+            f"the supplied time series ({n_frames} frames)"
+        )
+    n_lags = int(lags.size)
+    per_chain = np.full((n_chains, n_lags), np.nan, dtype=np.float64)
+    counts_ch = np.zeros((n_chains, n_lags), dtype=np.int64)
+
+    for li, lag in enumerate(lags):
+        tau = int(lag)
+        # No artificial linking of adjacent frame values and no r0 restriction.
+        origins = np.arange(0, n_frames - tau, int(origin_stride), dtype=np.int64)
+        a = x[:, origins]
+        b = x[:, origins + tau]
+        valid = np.isfinite(a) & np.isfinite(b)
+        n = valid.sum(axis=1, dtype=np.int64)
+        counts_ch[:, li] = n
+        if tau == 0:
+            per_chain[n > 0, li] = 0.0
+        else:
+            dr2 = (b - a) ** 2
+            total = np.sum(np.where(valid, dr2, 0.0), axis=1)
+            np.divide(total, n, out=per_chain[:, li], where=n > 0)
+
+    available = np.isfinite(per_chain)
+    n_available = available.sum(axis=0, dtype=np.int64)
+    sums = np.sum(np.where(available, per_chain, 0.0), axis=0)
+    mean = np.full(n_lags, np.nan, dtype=np.float64)
+    np.divide(sums, n_available, out=mean, where=n_available > 0)
+    stderr = np.full(n_lags, np.nan, dtype=np.float64)
+    for li, n in enumerate(n_available):
+        if n > 1:
+            stderr[li] = np.std(per_chain[available[:, li], li], ddof=1) / np.sqrt(float(n))
+
+    return DistanceMSD1DResult(
+        t_ns=lags.astype(float) * float(dt_ns),
+        lags_frames=lags,
+        msd_nm2=mean,
+        msd_stderr_nm2=stderr,
+        msd_per_chain_nm2=per_chain,
+        counts_per_chain=counts_ch,
+        counts=counts_ch.sum(axis=0),
+        n_chains=int(n_chains),
+        n_frames=int(n_frames),
+        dt_ns=float(dt_ns),
+        origin_stride=int(origin_stride),
+        chain_labels=labels,
+        selection=selection,
+        atom_labels=atom_labels,
+        selection_mode=selection_mode,
+        pbc=pbc,
+    )
+
+
+def distance_msd_1d_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    chains: Union[str, Sequence[str]] = "protein",
+    selection: Union[str, Sequence[object]],
+    dt_ns: float,
+    include_hydrogens: bool = False,
+    sidechain_only: bool = False,
+    pbc: bool = True,
+    lags_frames: Optional[Sequence[int]] = None,
+    max_lag_frames: int = 200,
+    lag_stride: int = 1,
+    origin_stride: int = 1,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    box_nm: Optional[Sequence[float]] = None,
+) -> DistanceMSD1DResult:
+    """Read an intrachain distance time series and calculate its unconditional MSD.
+
+    Uses the SAME pair-site selection and per-frame minimum atom--atom distance
+    as mdsim.analysis.intrachain_distances_from_dcd. Examples:
+    ``'39.CE2,69.SG'``; ``'39.CE2+CD2,69.SG+CB'``; ``'39,69'``.
+    ``pbc=True`` takes the minimum image independently in each frame. This is
+    a scalar minimum-distance coordinate; it does NOT implement an origin-
+    dependent hybrid/unwrapped atom-pair coordinate.
+    The supplied dt_ns is the spacing of OUTPUT frames (after stride).
+    """
+    # Deferred import: mdsim.analysis already owns pair-site parsing and minimum
+    # distance logic, so do not duplicate potentially divergent implementations.
+    from .analysis import intrachain_distances_from_dcd
+
+    series = intrachain_distances_from_dcd(
+        pdb_file=pdb_file,
+        dcd_files=dcd_files,
+        chains=chains,
+        selection=selection,
+        include_hydrogens=include_hydrogens,
+        sidechain_only=sidechain_only,
+        pbc=pbc,
+        box_nm=box_nm,
+        stride=stride,
+        chunk=chunk,
+        frame_start=frame_start,
+        frame_stop=frame_stop,
+    )
+    return distance_msd_1d_from_series(
+        series,
+        dt_ns=dt_ns,
+        lags_frames=lags_frames,
+        max_lag_frames=max_lag_frames,
+        lag_stride=lag_stride,
+        origin_stride=origin_stride,
+    )
+
+
+def _fit_distance_msd_1d_single(
+    data: DistanceMSD1DResult,
+    *,
+    fit_tmin_ns: float,
+    fit_tmax_ns: float,
+    dims: int,
+    fit_intercept: bool,
+) -> DistanceDiffusion1DFitResult:
+    """Fit mean MSD and each individual chain over the same lag-time window."""
+    t = np.asarray(data.t_ns, dtype=float)
+    y = np.asarray(data.msd_nm2, dtype=float)
+    if int(dims) != dims or int(dims) < 1:
+        raise ValueError("dims must be an integer >= 1")
+    if not np.isfinite(fit_tmin_ns) or not np.isfinite(fit_tmax_ns) or fit_tmax_ns <= fit_tmin_ns:
+        raise ValueError("fit_tmax_ns must be finite and > fit_tmin_ns")
+    ok = (t >= fit_tmin_ns) & (t <= fit_tmax_ns) & np.isfinite(t) & np.isfinite(y)
+    if int(np.sum(ok)) < 2:
+        raise ValueError("fit window must contain at least two finite MSD points")
+
+    def fit_one(yvals: np.ndarray) -> tuple[float, float]:
+        finite = ok & np.isfinite(yvals)
+        if int(np.sum(finite)) < 2:
+            return float("nan"), float("nan")
+        xx = t[finite]
+        yy = yvals[finite]
+        if fit_intercept:
+            return _linear_fit(xx, yy)
+        slope = float(np.dot(xx, yy) / np.dot(xx, xx))
+        return slope, 0.0
+
+    slope, intercept = fit_one(y)
+    per_chain = np.full(data.n_chains, np.nan, dtype=np.float64)
+    for i in range(data.n_chains):
+        s, _ = fit_one(np.asarray(data.msd_per_chain_nm2[i], dtype=float))
+        per_chain[i] = s / (2.0 * float(dims))
+    available = per_chain[np.isfinite(per_chain)]
+    chain_sem = (
+        float(np.std(available, ddof=1) / np.sqrt(float(len(available))))
+        if len(available) >= 2
+        else float("nan")
+    )
+    return DistanceDiffusion1DFitResult(
+        d_nm2_per_ns=float(slope / (2.0 * float(dims))),
+        d_stderr_nm2_per_ns=chain_sem,
+        slope_nm2_per_ns=slope,
+        intercept_nm2=intercept,
+        fit_tmin_ns=float(fit_tmin_ns),
+        fit_tmax_ns=float(fit_tmax_ns),
+        dims=int(dims),
+        fit_intercept=bool(fit_intercept),
+        per_chain_d_nm2_per_ns=per_chain,
+        n_chains=data.n_chains,
+    )
+
+
+def fit_distance_msd_1d(
+    data: Union[DistanceMSD1DResult, Mapping[str, DistanceMSD1DResult]],
+    *,
+    fit_tmin_ns: float,
+    fit_tmax_ns: float,
+    dims: int = 1,
+    fit_intercept: bool = True,
+) -> DistanceDiffusion1DFitResult:
+    """Fit D = slope/(2*dims); mapping input averages set-specific fitted Ds.
+
+    For a single set, uncertainty is SEM of the chain-specific D estimates.
+    For multiple simulation sets, D and SEM are equal-weight mean and SEM
+    across set-level estimates; chain-level results remain in individual fits.
+    A bounded intrachain coordinate generally has a plateauing MSD, so fitted
+    D is a *time-window-dependent effective* distance-coordinate diffusivity.
+    """
+    if not isinstance(data, Mapping):
+        return _fit_distance_msd_1d_single(
+            data,
+            fit_tmin_ns=fit_tmin_ns,
+            fit_tmax_ns=fit_tmax_ns,
+            dims=dims,
+            fit_intercept=fit_intercept,
+        )
+    if not data:
+        raise ValueError("data mapping is empty")
+    # A one-entry get_values mapping is still one simulation, so preserve
+    # chain-to-chain uncertainty rather than inventing a one-set SEM.
+    if len(data) == 1:
+        return _fit_distance_msd_1d_single(
+            next(iter(data.values())),
+            fit_tmin_ns=fit_tmin_ns,
+            fit_tmax_ns=fit_tmax_ns,
+            dims=dims,
+            fit_intercept=fit_intercept,
+        )
+    labels = tuple(str(k) for k in data)
+    fits = [
+        _fit_distance_msd_1d_single(
+            result,
+            fit_tmin_ns=fit_tmin_ns,
+            fit_tmax_ns=fit_tmax_ns,
+            dims=dims,
+            fit_intercept=fit_intercept,
+        )
+        for result in data.values()
+    ]
+    d = np.asarray([f.d_nm2_per_ns for f in fits], dtype=float)
+    valid = d[np.isfinite(d)]
+    if not valid.size:
+        raise ValueError("no finite per-set diffusion fits")
+    sem = (
+        float(np.std(valid, ddof=1) / np.sqrt(float(valid.size)))
+        if valid.size >= 2
+        else float("nan")
+    )
+    return DistanceDiffusion1DFitResult(
+        d_nm2_per_ns=float(np.mean(valid)),
+        d_stderr_nm2_per_ns=sem,
+        slope_nm2_per_ns=float(np.mean([f.slope_nm2_per_ns for f in fits])),
+        intercept_nm2=float(np.mean([f.intercept_nm2 for f in fits])),
+        fit_tmin_ns=float(fit_tmin_ns),
+        fit_tmax_ns=float(fit_tmax_ns),
+        dims=int(dims),
+        fit_intercept=bool(fit_intercept),
+        per_chain_d_nm2_per_ns=np.concatenate([f.per_chain_d_nm2_per_ns for f in fits]),
+        n_chains=sum(f.n_chains for f in fits),
+        n_sets=len(fits),
+        set_labels=labels,
+        per_set_d_nm2_per_ns=d,
+        per_set_d_stderr_nm2_per_ns=np.asarray([f.d_stderr_nm2_per_ns for f in fits]),
+        aggregation="sets_equal_weight",
+    )
