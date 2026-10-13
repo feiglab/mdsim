@@ -3434,3 +3434,154 @@ def fit_distance_msd_1d(
         per_set_d_stderr_nm2_per_ns=np.asarray([f.d_stderr_nm2_per_ns for f in fits]),
         aggregation="sets_equal_weight",
     )
+
+
+# ---- initial-distance-binned MSD from cached scalar distance time series ----
+
+
+def dist_msd_binned_from_series(
+    data: object,
+    *,
+    dt_ns: float,
+    distance_field: str = "distance_per_chain_nm",
+    r_edges_nm: Optional[Sequence[float]] = None,
+    r_min_nm: float = 0.0,
+    r_max_nm: Optional[float] = None,
+    n_bins: int = 6,
+    lags_frames: Optional[Sequence[int]] = None,
+    max_lag_frames: int = 200,
+    lag_stride: int = 1,
+    origin_stride: int = 1,
+) -> DistMSDPairResult:
+    """Initial-distance-dependent 1D MSD from a precomputed scalar r(t).
+
+    For each chain, lag, and origin with r0 in bin b, average
+    (r(t0+lag)-r(t0))**2; then average populated chain-specific curves
+    with equal chain weight. The SEM is across chain-specific MSDs.
+    Input may be a 1D or (n_chains,n_frames) array, an IntrachainDistanceResult,
+    or a result-field mapping; dt_ns is spacing of the supplied frames.
+
+    The half-open bins [r_edges[b], r_edges[b+1]) apply ONLY at the origin,
+    never to the endpoint. No restriction on absolute distances otherwise.
+    Missing endpoints are skipped. All available origin pairs are used by
+    default; origin_stride subsamples origins without changing physical lag.
+
+    Returns DistMSDPairResult(intra=DistMSDBinnedResult(...), inter=None)
+    compatible with fit_dist_msd_linear_bins and other binned plotting code.
+    This cannot recover the origin-dependent 'hybrid' image convention from
+    a scalar time series. For pbc=True cached intrachain distances the scalar
+    is the per-frame minimum-image distance.
+    """
+    if not np.isfinite(dt_ns) or float(dt_ns) <= 0:
+        raise ValueError("dt_ns must be finite and > 0")
+    if (
+        isinstance(origin_stride, (bool, np.bool_))
+        or int(origin_stride) != origin_stride
+        or origin_stride < 1
+    ):
+        raise ValueError("origin_stride must be an integer >= 1")
+    if not isinstance(distance_field, str) or not distance_field:
+        raise ValueError("distance_field must be a nonempty string")
+
+    if hasattr(data, distance_field):
+        x = np.asarray(getattr(data, distance_field), dtype=np.float64)
+        labels = tuple(str(v) for v in getattr(data, "chain_labels", ()))
+        selection = getattr(data, "selection", None)
+        atom_labels = tuple(getattr(data, "atom_labels", ()))
+        pbc = getattr(data, "pbc", None)
+    elif isinstance(data, Mapping) and distance_field in data:
+        x = np.asarray(data[distance_field], dtype=np.float64)
+        labels = tuple(str(v) for v in data.get("chain_labels", ()))
+        selection = data.get("selection")
+        atom_labels = tuple(data.get("atom_labels", ()))
+        pbc = data.get("pbc")
+    else:
+        x = np.asarray(data, dtype=np.float64)
+        labels, selection, atom_labels, pbc = (), None, (), None
+
+    if x.ndim == 1:
+        x = x[None, :]
+    if x.ndim != 2 or x.shape[0] < 1 or x.shape[1] < 2:
+        raise ValueError("distance series must have shape (n_chains, n_frames>=2)")
+    n_chains, n_frames = x.shape
+    if labels and (len(labels) != n_chains or len(set(labels)) != len(labels)):
+        raise ValueError("chain_labels must identify every row uniquely")
+    if not labels:
+        labels = tuple(f"chain {i}" for i in range(n_chains))
+
+    if not np.isfinite(float(r_min_nm)) or float(r_min_nm) < 0.0:
+        raise ValueError("r_min_nm must be finite and >= 0")
+    edges = _make_r_edges(
+        r_edges_nm=r_edges_nm,
+        r_min_nm=r_min_nm,
+        r_max_nm=r_max_nm,
+        n_bins=n_bins,
+    )
+    if float(edges[0]) < 0.0:
+        raise ValueError("distance bin edges must be >= 0")
+    n_bins_actual = int(len(edges) - 1)
+    lags = _make_lags(
+        lags_frames=lags_frames,
+        max_lag_frames=max_lag_frames,
+        lag_stride=lag_stride,
+    )
+    if int(lags[-1]) >= n_frames:
+        raise ValueError(
+            f"largest lag ({int(lags[-1])}) must be shorter than "
+            f"the supplied time series ({n_frames} frames)"
+        )
+
+    sum_rep = np.zeros((n_chains, n_bins_actual, len(lags)), dtype=np.float64)
+    cnt_rep = np.zeros_like(sum_rep, dtype=np.int64)
+    for li, tau in enumerate(lags):
+        origins = np.arange(0, n_frames - int(tau), int(origin_stride), dtype=np.int64)
+        r0 = x[:, origins]
+        r1 = x[:, origins + int(tau)]
+        bin_idx = np.searchsorted(edges, r0, side="right") - 1
+        keep = np.isfinite(r0) & np.isfinite(r1)
+        keep &= (bin_idx >= 0) & (bin_idx < n_bins_actual)
+        chains, times = np.nonzero(keep)
+        if not len(chains):
+            continue
+        flat_idx = chains * n_bins_actual + bin_idx[chains, times]
+        lengths = n_chains * n_bins_actual
+        cnt_rep[:, :, li] = np.bincount(flat_idx, minlength=lengths).reshape(
+            n_chains, n_bins_actual
+        )
+        delta = r1[chains, times] - r0[chains, times]
+        sum_rep[:, :, li] = np.bincount(flat_idx, weights=delta * delta, minlength=lengths).reshape(
+            n_chains, n_bins_actual
+        )
+
+    msd, stderr, msd_rep, counts = _finalize_binned_msd(sum_rep=sum_rep, cnt_rep=cnt_rep)
+    # Keep exact zero for populated lag-zero entries.
+    if int(lags[0]) == 0:
+        nonempty = cnt_rep[:, :, 0] > 0
+        msd_rep[:, :, 0][nonempty] = 0.0
+        occupied_bins = counts[:, 0] > 0
+        msd[occupied_bins, 0] = 0.0
+        stderr[occupied_bins, 0] = 0.0
+
+    binned = DistMSDBinnedResult(
+        t_ns=lags.astype(np.float64) * float(dt_ns),
+        lags_frames=lags,
+        r0_centers_nm=(edges[:-1] + edges[1:]) * 0.5,
+        r_edges_nm=edges,
+        msd_nm2=msd,
+        msd_stderr_nm2=stderr,
+        msd_rep_nm2=msd_rep,
+        counts=counts,
+        n_replicates=n_chains,
+        n_chains=n_chains,
+        n_frames=n_frames,
+        dt_ns=float(dt_ns),
+        origin_stride=int(origin_stride),
+        mode="intra",
+        distance_image="scalar_min_image" if pbc is True else "scalar_series",
+        inter_targets_per_ref=None,
+        random_seed=0,
+        selection=selection,
+        chain_labels=labels,
+        atom_labels=atom_labels,
+    )
+    return DistMSDPairResult(intra=binned, inter=None)
