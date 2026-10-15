@@ -1381,6 +1381,393 @@ def _finalize_binned_msd(
     return msd, err, msd_rep, cnt_rep.sum(axis=0)
 
 
+# ---- minimum site-to-site distances for distance-dependent MSD ----------------
+
+
+def _aligned_selected_site_groups(
+    tmpl: object,
+    *,
+    chains: Union[str, Sequence[str]],
+    selection: Union[str, Sequence[str]],
+    include_hydrogens: bool = False,
+    sidechain_only: bool = False,
+) -> tuple[np.ndarray, np.ndarray, list[int], tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Resolve a pair of atom *sets*, instead of requiring one atom per chain.
+
+    Supports bare residue selections (e.g. '39,69'), atom selections, and
+    explicitly combined atoms (e.g. '39.CE2+CD2,69.SG+CB'). Bare residue
+    selections use heavy atoms unless include_hydrogens=True.
+
+    Selected chains must have consistent site atom counts. This is expected for
+    a homologous set of chains and enables efficient array calculations.
+    """
+    import re
+
+    model = tmpl.model if hasattr(tmpl, "model") else tmpl
+    chain_idx, chain_labels, atom_to_chain = _chain_indices_from_selection(tmpl, chains)
+    first_spec, second_spec = _ordered_atom_pair_selection_specs(selection)
+
+    def indices_for_spec(spec: str) -> set[int]:
+        # The '+' syntax follows analysis.intrachain_distances_from_dcd:
+        # after '39.CE2', 'CD2' is understood as '39.CD2'.
+        parts = [p.strip() for p in spec.split("+")]
+        if any(not part for part in parts):
+            raise ValueError(f"invalid site atom selection {spec!r}")
+        full_specs = []
+        last_residue = None
+        for part in parts:
+            if "." in part:
+                last_residue = part.rsplit(".", 1)[0]
+                full_specs.append(part)
+            elif len(parts) > 1 and last_residue is not None:
+                full_specs.append(f"{last_residue}.{part}")
+            else:
+                full_specs.append(part)
+        indices: set[int] = set()
+        for part in full_specs:
+            for group in _selection_to_groups(tmpl, part):
+                indices.update(int(x) for x in group)
+        if not indices:
+            raise ValueError(f"site selection {spec!r} contains no atoms")
+
+        if re.fullmatch(r"[0-9]+", spec):
+            # Only implicit whole-residue selections exclude hydrogens by default.
+            # Explicit atom selectors, including explicit hydrogen atoms, remain
+            # untouched, matching their deliberate choice in the input.
+            if not include_hydrogens:
+                indices = {
+                    i
+                    for i in indices
+                    if not (
+                        (str(getattr(model.atoms[i], "name", "")).strip().upper().startswith("H"))
+                        or (
+                            len(str(getattr(model.atoms[i], "name", "")).strip()) > 1
+                            and str(getattr(model.atoms[i], "name", "")).strip()[0].isdigit()
+                            and str(getattr(model.atoms[i], "name", "")).strip()[1].upper() == "H"
+                        )
+                    )
+                }
+            if sidechain_only:
+                backbone = {
+                    "CA",
+                    "N",
+                    "C",
+                    "O",
+                    "HN",
+                    "HA",
+                    "HA1",
+                    "HA2",
+                    "OT1",
+                    "OT2",
+                    "OXT",
+                    "HT1",
+                    "HT2",
+                    "HT3",
+                    "H",
+                }
+                indices = {
+                    i
+                    for i in indices
+                    if str(getattr(model.atoms[i], "name", "")).strip().upper() not in backbone
+                }
+        if not indices:
+            raise ValueError(f"site selection {spec!r} has no atoms after filtering")
+        return indices
+
+    first_atoms = indices_for_spec(first_spec)
+    second_atoms = indices_for_spec(second_spec)
+    full_i: list[list[int]] = []
+    full_j: list[list[int]] = []
+    atom_labels: list[tuple[str, str]] = []
+    for ci, label in zip(chain_idx, chain_labels):
+        a = sorted(i for i in first_atoms if int(atom_to_chain[i]) == int(ci))
+        b = sorted(i for i in second_atoms if int(atom_to_chain[i]) == int(ci))
+        if not a or not b:
+            raise ValueError(f"missing selected site atoms in chain {label!r}")
+        full_i.append(a)
+        full_j.append(b)
+        atom_labels.append(
+            ("+".join(_atom_label(model, i) for i in a), "+".join(_atom_label(model, i) for i in b))
+        )
+    sizes_i = {len(a) for a in full_i}
+    sizes_j = {len(b) for b in full_j}
+    if len(sizes_i) != 1 or len(sizes_j) != 1:
+        raise ValueError(
+            "minimum-distance site selections must contain the same number of atoms in every selected chain"
+        )
+    full_indices = sorted({i for a in full_i + full_j for i in a})
+    idxmap = {old: new for new, old in enumerate(full_indices)}
+    local_i = np.asarray([[idxmap[i] for i in a] for a in full_i], dtype=np.int64)
+    local_j = np.asarray([[idxmap[i] for i in b] for b in full_j], dtype=np.int64)
+    return local_i, local_j, full_indices, chain_labels, tuple(atom_labels)
+
+
+def _min_site_distances(
+    site_i: np.ndarray,
+    site_j: np.ndarray,
+    box_nm: np.ndarray,
+    *,
+    image_mode: str,
+    image_indices: Optional[np.ndarray] = None,
+    keep_images: bool = False,
+    pair_chunk: int = 256,
+) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """Minimum over all atom pairs for each independent reference/target pair.
+
+    With image_indices=None and image_mode='min_image', each atom pair gets
+    its own nearest image and the winning pair's image vector is returned if
+    requested. With image_indices, ALL atom pairs share that origin-fixed image.
+    """
+    a = np.asarray(site_i, dtype=np.float64)
+    b = np.asarray(site_j, dtype=np.float64)
+    if a.ndim != 3 or b.ndim != 3 or a.shape[0] != b.shape[0] or a.shape[2] != 3 or b.shape[2] != 3:
+        raise ValueError("site arrays must have shapes (n_pairs,n_atoms,3)")
+    n = int(a.shape[0])
+    r = np.empty(n, dtype=np.float64)
+    imgs = np.empty((n, 3), dtype=np.int64) if keep_images else None
+    box = np.asarray(box_nm, dtype=np.float64).reshape(3)
+    for start in range(0, n, int(pair_chunk)):
+        end = min(n, start + int(pair_chunk))
+        disp = b[start:end, None, :, :] - a[start:end, :, None, :]
+        if image_indices is not None:
+            img = np.asarray(image_indices[start:end], dtype=np.int64)
+            disp = disp - img[:, None, None, :] * box[None, None, None, :]
+            img_pairs = None
+        elif image_mode == "min_image":
+            img_pairs = np.rint(disp / box[None, None, None, :]).astype(np.int64)
+            disp = disp - img_pairs * box[None, None, None, :]
+        elif image_mode == "unwrapped":
+            img_pairs = None
+        else:
+            raise ValueError(f"unknown image mode: {image_mode!r}")
+        dist2 = np.einsum("pijk,pijk->pij", disp, disp).reshape(end - start, -1)
+        winner = np.argmin(dist2, axis=1)
+        r[start:end] = np.sqrt(dist2[np.arange(end - start), winner])
+        if keep_images:
+            if img_pairs is None:
+                raise ValueError("keep_images requires image_mode=min_image and no image_indices")
+            imgs[start:end] = img_pairs.reshape(end - start, -1, 3)[
+                np.arange(end - start), winner, :
+            ]
+    return r, imgs
+
+
+def _unwrapped_coherent_site(
+    site_wr: np.ndarray,
+    box: np.ndarray,
+    previous_wr_anchor: Optional[np.ndarray],
+    previous_un_anchor: Optional[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Unwrap the site anchor in time, and keep the atoms adjacent to it."""
+    wr = np.asarray(site_wr, dtype=np.float64)
+    anchor_wr = wr[:, 0, :]
+    anchor_un = (
+        anchor_wr.copy()
+        if previous_wr_anchor is None
+        else _unwrap_step_nm(
+            anchor_wr, x_wr_prev=previous_wr_anchor, x_un_prev=previous_un_anchor, box_nm=box
+        )
+    )
+    rel = wr - anchor_wr[:, None, :]
+    rel -= np.rint(rel / box.reshape(1, 1, 3)) * box.reshape(1, 1, 3)
+    return anchor_un[:, None, :] + rel, anchor_wr.copy(), anchor_un.copy()
+
+
+def _dist_msd_group_min_from_dcd(
+    *,
+    dcd_list: Sequence[FileLike],
+    tmpl_model: object,
+    atom_indices_full: list[int],
+    idx_i: np.ndarray,
+    idx_j: np.ndarray,
+    chain_labels: tuple[str, ...],
+    atom_labels: tuple[tuple[str, str], ...],
+    selection: object,
+    mode: str,
+    distance_image: str,
+    dt_ns: float,
+    lags: np.ndarray,
+    origin_stride: int,
+    r_edges: np.ndarray,
+    inter_targets_per_ref: Optional[int],
+    random_seed: int,
+    stride: int,
+    chunk: int,
+    frame_start: int,
+    frame_stop: Optional[int],
+    box_fallback: Optional[np.ndarray],
+) -> DistMSDPairResult:
+    """Stream site-minimum MSDs with reference-based hybrid image tracking.
+
+    Hybrid convention for site groups: at each time origin, minimize over all
+    atom pairs and periodic images. At lag tau, retain the selected *molecular*
+    image (one image for the target site), but re-minimize over all its atom pairs.
+    Consequently the atom pair can switch while the molecular image stays fixed.
+    """
+    di = distance_image
+    n_ch = int(idx_i.shape[0])
+    n_bins = len(r_edges) - 1
+    n_lags = len(lags)
+    ring_size = int(lags[-1]) + 1
+    lag_groups = _prep_lag_groups(lags, origin_stride)
+    have_intra = mode in {"intra", "both"}
+    have_inter = mode in {"inter", "both"}
+    pi = pj = rep_inter = None
+    if have_inter:
+        pi, pj, rep_inter = _sample_inter_pairs(
+            n_ch, targets_per_ref=inter_targets_per_ref, seed=random_seed
+        )
+    rep_intra = np.arange(n_ch, dtype=np.int64)
+    ri = np.empty((ring_size, n_ch), dtype=np.float64) if have_intra else None
+    rj = np.empty((ring_size, len(pi)), dtype=np.float64) if have_inter else None
+    ii = np.empty((ring_size, n_ch, 3), dtype=np.int64) if have_intra and di == "hybrid" else None
+    ij = (
+        np.empty((ring_size, len(pi), 3), dtype=np.int64) if have_inter and di == "hybrid" else None
+    )
+    si = np.zeros((n_ch, n_bins, n_lags), dtype=np.float64) if have_intra else None
+    ci = np.zeros((n_ch, n_bins, n_lags), dtype=np.int64) if have_intra else None
+    sj = np.zeros((n_ch, n_bins, n_lags), dtype=np.float64) if have_inter else None
+    cj = np.zeros((n_ch, n_bins, n_lags), dtype=np.int64) if have_inter else None
+    prev_i_wr = prev_i_un = prev_j_wr = prev_j_un = None
+    n_frames = 0
+    for dcd in dcd_list:
+        for fi, (xyz_selected, frame_box) in enumerate(
+            iter_dcd(
+                dcd,
+                tmpl_model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+            box = (
+                _box_lengths_nm(frame_box)
+                if frame_box is not None
+                else _box_lengths_nm(box_fallback)
+            )
+            xyz = np.asarray(xyz_selected, dtype=np.float64)
+            ai_wr = xyz[idx_i, :]
+            aj_wr = xyz[idx_j, :]
+            if di in {"unwrapped", "hybrid"}:
+                ai, prev_i_wr, prev_i_un = _unwrapped_coherent_site(
+                    ai_wr, box, prev_i_wr, prev_i_un
+                )
+                aj, prev_j_wr, prev_j_un = _unwrapped_coherent_site(
+                    aj_wr, box, prev_j_wr, prev_j_un
+                )
+            else:
+                ai, aj = ai_wr, aj_wr
+            k = n_frames % ring_size
+            origin_image = "min_image" if di == "hybrid" else di
+            if have_intra:
+                rad, images = _min_site_distances(
+                    ai, aj, box, image_mode=origin_image, keep_images=(di == "hybrid")
+                )
+                ri[k, :] = rad
+                if ii is not None:
+                    ii[k, :, :] = images
+            if have_inter:
+                rad, images = _min_site_distances(
+                    ai[pi], aj[pj], box, image_mode=origin_image, keep_images=(di == "hybrid")
+                )
+                rj[k, :] = rad
+                if ij is not None:
+                    ij[k, :, :] = images
+
+            rem = n_frames % int(origin_stride)
+            for tau, li in lag_groups[rem]:
+                if n_frames < tau:
+                    continue
+                t0 = n_frames - tau
+                if t0 % int(origin_stride):
+                    continue
+                k0 = t0 % ring_size
+                if have_intra:
+                    rad0 = ri[k0, :]
+                    if di == "hybrid":
+                        rad1, _ = _min_site_distances(
+                            ai, aj, box, image_mode="unwrapped", image_indices=ii[k0, :, :]
+                        )
+                    else:
+                        rad1 = ri[k, :]
+                    _accumulate_one_lag(
+                        r0=rad0,
+                        r1=rad1,
+                        rep_idx=rep_intra,
+                        r_edges=r_edges,
+                        n_rep=n_ch,
+                        n_bins=n_bins,
+                        sum_rep=si,
+                        cnt_rep=ci,
+                        lag_i=li,
+                    )
+                if have_inter:
+                    rad0 = rj[k0, :]
+                    if di == "hybrid":
+                        rad1, _ = _min_site_distances(
+                            ai[pi], aj[pj], box, image_mode="unwrapped", image_indices=ij[k0, :, :]
+                        )
+                    else:
+                        rad1 = rj[k, :]
+                    _accumulate_one_lag(
+                        r0=rad0,
+                        r1=rad1,
+                        rep_idx=rep_inter,
+                        r_edges=r_edges,
+                        n_rep=n_ch,
+                        n_bins=n_bins,
+                        sum_rep=sj,
+                        cnt_rep=cj,
+                        lag_i=li,
+                    )
+            n_frames += 1
+
+    if n_frames < 2:
+        raise ValueError("need >=2 frames selected")
+    if int(lags[-1]) >= n_frames:
+        raise ValueError("maximum lag must be less than selected frame count")
+    centers = 0.5 * (r_edges[1:] + r_edges[:-1])
+    time = np.asarray(lags, dtype=np.float64) * float(dt_ns)
+
+    def finalize(mode_name: str, sums: np.ndarray, counts_rep: np.ndarray) -> DistMSDBinnedResult:
+        msd, err, msd_rep, counts = _finalize_binned_msd(sum_rep=sums, cnt_rep=counts_rep)
+        occupied = counts[:, 0] > 0
+        msd[occupied, 0] = 0.0
+        err[occupied, 0] = 0.0
+        msd_rep[:, :, 0][counts_rep[:, :, 0] > 0] = 0.0
+        return DistMSDBinnedResult(
+            t_ns=time.copy(),
+            lags_frames=lags.copy(),
+            r0_centers_nm=centers.copy(),
+            r_edges_nm=r_edges.copy(),
+            msd_nm2=msd,
+            msd_stderr_nm2=err,
+            msd_rep_nm2=msd_rep,
+            counts=counts,
+            n_replicates=n_ch,
+            n_chains=n_ch,
+            n_frames=n_frames,
+            dt_ns=float(dt_ns),
+            origin_stride=int(origin_stride),
+            mode=mode_name,
+            distance_image=di,
+            inter_targets_per_ref=(inter_targets_per_ref if mode_name == "inter" else None),
+            random_seed=int(random_seed),
+            selection=selection,
+            chain_labels=chain_labels,
+            atom_labels=atom_labels,
+        )
+
+    return DistMSDPairResult(
+        intra=finalize("intra", si, ci) if have_intra else None,
+        inter=finalize("inter", sj, cj) if have_inter else None,
+    )
+
+
 def dist_msd_binned_from_dcd(
     pdb_file: FileLike,
     dcd_files: Union[FileLike, Sequence[FileLike]],
@@ -1390,6 +1777,8 @@ def dist_msd_binned_from_dcd(
     res_i: Optional[int] = None,
     res_j: Optional[int] = None,
     atom_name: str = "CA",
+    include_hydrogens: bool = False,
+    sidechain_only: bool = False,
     mode: str = "both",  # "intra" | "inter" | "both"
     distance_image: str = "hybrid",  # "unwrapped" | "min_image" | "hybrid"
     dt_ns: float,
@@ -1418,10 +1807,18 @@ def dist_msd_binned_from_dcd(
     Preferred selection interface
     -----------------------------
     ``chains`` is a StructureSelector-compatible selection identifying the physical
-    chains to analyze. ``selection`` contains exactly two ordered atom selectors,
-    for example ``"39.CE2,69.SG"``. The first atom is the reference atom for
-    interchain distances and the second is the target atom. Each selector must
-    resolve to exactly one atom in every selected chain.
+    chains to analyze. ``selection`` contains two ordered atom/site selectors,
+    e.g. ``"39.CE2,69.SG"`` (one atom per site), ``"39.CE2+CD2,69.SG+CB"``,
+    or ``"39,69"`` (minimum distance across all selected site atom pairs).
+    Bare-residue selections use heavy atoms by default; use include_hydrogens or
+    sidechain_only to alter residue-level atom selection.
+
+    Single-atom selections retain the existing high-performance path. Multi-atom
+    selections use a streaming minimum-distance path (serial backend). For hybrid
+    multi-atom selections, the origin chooses the minimum-distance atom pair and
+    its periodic *molecular image*; the endpoint uses that SAME image but may
+    switch to another closest atom pair. This is a different coordinate from
+    tracking the originally closest atom pair.
 
     The legacy ``res_i``/``res_j``/``atom_name`` interface remains supported when
     ``selection`` is omitted.
@@ -1508,6 +1905,46 @@ def dist_msd_binned_from_dcd(
         )
     else:
         resolved_selection = selection
+
+    site_i, site_j, sites_atom_indices, sites_chain_labels, sites_atom_labels = (
+        _aligned_selected_site_groups(
+            tmpl,
+            chains=chains,
+            selection=resolved_selection,
+            include_hydrogens=bool(include_hydrogens),
+            sidechain_only=bool(sidechain_only),
+        )
+    )
+    if site_i.shape[1] != 1 or site_j.shape[1] != 1:
+        if be == "process":
+            raise ValueError(
+                "multi-atom minimum-distance distmsd currently supports backend='serial' only"
+            )
+        if m in {"inter", "both"} and len(sites_chain_labels) < 2:
+            raise ValueError("need >=2 chains for inter mode")
+        return _dist_msd_group_min_from_dcd(
+            dcd_list=dcd_list,
+            tmpl_model=tmpl_model,
+            atom_indices_full=sites_atom_indices,
+            idx_i=site_i,
+            idx_j=site_j,
+            chain_labels=sites_chain_labels,
+            atom_labels=sites_atom_labels,
+            selection=resolved_selection,
+            mode=m,
+            distance_image=di,
+            dt_ns=dt_ns,
+            lags=lags,
+            origin_stride=int(origin_stride),
+            r_edges=r_edges,
+            inter_targets_per_ref=inter_targets_per_ref,
+            random_seed=int(random_seed),
+            stride=int(stride),
+            chunk=int(chunk),
+            frame_start=int(frame_start),
+            frame_stop=frame_stop,
+            box_fallback=(None if box_nm is None else _box_lengths_nm(box_nm)),
+        )
 
     (
         idx_i,
