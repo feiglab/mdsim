@@ -1493,7 +1493,8 @@ def _aligned_selected_site_groups(
     sizes_j = {len(b) for b in full_j}
     if len(sizes_i) != 1 or len(sizes_j) != 1:
         raise ValueError(
-            "minimum-distance site selections must have same number of atoms in every selected chain"
+            "minimum-distance site selections must have"
+            + "same number of atoms in every selected chain"
         )
     full_indices = sorted({i for a in full_i + full_j for i in a})
     idxmap = {old: new for new, old in enumerate(full_indices)}
