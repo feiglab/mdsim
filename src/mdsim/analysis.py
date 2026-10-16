@@ -6568,6 +6568,13 @@ class RadialTranslationalDiffusionFitResult:
     n_sets: int
     fit_tmin_ns: float
     fit_tmax_ns: float
+    # Optional finite-size correction. Raw quantities above are never changed.
+    yeh_hummer_delta_nm2_per_ns: float = 0.0  # single-set delta, or equal-set mean delta
+    d_corrected_nm2_per_ns: Optional[np.ndarray] = None
+    d_corrected_stderr_nm2_per_ns: Optional[np.ndarray] = None
+    per_chain_d_corrected_nm2_per_ns: Optional[np.ndarray] = None
+    correction_per_set_nm2_per_ns: Optional[np.ndarray] = None  # (n_sets,)
+    per_set_d_corrected_nm2_per_ns: Optional[np.ndarray] = None  # (n_sets, radial bin)
 
 
 def fit_radial_translational_msd(
@@ -6577,60 +6584,137 @@ def fit_radial_translational_msd(
     fit_tmax_ns: float,
     min_fit_points: int = 3,
     include_chains: Optional[Sequence[str]] = None,
+    temperature_K: Optional[Union[float, Mapping[str, float]]] = None,
+    viscosity_Pa_s: Optional[Union[float, Mapping[str, float]]] = None,
+    box_length_nm: Optional[
+        Union[float, Sequence[float], Mapping[str, Union[float, Sequence[float]]]]
+    ] = None,
+    allow_relative_correction: bool = False,
 ) -> RadialTranslationalDiffusionFitResult:
-    """Fit 3D D(r) per chain, then average chains or independent sets.
+    """Fit radial-origin-conditioned MSD(t) = 6 D(r) t + intercept.
 
-    Mapping input assigns *equal weight to each simulation set* and reports
-    SEM across set means, not over potentially correlated individual chains.
+    The uncorrected ``d_nm2_per_ns`` and ``d_stderr_nm2_per_ns`` are retained.
+    Supply ``temperature_K``, ``viscosity_Pa_s``, and ``box_length_nm`` together
+    to also return ``d_corrected_nm2_per_ns`` and its SEM. The Yeh--Hummer
+    correction is an additive constant, independent of radial bin, for a given
+    simulation set. The box must be cubic.
+
+    For a mapping of simulation sets, each physical parameter may be either a
+    common value or a mapping keyed by simulation-set name. Mean and SEM of
+    corrected diffusion coefficients are computed *after* correcting each set;
+    this matters if the individual sets have different viscosities/box lengths.
+
+    The Yeh--Hummer formula is derived for bulk self diffusion in a homogeneous
+    periodic liquid, not diffusion relative to a moving condensate or spatially
+    resolved diffusion in a heterogeneous condensate. For that reason relative
+    trajectories reject it by default. ``allow_relative_correction=True``
+    explicitly permits a formal additive shift of such curves, with a warning;
+    this shift is NOT a validated Yeh--Hummer correction for relative motion.
+
+    As in the original fitter, chain-to-chain SEM is used within one set;
+    independent sets receive equal weight, with between-set SEM when >=2 sets
+    contribute to a bin. Missing radial bins remain NaN.
     """
+    if not np.isfinite(float(fit_tmin_ns)) or not np.isfinite(float(fit_tmax_ns)):
+        raise ValueError("fit_tmin_ns and fit_tmax_ns must be finite")
+    if float(fit_tmax_ns) <= float(fit_tmin_ns):
+        raise ValueError("fit_tmax_ns must be greater than fit_tmin_ns")
+    if (
+        isinstance(min_fit_points, (bool, np.bool_))
+        or int(min_fit_points) != min_fit_points
+        or int(min_fit_points) < 2
+    ):
+        raise ValueError("min_fit_points must be an integer >= 2")
+
+    params = (temperature_K, viscosity_Pa_s, box_length_nm)
+    if any(value is not None for value in params) and not all(
+        value is not None for value in params
+    ):
+        raise ValueError("supply temperature_K, viscosity_Pa_s, and box_length_nm together")
+    use_correction = all(value is not None for value in params)
+
     if isinstance(data, Mapping):
         if not data:
             raise ValueError("no radial MSD results supplied")
-        fits = [
-            fit_radial_translational_msd(
-                v,
-                fit_tmin_ns=fit_tmin_ns,
-                fit_tmax_ns=fit_tmax_ns,
-                min_fit_points=min_fit_points,
-                include_chains=include_chains,
+
+        def for_set(value: Any, key: str, name: str) -> Any:
+            if isinstance(value, Mapping):
+                if key not in value:
+                    raise KeyError(f"{name} has no value for simulation set {key!r}")
+                return value[key]
+            return value
+
+        fits = []
+        for key, result in data.items():
+            key = str(key)
+            fits.append(
+                fit_radial_translational_msd(
+                    result,
+                    fit_tmin_ns=fit_tmin_ns,
+                    fit_tmax_ns=fit_tmax_ns,
+                    min_fit_points=min_fit_points,
+                    include_chains=include_chains,
+                    temperature_K=for_set(temperature_K, key, "temperature_K"),
+                    viscosity_Pa_s=for_set(viscosity_Pa_s, key, "viscosity_Pa_s"),
+                    box_length_nm=for_set(box_length_nm, key, "box_length_nm"),
+                    allow_relative_correction=allow_relative_correction,
+                )
             )
-            for v in data.values()
-        ]
-        edges = fits[0].r_centers_nm
-        if any(not np.array_equal(f.r_centers_nm, edges) for f in fits[1:]):
+        r_centers = fits[0].r_centers_nm
+        if any(not np.array_equal(f.r_centers_nm, r_centers) for f in fits[1:]):
             raise ValueError("radial bins differ across simulation sets")
-        stack = np.stack([f.d_nm2_per_ns for f in fits], axis=0)
-        finite = np.isfinite(stack)
-        count = finite.sum(axis=0)
-        mean = np.full(len(edges), np.nan)
-        np.divide(np.where(finite, stack, 0).sum(axis=0), count, out=mean, where=count > 0)
-        sem = np.full_like(mean, np.nan)
-        for i in range(len(edges)):
-            v = stack[finite[:, i], i]
-            if len(v) > 1:
-                sem[i] = np.std(v, ddof=1) / np.sqrt(len(v))
-            elif len(v) == 1:
-                sem[i] = fits[int(np.flatnonzero(finite[:, i])[0])].d_stderr_nm2_per_ns[i]
+
+        def average_sets(field: str, fallback_sem: str) -> tuple[np.ndarray, np.ndarray]:
+            values = np.stack([getattr(f, field) for f in fits], axis=0)
+            valid = np.isfinite(values)
+            counts = valid.sum(axis=0)
+            avg = np.full(len(r_centers), np.nan)
+            np.divide(np.where(valid, values, 0.0).sum(axis=0), counts, out=avg, where=counts > 0)
+            sem = np.full_like(avg, np.nan)
+            for b in range(len(r_centers)):
+                finite_values = values[valid[:, b], b]
+                if len(finite_values) > 1:
+                    sem[b] = np.std(finite_values, ddof=1) / np.sqrt(len(finite_values))
+                elif len(finite_values) == 1:
+                    sem[b] = getattr(fits[int(np.flatnonzero(valid[:, b])[0])], fallback_sem)[b]
+            return avg, sem
+
+        mean, sem = average_sets("d_nm2_per_ns", "d_stderr_nm2_per_ns")
+        corrected_mean = corrected_sem = corrected_by_set = deltas = None
+        if use_correction:
+            corrected_by_set = np.stack([f.d_corrected_nm2_per_ns for f in fits], axis=0)
+            deltas = np.asarray([f.yeh_hummer_delta_nm2_per_ns for f in fits], dtype=float)
+            corrected_mean, corrected_sem = average_sets(
+                "d_corrected_nm2_per_ns", "d_corrected_stderr_nm2_per_ns"
+            )
         return RadialTranslationalDiffusionFitResult(
-            r_centers_nm=edges.copy(),
+            r_centers_nm=r_centers.copy(),
             d_nm2_per_ns=mean,
             d_stderr_nm2_per_ns=sem,
-            per_chain_d_nm2_per_ns=np.empty((0, len(edges))),
+            per_chain_d_nm2_per_ns=np.empty((0, len(r_centers))),
             n_chains_per_bin=np.sum([f.n_chains_per_bin for f in fits], axis=0),
             n_sets=len(fits),
             fit_tmin_ns=float(fit_tmin_ns),
             fit_tmax_ns=float(fit_tmax_ns),
+            yeh_hummer_delta_nm2_per_ns=float(np.mean(deltas)) if use_correction else 0.0,
+            d_corrected_nm2_per_ns=corrected_mean,
+            d_corrected_stderr_nm2_per_ns=corrected_sem,
+            correction_per_set_nm2_per_ns=deltas,
+            per_set_d_corrected_nm2_per_ns=corrected_by_set,
         )
 
     t = np.asarray(data.t_ns, dtype=float)
     window = (t >= float(fit_tmin_ns)) & (t <= float(fit_tmax_ns))
     if np.count_nonzero(window) < int(min_fit_points):
         raise ValueError("fit window contains fewer than min_fit_points lags")
-    labels = data.chain_labels
+    labels = tuple(str(label) for label in data.chain_labels)
     wanted = set(labels) if include_chains is None else set(str(k) for k in include_chains)
     if not wanted.issubset(labels):
         raise ValueError(f"unknown chain labels: {sorted(wanted.difference(labels))}")
     index = [i for i, lab in enumerate(labels) if lab in wanted]
+    if not index:
+        raise ValueError("no chains remain")
+
     nbin = len(data.r_centers_nm)
     d_by_chain = np.full((len(index), nbin), np.nan)
     for row, i in enumerate(index):
@@ -6648,6 +6732,37 @@ def fit_radial_translational_msd(
             mean[b] = float(np.mean(ds))
         if ds.size >= 2:
             sem[b] = float(np.std(ds, ddof=1) / np.sqrt(ds.size))
+
+    delta = 0.0
+    corrected = corrected_sem = per_chain_corrected = deltas = None
+    if use_correction:
+        if data.remove_reference_motion:
+            if not allow_relative_correction:
+                raise ValueError(
+                    "Yeh--Hummer is not applicable to condensate-relative diffusion; "
+                    "generate lab-frame trajectories with remove_reference_motion=False. "
+                    "To request only a formal additive shift despite this limitation, "
+                    "set allow_relative_correction=True."
+                )
+            import warnings
+
+            warnings.warn(
+                "Applying a formal Yeh--Hummer-sized offset to condensate-relative "
+                "diffusion. The bulk Yeh--Hummer formula is not validated for "
+                "condensate-relative or radially conditioned motion.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        delta = yeh_hummer_diffusion_correction(
+            temperature_K=temperature_K,
+            viscosity_Pa_s=viscosity_Pa_s,
+            box_length_nm=box_length_nm,
+        )
+        corrected = mean + delta
+        corrected_sem = sem.copy()  # constant shift: within-set SEM is unchanged
+        per_chain_corrected = d_by_chain + delta
+        deltas = np.asarray([delta], dtype=float)
+
     return RadialTranslationalDiffusionFitResult(
         r_centers_nm=data.r_centers_nm.copy(),
         d_nm2_per_ns=mean,
@@ -6657,4 +6772,10 @@ def fit_radial_translational_msd(
         n_sets=1,
         fit_tmin_ns=float(fit_tmin_ns),
         fit_tmax_ns=float(fit_tmax_ns),
+        yeh_hummer_delta_nm2_per_ns=delta,
+        d_corrected_nm2_per_ns=corrected,
+        d_corrected_stderr_nm2_per_ns=corrected_sem,
+        per_chain_d_corrected_nm2_per_ns=per_chain_corrected,
+        correction_per_set_nm2_per_ns=deltas,
+        per_set_d_corrected_nm2_per_ns=(None if corrected is None else corrected[None, :]),
     )
