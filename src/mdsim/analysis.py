@@ -6111,3 +6111,550 @@ def cluster_rdf_from_dcd(
         "min_cluster_size": int(min_cluster_size),
         "stride": int(stride),
     }
+
+
+# --- Translational motion of protein/solute chain centers ----------------------
+
+
+@dataclass(frozen=True)
+class ChainCOMTrajectoryResult:
+    """Continuous chain-center trajectories, optionally in a moving reference frame.
+
+    ``position_per_chain_nm`` is (chain, frame, xyz) in the selected frame.
+    ``absolute_position_per_chain_nm`` is the laboratory-frame unwrapped trajectory.
+    If a reference selection is given, ``distance_per_chain_nm`` is its instantaneous
+    minimum-image radial separation, compatible with ``centerdist`` binning.
+    Input frames are assumed equally spaced, and chains are whole in each frame
+    unless ``unwrap_within_frame=True`` is requested.
+    """
+
+    position_per_chain_nm: np.ndarray
+    absolute_position_per_chain_nm: np.ndarray
+    distance_per_chain_nm: Optional[np.ndarray]
+    reference_center_unwrapped_nm: Optional[np.ndarray]
+    reference_center_nm: Optional[np.ndarray]
+    box_lengths_nm: np.ndarray  # (frames, 3)
+    chain_labels: tuple[str, ...]
+    reference_chain_labels: tuple[str, ...]
+    n_chains: int
+    n_frames: int
+    dt_ns: float
+    mode: str
+    remove_reference_motion: bool
+    reference_image_mode: str
+
+
+def chain_com_trajectories_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
+    reference_segments: Optional[Union[str, Sequence[str]]] = None,
+    mode: str = "com",
+    remove_reference_motion: bool = False,
+    reference_image_mode: str = "cluster",
+    dt_ns: float,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    unwrap_within_frame: bool = False,
+) -> ChainCOMTrajectoryResult:
+    """Read unwrapped chain COM/COG trajectories from one continuous simulation.
+
+    ``dt_ns`` is the actual spacing between the *retained* frames, i.e., the
+    DCD interval multiplied by ``stride``. DCD files are assumed consecutive;
+    do not concatenate independent replicas. Boxes must be orthorhombic.
+
+    Reference chains may be supplied in the same one-spec-per-chain form as
+    ``reference_center_distances_from_dcd`` (e.g., ``segs['rlp']``). The
+    reference is reconstructed per frame using the existing connected-cluster
+    minimum-spanning-tree method when ``reference_image_mode='cluster'``.
+    """
+    center_mode = str(mode).lower()
+    if center_mode not in {"com", "cog"}:
+        raise ValueError("mode must be 'com' or 'cog'")
+    if not np.isfinite(float(dt_ns)) or float(dt_ns) <= 0:
+        raise ValueError("dt_ns must be finite and > 0")
+    if int(stride) < 1 or int(chunk) < 1 or int(frame_start) < 0:
+        raise ValueError("stride/chunk must be positive and frame_start >= 0")
+    if remove_reference_motion and reference_segments is None:
+        raise ValueError("reference_segments is required when removing reference motion")
+    reference_mode = _normalize_reference_image_mode(reference_image_mode)
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+
+    tmpl = PDBReader().read(pdb_file)
+    model = tmpl.model
+    query_full = _selection_to_groups(tmpl, selection)
+    if not query_full:
+        raise ValueError("selection produced no chain groups")
+    labels = _group_chain_labels(model, query_full)
+    if any("+" in label for label in labels) or len(set(labels)) != len(labels):
+        raise ValueError("selection must yield one unique physical chain per group")
+
+    if reference_segments is None:
+        ref_full, ref_labels = [], ()
+    else:
+        ref_full, ref_labels = _one_chain_groups_from_specs(
+            tmpl, reference_segments, argument_name="reference_segments"
+        )
+
+    atom_full = sorted({int(i) for g in (*query_full, *ref_full) for i in g})
+    remap = {i: j for j, i in enumerate(atom_full)}
+    query = [np.asarray([remap[int(i)] for i in g], dtype=np.int64) for g in query_full]
+    ref = [np.asarray([remap[int(i)] for i in g], dtype=np.int64) for g in ref_full]
+    masses = None
+    if center_mode == "com":
+        masses = np.asarray(atom_masses(tmpl)[atom_full], dtype=np.float64)
+        if np.any(masses <= 0):
+            raise ValueError("nonpositive/unknown atom masses: use mode='cog' or fix template")
+    if ref:
+        weights = np.array(
+            [np.sum(masses[g]) if masses is not None else len(g) for g in ref], dtype=float
+        )
+        if np.any(weights <= 0):
+            raise ValueError("reference chain weights must be positive")
+    else:
+        weights = np.empty(0, dtype=float)
+
+    query_frames: list[np.ndarray] = []
+    ref_wr_frames: list[np.ndarray] = []
+    distances: list[np.ndarray] = []
+    boxes: list[np.ndarray] = []
+    fallback_box = _box_lengths_nm(box_nm) if box_nm is not None else None
+
+    for dcd in dcd_list:
+        for fi, (xyz_nm, dcd_box) in enumerate(
+            iter_dcd(dcd, model, chunk=int(chunk), stride=int(stride), atom_indices=atom_full)
+        ):
+            if fi < int(frame_start):
+                continue
+            if frame_stop is not None and fi >= int(frame_stop):
+                break
+            if dcd_box is None and fallback_box is None:
+                raise ValueError("DCD contains no box lengths; supply box_nm")
+            box = fallback_box if dcd_box is None else _box_lengths_nm(dcd_box)
+            xyz = np.asarray(xyz_nm, dtype=np.float64)
+            # A group is assumed to be a whole molecule in the saved DCD.
+            q = group_centers_nm(
+                xyz,
+                query,
+                masses=masses,
+                box_nm=box,
+                center=center_mode,
+                unwrap=bool(unwrap_within_frame),
+                wrap=False,
+            )
+            # Only the center is wrapped; the molecule is never moved atomwise here.
+            q_wr = np.mod(q, box[None, :])
+            query_frames.append(q_wr)
+            boxes.append(box.copy())
+
+            if ref:
+                r = group_centers_nm(
+                    xyz,
+                    ref,
+                    masses=masses,
+                    box_nm=box,
+                    center=center_mode,
+                    unwrap=bool(unwrap_within_frame),
+                    wrap=False,
+                )
+                if reference_mode == "cluster":
+                    r = _assemble_periodic_cluster_nm(r, box)
+                ref_raw = np.average(r, weights=weights, axis=0)
+                ref_wr = np.mod(ref_raw, box)
+                ref_wr_frames.append(ref_wr)
+                dq = q - ref_raw[None, :]
+                dq -= np.rint(dq / box[None, :]) * box[None, :]
+                distances.append(np.linalg.norm(dq, axis=1))
+
+    if len(query_frames) < 2:
+        raise ValueError("need >=2 retained frames")
+    box_array = np.stack(boxes, axis=0)
+    q_wr_array = np.stack(query_frames, axis=0)
+    q_un = _unwrap_time_series_nm(q_wr_array, box_array)  # (frame, chain, xyz)
+    reference_un = None
+    reference_wr = None
+    distance_array = None
+    if ref:
+        reference_wr = np.stack(ref_wr_frames, axis=0)
+        reference_un = _unwrap_time_series_nm(reference_wr[:, None, :], box_array)[:, 0, :]
+        distance_array = np.stack(distances, axis=1)
+
+    positions = q_un if not remove_reference_motion else q_un - reference_un[:, None, :]
+    return ChainCOMTrajectoryResult(
+        position_per_chain_nm=np.transpose(positions, (1, 0, 2)).copy(),
+        absolute_position_per_chain_nm=np.transpose(q_un, (1, 0, 2)).copy(),
+        distance_per_chain_nm=distance_array,
+        reference_center_unwrapped_nm=reference_un,
+        reference_center_nm=reference_wr,
+        box_lengths_nm=box_array,
+        chain_labels=labels,
+        reference_chain_labels=tuple(ref_labels),
+        n_chains=len(query),
+        n_frames=len(query_frames),
+        dt_ns=float(dt_ns),
+        mode=center_mode,
+        remove_reference_motion=bool(remove_reference_motion),
+        reference_image_mode=reference_mode,
+    )
+
+
+@dataclass(frozen=True)
+class TranslationalMSDResult:
+    t_ns: np.ndarray
+    msd_nm2: np.ndarray
+    msd_stderr_nm2: np.ndarray
+    msd_per_chain_nm2: np.ndarray  # (chain, lag)
+    n_origins: np.ndarray  # (lag,)
+    chain_labels: tuple[str, ...]
+    n_chains: int
+    n_frames: int
+    dt_ns: float
+    remove_reference_motion: bool
+
+
+def translational_msd_from_trajectories(
+    traj: ChainCOMTrajectoryResult,
+    *,
+    max_lag_frames: Optional[int] = 200,
+    n_jobs: int = 1,
+    block_chains: int = 16,
+) -> TranslationalMSDResult:
+    """Calculate per-chain time-origin-averaged 3D MSD by existing FFT kernel."""
+    r = np.transpose(np.asarray(traj.position_per_chain_nm, dtype=float), (1, 0, 2))
+    if r.ndim != 3 or r.shape[2] != 3:
+        raise ValueError("position_per_chain_nm must have shape (chain,frame,3)")
+    n = r.shape[0]
+    stop = n if max_lag_frames is None else min(n, int(max_lag_frames) + 1)
+    if stop < 2:
+        raise ValueError("max_lag_frames must be >= 1")
+    per_chain = _msd_fft_all(r, n_jobs=int(n_jobs), block_chains=int(block_chains))[:, :stop]
+    per_chain = np.maximum(per_chain, 0.0)
+    mean = np.mean(per_chain, axis=0)
+    sem = (
+        np.std(per_chain, axis=0, ddof=1) / np.sqrt(r.shape[1])
+        if r.shape[1] > 1
+        else np.full(stop, np.nan)
+    )
+    return TranslationalMSDResult(
+        t_ns=np.arange(stop) * float(traj.dt_ns),
+        msd_nm2=mean,
+        msd_stderr_nm2=sem,
+        msd_per_chain_nm2=per_chain,
+        n_origins=n - np.arange(stop, dtype=np.int64),
+        chain_labels=traj.chain_labels,
+        n_chains=r.shape[1],
+        n_frames=n,
+        dt_ns=traj.dt_ns,
+        remove_reference_motion=traj.remove_reference_motion,
+    )
+
+
+def yeh_hummer_diffusion_correction(
+    *,
+    temperature_K: float,
+    viscosity_Pa_s: float,
+    box_length_nm: Union[float, Sequence[float]],
+) -> float:
+    """Yeh--Hummer additive cubic-box correction, in nm^2/ns.
+
+    A 3-vector must describe a cubic box. The input viscosity is the effective
+    *system* shear viscosity, not necessarily the viscosity of pure water.
+    """
+    sides = np.asarray(box_length_nm, dtype=float).reshape(-1)
+    if sides.size not in (1, 3) or np.any(~np.isfinite(sides)) or np.any(sides <= 0):
+        raise ValueError("box_length_nm must be positive scalar or three positive lengths")
+    if sides.size == 3 and not np.allclose(sides, sides[0], rtol=1e-6, atol=0):
+        raise ValueError("standard Yeh--Hummer constant applies only to cubic boxes")
+    t, eta = float(temperature_K), float(viscosity_Pa_s)
+    if not np.isfinite(t) or t <= 0 or not np.isfinite(eta) or eta <= 0:
+        raise ValueError("temperature_K and viscosity_Pa_s must be finite and positive")
+    kB = 1.380649e-23  # J/K
+    d_m2_per_s = 2.837297 * kB * t / (6 * np.pi * eta * (sides[0] * 1e-9))
+    return float(d_m2_per_s * 1e9)  # m2/s -> nm2/ns
+
+
+@dataclass(frozen=True)
+class TranslationalDiffusionFitResult:
+    fit_tmin_ns: float
+    fit_tmax_ns: float
+    d_nm2_per_ns: float
+    d_stderr_nm2_per_ns: float
+    per_chain_d_nm2_per_ns: np.ndarray
+    intercept_nm2: float
+    chain_labels: tuple[str, ...]
+    n_chains: int
+    yeh_hummer_delta_nm2_per_ns: float = 0.0
+    d_corrected_nm2_per_ns: Optional[float] = None
+
+
+def fit_translational_msd(
+    msd: TranslationalMSDResult,
+    *,
+    fit_tmin_ns: float,
+    fit_tmax_ns: float,
+    include_chains: Optional[Sequence[str]] = None,
+    temperature_K: Optional[float] = None,
+    viscosity_Pa_s: Optional[float] = None,
+    box_length_nm: Optional[Union[float, Sequence[float]]] = None,
+) -> TranslationalDiffusionFitResult:
+    """Fit MSD(t)=6Dt+b per chain, returning mean and chain-to-chain SEM.
+
+    Set the three Yeh--Hummer parameters together to get D_corrected. That
+    correction is rejected for condensate-relative trajectories.
+    """
+    t = np.asarray(msd.t_ns, dtype=float)
+    mask = (t >= float(fit_tmin_ns)) & (t <= float(fit_tmax_ns))
+    if np.count_nonzero(mask) < 2:
+        raise ValueError("fit time window must contain at least two lag points")
+    labels = msd.chain_labels
+    if include_chains is None:
+        indices = np.arange(len(labels))
+    else:
+        wanted = set(str(k) for k in include_chains)
+        missing = wanted.difference(labels)
+        if missing:
+            raise ValueError(f"unknown chain labels: {sorted(missing)}")
+        indices = np.array([i for i, k in enumerate(labels) if k in wanted], dtype=int)
+    if indices.size == 0:
+        raise ValueError("no chains remain")
+    y = np.asarray(msd.msd_per_chain_nm2, dtype=float)[indices]
+    coeff = np.polyfit(t[mask], y[:, mask].T, deg=1)  # (2, n_ch)
+    per_d = coeff[0] / 6.0
+    stderr = float(np.std(per_d, ddof=1) / np.sqrt(len(per_d))) if len(per_d) > 1 else float("nan")
+    yh_params = (temperature_K, viscosity_Pa_s, box_length_nm)
+    if any(x is not None for x in yh_params) and not all(x is not None for x in yh_params):
+        raise ValueError("supply temperature_K, viscosity_Pa_s and box_length_nm together")
+    delta = 0.0
+    corrected = None
+    if all(x is not None for x in yh_params):
+        if msd.remove_reference_motion:
+            raise ValueError("Yeh--Hummer is not applicable to condensate-relative diffusion")
+        delta = yeh_hummer_diffusion_correction(
+            temperature_K=temperature_K,
+            viscosity_Pa_s=viscosity_Pa_s,
+            box_length_nm=box_length_nm,
+        )
+        corrected = float(np.mean(per_d) + delta)
+    return TranslationalDiffusionFitResult(
+        fit_tmin_ns=float(fit_tmin_ns),
+        fit_tmax_ns=float(fit_tmax_ns),
+        d_nm2_per_ns=float(np.mean(per_d)),
+        d_stderr_nm2_per_ns=stderr,
+        per_chain_d_nm2_per_ns=per_d,
+        intercept_nm2=float(np.mean(coeff[1])),
+        chain_labels=tuple(labels[i] for i in indices),
+        n_chains=len(per_d),
+        yeh_hummer_delta_nm2_per_ns=delta,
+        d_corrected_nm2_per_ns=corrected,
+    )
+
+
+@dataclass(frozen=True)
+class RadialTranslationalMSDResult:
+    r_centers_nm: np.ndarray
+    r_edges_nm: np.ndarray
+    t_ns: np.ndarray
+    msd_nm2: np.ndarray  # (radial bin, lag), equal-chain mean
+    msd_stderr_nm2: np.ndarray  # (radial bin, lag)
+    msd_per_chain_nm2: np.ndarray  # (chain, radial bin, lag)
+    origins_per_chain: np.ndarray  # (chain, radial bin, lag)
+    chain_labels: tuple[str, ...]
+    n_chains: int
+    dt_ns: float
+    remove_reference_motion: bool
+
+
+def radial_translational_msd_from_trajectories(
+    traj: ChainCOMTrajectoryResult,
+    *,
+    bins: Union[int, Sequence[float]] = 10,
+    value_range: Optional[tuple[float, float]] = (0.0, 30.0),
+    max_lag_frames: int = 100,
+    origin_stride: int = 1,
+    min_origins_per_chain: int = 5,
+) -> RadialTranslationalMSDResult:
+    """Compute MSD by *initial* chain-to-condensate-center radial separation.
+
+    For every selected lag, a displacement is assigned to the bin containing
+    r_chain(t0), regardless of where the chain moves afterward. The frame is
+    either laboratory or condensate-relative, as chosen for ``traj``.
+    """
+    dist = traj.distance_per_chain_nm
+    if dist is None:
+        raise ValueError("reference_segments are required to compute radial MSD")
+    if np.isscalar(bins):
+        if value_range is None or int(bins) < 1 or int(bins) != float(bins):
+            raise ValueError("integer bins require positive bins and value_range")
+        edges = np.linspace(float(value_range[0]), float(value_range[1]), int(bins) + 1)
+    else:
+        edges = np.asarray(bins, dtype=float)
+    if (
+        edges.ndim != 1
+        or len(edges) < 2
+        or np.any(~np.isfinite(edges))
+        or np.any(np.diff(edges) <= 0)
+    ):
+        raise ValueError("radial bin edges must be finite and strictly increasing")
+    if edges[0] < 0:
+        raise ValueError("radial bins must be nonnegative")
+    if int(origin_stride) < 1 or int(max_lag_frames) < 1 or int(min_origins_per_chain) < 1:
+        raise ValueError("origin_stride, max_lag_frames, min_origins_per_chain must be >= 1")
+
+    pos = np.asarray(traj.position_per_chain_nm, dtype=float)
+    rad = np.asarray(dist, dtype=float)
+    n_ch, n_frames, _ = pos.shape
+    if rad.shape != (n_ch, n_frames):
+        raise ValueError("distance_per_chain_nm shape does not match positions")
+    nl = min(n_frames, int(max_lag_frames) + 1)
+    nb = len(edges) - 1
+    sums = np.zeros((n_ch, nb, nl), dtype=float)
+    counts = np.zeros((n_ch, nb, nl), dtype=np.int64)
+    for lag in range(nl):
+        origin = np.arange(0, n_frames - lag, int(origin_stride), dtype=int)
+        dr = pos[:, origin + lag, :] - pos[:, origin, :]
+        dsq = np.einsum("ctd,ctd->ct", dr, dr)
+        bindex = np.searchsorted(edges, rad[:, origin], side="right") - 1
+        good = (bindex >= 0) & (bindex < nb) & np.isfinite(dsq) & np.isfinite(rad[:, origin])
+        for chain in range(n_ch):
+            bins_for_chain = bindex[chain, good[chain]]
+            if bins_for_chain.size:
+                counts[chain, :, lag] = np.bincount(bins_for_chain, minlength=nb)
+                sums[chain, :, lag] = np.bincount(
+                    bins_for_chain, weights=dsq[chain, good[chain]], minlength=nb
+                )
+    per_chain = np.full_like(sums, np.nan, dtype=float)
+    ok = counts >= int(min_origins_per_chain)
+    np.divide(sums, counts, out=per_chain, where=ok)
+    valid = np.isfinite(per_chain)
+    n_valid = np.sum(valid, axis=0)
+    pooled_sums = np.sum(np.where(valid, per_chain, 0), axis=0)
+    mean = np.full((nb, nl), np.nan, dtype=float)
+    np.divide(pooled_sums, n_valid, out=mean, where=n_valid > 0)
+    stderr = np.full_like(mean, np.nan)
+    for b in range(nb):
+        for lag in range(nl):
+            values = per_chain[:, b, lag]
+            values = values[np.isfinite(values)]
+            if values.size >= 2:
+                stderr[b, lag] = np.std(values, ddof=1) / np.sqrt(values.size)
+    return RadialTranslationalMSDResult(
+        r_centers_nm=0.5 * (edges[1:] + edges[:-1]),
+        r_edges_nm=edges,
+        t_ns=np.arange(nl) * traj.dt_ns,
+        msd_nm2=mean,
+        msd_stderr_nm2=stderr,
+        msd_per_chain_nm2=per_chain,
+        origins_per_chain=counts,
+        chain_labels=traj.chain_labels,
+        n_chains=n_ch,
+        dt_ns=traj.dt_ns,
+        remove_reference_motion=traj.remove_reference_motion,
+    )
+
+
+@dataclass(frozen=True)
+class RadialTranslationalDiffusionFitResult:
+    r_centers_nm: np.ndarray
+    d_nm2_per_ns: np.ndarray
+    d_stderr_nm2_per_ns: np.ndarray
+    per_chain_d_nm2_per_ns: np.ndarray  # (chain, radial bin) for one set; empty for pooled sets
+    n_chains_per_bin: np.ndarray
+    n_sets: int
+    fit_tmin_ns: float
+    fit_tmax_ns: float
+
+
+def fit_radial_translational_msd(
+    data: Union[RadialTranslationalMSDResult, Mapping[str, RadialTranslationalMSDResult]],
+    *,
+    fit_tmin_ns: float,
+    fit_tmax_ns: float,
+    min_fit_points: int = 3,
+    include_chains: Optional[Sequence[str]] = None,
+) -> RadialTranslationalDiffusionFitResult:
+    """Fit 3D D(r) per chain, then average chains or independent sets.
+
+    Mapping input assigns *equal weight to each simulation set* and reports
+    SEM across set means, not over potentially correlated individual chains.
+    """
+    if isinstance(data, Mapping):
+        if not data:
+            raise ValueError("no radial MSD results supplied")
+        fits = [
+            fit_radial_translational_msd(
+                v,
+                fit_tmin_ns=fit_tmin_ns,
+                fit_tmax_ns=fit_tmax_ns,
+                min_fit_points=min_fit_points,
+                include_chains=include_chains,
+            )
+            for v in data.values()
+        ]
+        edges = fits[0].r_centers_nm
+        if any(not np.array_equal(f.r_centers_nm, edges) for f in fits[1:]):
+            raise ValueError("radial bins differ across simulation sets")
+        stack = np.stack([f.d_nm2_per_ns for f in fits], axis=0)
+        finite = np.isfinite(stack)
+        count = finite.sum(axis=0)
+        mean = np.full(len(edges), np.nan)
+        np.divide(np.where(finite, stack, 0).sum(axis=0), count, out=mean, where=count > 0)
+        sem = np.full_like(mean, np.nan)
+        for i in range(len(edges)):
+            v = stack[finite[:, i], i]
+            if len(v) > 1:
+                sem[i] = np.std(v, ddof=1) / np.sqrt(len(v))
+            elif len(v) == 1:
+                sem[i] = fits[int(np.flatnonzero(finite[:, i])[0])].d_stderr_nm2_per_ns[i]
+        return RadialTranslationalDiffusionFitResult(
+            r_centers_nm=edges.copy(),
+            d_nm2_per_ns=mean,
+            d_stderr_nm2_per_ns=sem,
+            per_chain_d_nm2_per_ns=np.empty((0, len(edges))),
+            n_chains_per_bin=np.sum([f.n_chains_per_bin for f in fits], axis=0),
+            n_sets=len(fits),
+            fit_tmin_ns=float(fit_tmin_ns),
+            fit_tmax_ns=float(fit_tmax_ns),
+        )
+
+    t = np.asarray(data.t_ns, dtype=float)
+    window = (t >= float(fit_tmin_ns)) & (t <= float(fit_tmax_ns))
+    if np.count_nonzero(window) < int(min_fit_points):
+        raise ValueError("fit window contains fewer than min_fit_points lags")
+    labels = data.chain_labels
+    wanted = set(labels) if include_chains is None else set(str(k) for k in include_chains)
+    if not wanted.issubset(labels):
+        raise ValueError(f"unknown chain labels: {sorted(wanted.difference(labels))}")
+    index = [i for i, lab in enumerate(labels) if lab in wanted]
+    nbin = len(data.r_centers_nm)
+    d_by_chain = np.full((len(index), nbin), np.nan)
+    for row, i in enumerate(index):
+        for b in range(nbin):
+            y = data.msd_per_chain_nm2[i, b]
+            good = window & np.isfinite(y)
+            if np.count_nonzero(good) >= int(min_fit_points):
+                d_by_chain[row, b] = np.polyfit(t[good], y[good], 1)[0] / 6.0
+    mean = np.full(nbin, np.nan)
+    sem = np.full(nbin, np.nan)
+    n = np.isfinite(d_by_chain).sum(axis=0)
+    for b in range(nbin):
+        ds = d_by_chain[np.isfinite(d_by_chain[:, b]), b]
+        if ds.size:
+            mean[b] = float(np.mean(ds))
+        if ds.size >= 2:
+            sem[b] = float(np.std(ds, ddof=1) / np.sqrt(ds.size))
+    return RadialTranslationalDiffusionFitResult(
+        r_centers_nm=data.r_centers_nm.copy(),
+        d_nm2_per_ns=mean,
+        d_stderr_nm2_per_ns=sem,
+        per_chain_d_nm2_per_ns=d_by_chain,
+        n_chains_per_bin=n,
+        n_sets=1,
+        fit_tmin_ns=float(fit_tmin_ns),
+        fit_tmax_ns=float(fit_tmax_ns),
+    )
