@@ -4818,6 +4818,305 @@ def mass_density_profile_from_dcd(
     )
 
 
+# --- CA-resolved radial number densities around the condensate center ---------
+
+
+@dataclass(frozen=True)
+class ResidueDensityProfileResult:
+    """Cached per-chain, per-residue radial positions and number densities.
+
+    Each chain contributes at most ONE site (the selected atom) per residue and
+    frame. ``bin_index_per_frame`` has shape (frames, chains, residues), with
+    -1 for positions beyond the cached radial range. Its small integer dtype
+    makes frame-dependent post-cache conditioning practical.
+
+    ``counts_per_chain_residue`` and ``density_per_chain_residue_nm3`` have shape
+    (chains, residues, radial_bins). The latter is the time-mean contribution
+    from EACH individual chain; summing over chains gives the total residue
+    number density in nm^-3.
+    """
+
+    r_nm: np.ndarray
+    edges_nm: np.ndarray
+    shell_volumes_nm3: np.ndarray
+    residue_numbers: np.ndarray
+    residue_names: tuple[str, ...]
+    chain_labels: tuple[str, ...]
+    bin_index_per_frame: np.ndarray
+    counts_per_chain_residue: np.ndarray
+    density_per_chain_residue_nm3: np.ndarray
+    source_frame_indices: np.ndarray
+    n_frames: int
+    n_chains: int
+    n_residues: int
+    n_bins: int
+    atom_name: str
+    reference_chain_labels: tuple[str, ...]
+    reference_label: str
+    mode: str
+    reference_image_mode: str
+    selection: Any
+    stride: int
+    frame_start: int
+    frame_stop: Optional[int]
+    units: str = "nm^-3"
+
+    @property
+    def centers(self) -> np.ndarray:
+        return self.r_nm
+
+
+def residue_density_profile_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    reference_segments: Union[str, Sequence[str]],
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
+    reference_label: str = "reference_center",
+    atom_name: str = "CA",
+    mode: str = "cog",
+    reference_image_mode: str = "as_is",
+    bins: Union[int, Sequence[float], np.ndarray] = 60,
+    value_range: Optional[tuple[float, float]] = None,
+    box_nm: Optional[Sequence[float]] = None,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    time_start: Any = None,
+    time_stop: Any = None,
+    delta_t: Any = None,
+) -> ResidueDensityProfileResult:
+    """Cache radial number-density contributions for each residue and chain.
+
+    Uses the *same* PBC-aware reference center as mass_density_profile_from_dcd.
+    Query chains and reference chains are whole in each DCD frame: no within-
+    chain unwrapping is attempted. Only displacement from the reference center
+    is minimum-imaged. Spherical profiles are restricted to r <= min(box)/2.
+
+    The trajectory cache additionally holds compact site-to-radial-bin indices
+    so time-varying chain/frame filters can be applied without rereading DCDs.
+    """
+    center_mode = str(mode).strip().lower()
+    if center_mode not in {"com", "cog"}:
+        raise ValueError("mode must be 'com' or 'cog'")
+    image_mode = _normalize_reference_image_mode(reference_image_mode)
+    site_name = str(atom_name).strip().upper()
+    if not site_name:
+        raise ValueError("atom_name must be nonempty")
+    if int(stride) <= 0 or int(chunk) <= 0:
+        raise ValueError("stride and chunk must be positive")
+
+    first, stop = _density_profile_frame_limits(
+        frame_start=frame_start,
+        frame_stop=frame_stop,
+        time_start=time_start,
+        time_stop=time_stop,
+        delta_t=delta_t,
+    )
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files supplied")
+    tmpl = PDBReader().read(pdb_file)
+    model = tmpl.model
+    ref_groups_full, ref_labels = _one_chain_groups_from_specs(
+        tmpl,
+        reference_segments,
+        argument_name="reference_segments",
+    )
+    query_groups_full = _selection_to_groups(tmpl, selection)
+    if not query_groups_full:
+        raise ValueError("selection produced no query chains")
+    query_labels = _group_chain_labels(model, query_groups_full)
+    if len(set(query_labels)) != len(query_labels):
+        raise ValueError("selection includes duplicate chain labels")
+    if any(label not in model.chain for label in query_labels):
+        raise ValueError("selection must produce one group per physical chain")
+
+    atom_index = {id(atom): i for i, atom in enumerate(model.atoms)}
+    residue_sites: list[list[int]] = []
+    residue_numbers: Optional[tuple[int, ...]] = None
+    residue_names: Optional[tuple[str, ...]] = None
+
+    for label, group in zip(query_labels, query_groups_full):
+        allowed = set(map(int, group))
+        chain = model.chain[label]
+        chain_sites: list[int] = []
+        chain_numbers: list[int] = []
+        chain_names: list[str] = []
+        for residue in chain.residues:
+            site_candidates = [
+                atom_index[id(a)]
+                for a in residue.atoms
+                if id(a) in atom_index
+                and atom_index[id(a)] in allowed
+                and str(getattr(a, "name", "") or "").strip().upper() == site_name
+            ]
+            if len(site_candidates) > 1:
+                raise ValueError(
+                    f"chain {label}: multiple {site_name} atoms at residue {residue.resnum}"
+                )
+            if site_candidates:
+                chain_sites.append(site_candidates[0])
+                chain_numbers.append(int(residue.resnum))
+                chain_names.append(
+                    str(
+                        getattr(residue, "resname", None)
+                        or getattr(residue, "name", None)
+                        or getattr(residue.atoms[0], "resname", "")
+                        or ""
+                    )
+                )
+
+        if not chain_sites:
+            raise ValueError(f"chain {label!r} has no selected {site_name} atoms")
+        numbers = tuple(chain_numbers)
+        names = tuple(chain_names)
+        if residue_numbers is None:
+            residue_numbers = numbers
+            residue_names = names
+        elif numbers != residue_numbers or names != residue_names:
+            raise ValueError(
+                f"chain {label!r} does not share the residue numbers/names of the first "
+                "query chain. Analyze distinct sequences as separate groups."
+            )
+        residue_sites.append(chain_sites)
+
+    assert residue_numbers is not None and residue_names is not None
+    n_chains = len(query_labels)
+    n_residues = len(residue_numbers)
+    query_sites_full = np.asarray(residue_sites, dtype=np.int64)
+
+    atom_set = set(int(i) for i in query_sites_full.reshape(-1).tolist())
+    for group in ref_groups_full:
+        atom_set.update(map(int, group))
+    atom_indices_full = sorted(atom_set)
+    remap = {idx: i for i, idx in enumerate(atom_indices_full)}
+    query_sites = np.asarray(
+        [[remap[int(i)] for i in chain] for chain in query_sites_full],
+        dtype=np.int64,
+    )
+    ref_groups = [
+        np.asarray([remap[int(i)] for i in group], dtype=np.int64) for group in ref_groups_full
+    ]
+    masses = np.asarray(atom_masses(model)[atom_indices_full], dtype=np.float64)
+    if center_mode == "com":
+        ref_weights = np.asarray([np.sum(masses[g]) for g in ref_groups], dtype=float)
+        if np.any(~np.isfinite(ref_weights)) or np.any(ref_weights <= 0):
+            raise ValueError("invalid reference masses; try mode='cog'")
+        center_masses = masses
+    else:
+        ref_weights = np.asarray([len(g) for g in ref_groups], dtype=float)
+        center_masses = None
+
+    first_boxes = [
+        _peek_first_box_nm(dcd, model, atom_indices_full, int(stride), box_nm=box_nm)
+        for dcd in dcd_list
+    ]
+    edges = _density_profile_edges(
+        bins,
+        value_range=value_range,
+        profile_axes="xyz",
+        first_boxes_nm=first_boxes,
+    )
+    if edges[0] < 0:
+        raise ValueError("radial bin edges cannot be negative")
+    n_bins = len(edges) - 1
+    dtype = np.int16 if n_bins <= np.iinfo(np.int16).max else np.int32
+    shell_vol = _density_profile_bin_volumes_nm3(
+        edges,
+        profile_axes="xyz",
+        box_nm=first_boxes[0],
+    )
+    if np.any(shell_vol <= 0):
+        raise ValueError("shell volumes must be positive")
+
+    counts_flat = np.zeros(n_chains * n_residues * n_bins, dtype=np.int64)
+    site_linear = np.arange(n_chains * n_residues, dtype=np.int64) * n_bins
+    bin_frames: list[np.ndarray] = []
+    source_frames: list[int] = []
+    box_fallback = None if box_nm is None else _box_lengths_nm(box_nm)
+
+    for dcd in dcd_list:
+        for fi, (xyz_selected, current_box) in enumerate(
+            iter_dcd(
+                dcd, model, chunk=int(chunk), stride=int(stride), atom_indices=atom_indices_full
+            )
+        ):
+            if fi < first:
+                continue
+            if stop is not None and fi >= stop:
+                break
+            if current_box is None:
+                if box_fallback is None:
+                    raise ValueError("DCD lacks box; supply box_nm=(Lx,Ly,Lz)")
+                box = box_fallback
+            else:
+                box = _box_lengths_nm(current_box)
+            _validate_density_profile_range_for_box(
+                edges,
+                profile_axes="xyz",
+                box_nm=box,
+            )
+            xyz = np.asarray(xyz_selected, dtype=np.float64)
+            ref_centers = group_centers_nm(
+                xyz,
+                ref_groups,
+                masses=center_masses,
+                center=center_mode,
+                unwrap=False,
+                wrap=False,
+            )
+            if image_mode == "cluster":
+                ref_centers = _assemble_periodic_cluster_nm(ref_centers, box)
+            reference_center = np.average(ref_centers, axis=0, weights=ref_weights)
+
+            displacement = xyz[query_sites, :] - reference_center[None, None, :]
+            displacement -= np.rint(displacement / box[None, None, :]) * box[None, None, :]
+            distances = np.linalg.norm(displacement, axis=-1)
+            bidx = np.searchsorted(edges, distances, side="right") - 1
+            # Match np.histogram: include the right endpoint of the final bin.
+            bidx[distances == edges[-1]] = n_bins - 1
+            bidx[(distances < edges[0]) | (distances > edges[-1])] = -1
+            valid = (bidx >= 0) & (bidx < n_bins)
+            flat_bins = bidx.ravel()
+            valid_flat = valid.ravel()
+            np.add.at(counts_flat, site_linear[valid_flat] + flat_bins[valid_flat], 1)
+            bin_frames.append(bidx.astype(dtype, copy=False))
+            source_frames.append(fi)
+
+    if not bin_frames:
+        raise ValueError("no frames selected")
+    bins_per_frame = np.stack(bin_frames, axis=0)
+    counts = counts_flat.reshape(n_chains, n_residues, n_bins)
+    densities = counts / (len(bin_frames) * shell_vol[None, None, :])
+    return ResidueDensityProfileResult(
+        r_nm=0.5 * (edges[:-1] + edges[1:]),
+        edges_nm=edges,
+        shell_volumes_nm3=shell_vol,
+        residue_numbers=np.asarray(residue_numbers, dtype=np.int64),
+        residue_names=residue_names,
+        chain_labels=query_labels,
+        bin_index_per_frame=bins_per_frame,
+        counts_per_chain_residue=counts,
+        density_per_chain_residue_nm3=densities,
+        source_frame_indices=np.asarray(source_frames, dtype=np.int64),
+        n_frames=len(bin_frames),
+        n_chains=n_chains,
+        n_residues=n_residues,
+        n_bins=n_bins,
+        atom_name=site_name,
+        reference_chain_labels=ref_labels,
+        reference_label=str(reference_label),
+        mode=center_mode,
+        reference_image_mode=image_mode,
+        selection=selection,
+        stride=int(stride),
+        frame_start=first,
+        frame_stop=stop,
+    )
+
+
 # --- binding/contact probability analysis ------------------------------------
 
 
