@@ -4818,15 +4818,17 @@ def mass_density_profile_from_dcd(
     )
 
 
-# --- CA-resolved radial number densities around the condensate center ---------
+# --- residue-site-resolved radial number densities around the condensate center --
 
 
 @dataclass(frozen=True)
 class ResidueDensityProfileResult:
     """Cached per-chain, per-residue radial positions and number densities.
 
-    Each chain contributes at most ONE site (the selected atom) per residue and
-    frame. ``bin_index_per_frame`` has shape (frames, chains, residues), with
+    Each chain contributes ONE representative position per residue and frame:
+    either a specified atom (CA by default), the residue center of geometry
+    (COG), or the residue center of mass (COM). ``bin_index_per_frame`` has
+    shape (frames, chains, residues), with
     -1 for positions beyond the cached radial range. Its small integer dtype
     makes frame-dependent post-cache conditioning practical.
 
@@ -4874,6 +4876,7 @@ def residue_density_profile_from_dcd(
     selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "protein",
     reference_label: str = "reference_center",
     atom_name: str = "CA",
+    residue_site: Optional[str] = None,
     mode: str = "cog",
     reference_image_mode: str = "as_is",
     bins: Union[int, Sequence[float], np.ndarray] = 60,
@@ -4896,14 +4899,21 @@ def residue_density_profile_from_dcd(
 
     The trajectory cache additionally holds compact site-to-radial-bin indices
     so time-varying chain/frame filters can be applied without rereading DCDs.
+
+    ``residue_site`` may be "CA" (default, or any other named atom), "COG",
+    or "COM". The latter two compute a center from all atoms admitted by the
+    query ``selection`` within each residue; use full-chain selections, e.g.
+    ``selection='protein'``, if a full-residue center is desired. The separate
+    ``mode`` parameter continues to control the *reference* center (COG/COM).
     """
     center_mode = str(mode).strip().lower()
     if center_mode not in {"com", "cog"}:
         raise ValueError("mode must be 'com' or 'cog'")
     image_mode = _normalize_reference_image_mode(reference_image_mode)
-    site_name = str(atom_name).strip().upper()
-    if not site_name:
-        raise ValueError("atom_name must be nonempty")
+    site_name = str(atom_name if residue_site is None else residue_site).strip().upper()
+    if not site_name or site_name == "NONE":
+        raise ValueError("residue_site/atom_name must be nonempty")
+    center_sites = site_name in {"COG", "COM"}
     if int(stride) <= 0 or int(chunk) <= 0:
         raise ValueError("stride and chunk must be positive")
 
@@ -4934,30 +4944,36 @@ def residue_density_profile_from_dcd(
         raise ValueError("selection must produce one group per physical chain")
 
     atom_index = {id(atom): i for i, atom in enumerate(model.atoms)}
-    residue_sites: list[list[int]] = []
+    residue_sites: list[list[list[int]]] = []
     residue_numbers: Optional[tuple[int, ...]] = None
     residue_names: Optional[tuple[str, ...]] = None
 
     for label, group in zip(query_labels, query_groups_full):
         allowed = set(map(int, group))
         chain = model.chain[label]
-        chain_sites: list[int] = []
+        chain_sites: list[list[int]] = []
         chain_numbers: list[int] = []
         chain_names: list[str] = []
         for residue in chain.residues:
-            site_candidates = [
-                atom_index[id(a)]
-                for a in residue.atoms
-                if id(a) in atom_index
-                and atom_index[id(a)] in allowed
-                and str(getattr(a, "name", "") or "").strip().upper() == site_name
+            selected_atoms = [
+                atom_index[id(atom)]
+                for atom in residue.atoms
+                if id(atom) in atom_index and atom_index[id(atom)] in allowed
             ]
-            if len(site_candidates) > 1:
-                raise ValueError(
-                    f"chain {label}: multiple {site_name} atoms at residue {residue.resnum}"
-                )
+            if center_sites:
+                site_candidates = selected_atoms
+            else:
+                site_candidates = [
+                    idx
+                    for idx in selected_atoms
+                    if str(getattr(model.atoms[idx], "name", "") or "").strip().upper() == site_name
+                ]
+                if len(site_candidates) > 1:
+                    raise ValueError(
+                        f"chain {label}: multiple {site_name} atoms at residue {residue.resnum}"
+                    )
             if site_candidates:
-                chain_sites.append(site_candidates[0])
+                chain_sites.append(site_candidates)
                 chain_numbers.append(int(residue.resnum))
                 chain_names.append(
                     str(
@@ -4985,21 +5001,52 @@ def residue_density_profile_from_dcd(
     assert residue_numbers is not None and residue_names is not None
     n_chains = len(query_labels)
     n_residues = len(residue_numbers)
-    query_sites_full = np.asarray(residue_sites, dtype=np.int64)
-
-    atom_set = set(int(i) for i in query_sites_full.reshape(-1).tolist())
+    atom_set = {
+        int(idx)
+        for chain_sites in residue_sites
+        for site_atoms in chain_sites
+        for idx in site_atoms
+    }
     for group in ref_groups_full:
         atom_set.update(map(int, group))
     atom_indices_full = sorted(atom_set)
     remap = {idx: i for i, idx in enumerate(atom_indices_full)}
-    query_sites = np.asarray(
-        [[remap[int(i)] for i in chain] for chain in query_sites_full],
-        dtype=np.int64,
-    )
     ref_groups = [
         np.asarray([remap[int(i)] for i in group], dtype=np.int64) for group in ref_groups_full
     ]
     masses = np.asarray(atom_masses(model)[atom_indices_full], dtype=np.float64)
+
+    # Single-atom selections use the original fast vectorized indexing path.
+    # For COG/COM, flatten the ragged per-residue atom lists and use reduceat
+    # to obtain all residue centers in one operation for each trajectory frame.
+    query_sites = None
+    site_flat = site_starts = site_weights = site_weight_sums = None
+    if not center_sites:
+        query_sites = np.asarray(
+            [[remap[site_atoms[0]] for site_atoms in chain] for chain in residue_sites],
+            dtype=np.int64,
+        )
+    else:
+        groups = [
+            np.asarray([remap[idx] for idx in site_atoms], dtype=np.int64)
+            for chain in residue_sites
+            for site_atoms in chain
+        ]
+        sizes = np.asarray([len(group) for group in groups], dtype=np.int64)
+        site_starts = np.concatenate(([0], np.cumsum(sizes)[:-1]))
+        site_flat = np.concatenate(groups)
+        site_weights = (
+            np.asarray(masses[site_flat], dtype=np.float64)
+            if site_name == "COM"
+            else np.ones(site_flat.size, dtype=np.float64)
+        )
+        site_weight_sums = np.add.reduceat(site_weights, site_starts)
+        if (
+            np.any(~np.isfinite(site_weights))
+            or np.any(site_weights < 0)
+            or np.any(site_weight_sums <= 0)
+        ):
+            raise ValueError("invalid residue atom masses for COM; try residue_site='COG'")
     if center_mode == "com":
         ref_weights = np.asarray([np.sum(masses[g]) for g in ref_groups], dtype=float)
         if np.any(~np.isfinite(ref_weights)) or np.any(ref_weights <= 0):
@@ -5071,7 +5118,14 @@ def residue_density_profile_from_dcd(
                 ref_centers = _assemble_periodic_cluster_nm(ref_centers, box)
             reference_center = np.average(ref_centers, axis=0, weights=ref_weights)
 
-            displacement = xyz[query_sites, :] - reference_center[None, None, :]
+            if query_sites is not None:
+                query_positions = xyz[query_sites, :]
+            else:
+                flat_positions = xyz[site_flat, :] * site_weights[:, None]
+                site_positions = np.add.reduceat(flat_positions, site_starts, axis=0)
+                site_positions /= site_weight_sums[:, None]
+                query_positions = site_positions.reshape(n_chains, n_residues, 3)
+            displacement = query_positions - reference_center[None, None, :]
             displacement -= np.rint(displacement / box[None, None, :]) * box[None, None, :]
             distances = np.linalg.norm(displacement, axis=-1)
             bidx = np.searchsorted(edges, distances, side="right") - 1
