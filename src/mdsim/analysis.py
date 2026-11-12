@@ -5171,6 +5171,383 @@ def residue_density_profile_from_dcd(
     )
 
 
+# --- peptide backbone and side-chain torsions --------------------------------
+
+# Atom-name definitions follow the conventional protein chi1/chi2 assignments.
+# The same definitions apply to the common histidine protonation variants.
+# A missing named atom yields NaN; no alternative branch is chosen dynamically.
+_PEPTIDE_CHI_ATOMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "ARG": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "ASN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "ASP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "ASH": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "CYS": (("N", "CA", "CB", "SG"), ()),
+    "CYM": (("N", "CA", "CB", "SG"), ()),
+    "CYX": (("N", "CA", "CB", "SG"), ()),
+    "GLN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "GLU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "GLH": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "HIS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "HSD": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "HSE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "HSP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "HID": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "HIE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "HIP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "ILE": (("N", "CA", "CB", "CG1"), ("CA", "CB", "CG1", "CD1")),
+    "LEU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "LYS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "MET": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "SD")),
+    "PHE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "PRO": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "SER": (("N", "CA", "CB", "OG"), ()),
+    "THR": (("N", "CA", "CB", "OG1"), ()),
+    "TRP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "TYR": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "VAL": (("N", "CA", "CB", "CG1"), ()),
+}
+
+# Retain residues missing some atoms within a demonstrably atomistic chain.
+# Individual torsions that cannot be constructed stay NaN.
+_PEPTIDE_RESIDUE_NAMES = frozenset(
+    {
+        "ALA",
+        "GLY",
+        *_PEPTIDE_CHI_ATOMS.keys(),
+        "SEC",
+        "PYL",
+        "CAT",
+    }
+)
+
+
+@dataclass(frozen=True)
+class PeptideTorsionChainResult:
+    """Residue-by-frame torsion arrays for one physical protein/peptide chain."""
+
+    chain_label: str
+    residue_numbers: np.ndarray  # (n_residues,)
+    residue_names: tuple[str, ...]
+    phi: np.ndarray  # (n_residues, n_frames)
+    psi: np.ndarray
+    omega: np.ndarray  # CA(i)-C(i)-N(i+1)-CA(i+1), assigned to i
+    chi1: np.ndarray
+    chi2: np.ndarray
+
+    @property
+    def n_residues(self) -> int:
+        return int(self.residue_numbers.size)
+
+    @property
+    def n_frames(self) -> int:
+        return int(self.phi.shape[1])
+
+
+@dataclass(frozen=True)
+class PeptideTorsionResult:
+    """Torsion time series for all detected atomistic chains; NaN means undefined."""
+
+    chains: dict[str, PeptideTorsionChainResult]
+    n_frames: int
+    source_frame_indices: np.ndarray  # index after stride, separately for each DCD
+    source_file_indices: np.ndarray  # which DCD each frame came from
+    unit: str  # 'radians' or 'degrees'
+    stride: int
+    frame_start: int
+    frame_stop: Optional[int]
+
+    @property
+    def chain_labels(self) -> tuple[str, ...]:
+        return tuple(self.chains)
+
+    @property
+    def n_chains(self) -> int:
+        return len(self.chains)
+
+
+def _peptide_dihedrals_nm(
+    xyz: np.ndarray,
+    quadruplets: np.ndarray,
+    box_nm: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Vectorized signed dihedrals in [-pi, pi], matching MDTraj/OpenMM signs."""
+    if len(quadruplets) == 0:
+        return np.empty(0, dtype=np.float64)
+
+    p0 = xyz[quadruplets[:, 0]]
+    p1 = xyz[quadruplets[:, 1]]
+    p2 = xyz[quadruplets[:, 2]]
+    p3 = xyz[quadruplets[:, 3]]
+    b1 = p1 - p0
+    b2 = p2 - p1
+    b3 = p3 - p2
+    if box_nm is not None:
+        box = np.asarray(box_nm, dtype=np.float64).reshape(1, 3)
+        b1 -= np.rint(b1 / box) * box
+        b2 -= np.rint(b2 / box) * box
+        b3 -= np.rint(b3 / box) * box
+
+    n1 = np.cross(b1, b2)
+    n2 = np.cross(b2, b3)
+    b2_norm = np.linalg.norm(b2, axis=1)
+    n1_norm = np.linalg.norm(n1, axis=1)
+    n2_norm = np.linalg.norm(n2, axis=1)
+    good = (b2_norm > 1.0e-12) & (n1_norm > 1.0e-12) & (n2_norm > 1.0e-12)
+    angle = np.full(len(quadruplets), np.nan, dtype=np.float64)
+    if np.any(good):
+        n1g = n1[good]
+        n2g = n2[good]
+        b2_unit = b2[good] / b2_norm[good, None]
+        cos = np.einsum("ij,ij->i", n1g, n2g)
+        sin = -np.einsum("ij,ij->i", np.cross(n1g, b2_unit), n2g)
+        angle[good] = np.arctan2(sin, cos)
+    return angle
+
+
+def peptide_torsions_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    degrees: bool = False,
+    pbc: bool = False,
+    box_nm: Optional[Sequence[float]] = None,
+    check_peptide_bonds: bool = True,
+    peptide_bond_cutoff_nm: float = 0.22,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    dtype: Any = np.float32,
+) -> PeptideTorsionResult:
+    """Calculate phi, psi, omega, chi1, chi2 for all atomistic peptide chains.
+
+    Only a chain with at least one residue containing N, CA and C is analyzed.
+    Protein residues missing backbone or side-chain heavy atoms are retained
+    in those chains but their impossible torsions are NaN. CA-only (coarse-
+    grained) chains, water and ions are skipped. Chains may have different
+    sequences and numbers of residues.
+
+    Definitions for residue i:
+       phi(i)   C(i-1), N(i),  CA(i), C(i)
+       psi(i)   N(i),   CA(i), C(i),  N(i+1)
+       omega(i) CA(i),  C(i),  N(i+1), CA(i+1)
+       chi1(i)  N(i),   CA(i), CB(i), sidechain(i)
+       chi2(i)  CA(i),  CB(i), CG(i), sidechain(i)
+    Chi1/chi2 use standard residue-specific heavy-atom definitions (e.g.
+    ILE CG1/CD1, ASP OD1, SER OG, THR OG1). Omega is assigned to the
+    preceding residue, so the final residue's omega is usually NaN.
+
+    Peptide-bond lengths are checked *per frame* by default. A backbone
+    torsion is NaN if its requisite C(i)-N(i+1) distance exceeds the
+    cutoff. This prevents connecting missing residues or chain breaks.
+    Consecutive residues are determined by their topology order, NOT by
+    numeric residue-number continuity. No hydrogen coordinates are needed.
+
+    If pbc=False (default), coordinates are assumed to keep each peptide
+    locally whole, as in other mdsim analyses. If pbc=True, consecutive
+    bond vectors are minimum-imaged using orthorhombic box dimensions
+    from the DCD, or the box_nm fallback; this handles atom-wise wrapping.
+
+    Returns a PeptideTorsionResult with results.chains[chain_key].phi/psi/
+    omega/chi1/chi2, each shaped (n_residues_in_chain, n_frames) and
+    expressed in radians or degrees. Frame selection is per DCD and
+    indexes refer to frames after stride; multiple DCDs are concatenated.
+    """
+    if int(stride) < 1 or int(chunk) < 1:
+        raise ValueError("stride and chunk must be positive")
+    if int(frame_start) < 0:
+        raise ValueError("frame_start must be >= 0")
+    if frame_stop is not None and int(frame_stop) <= int(frame_start):
+        raise ValueError("frame_stop must be greater than frame_start")
+    if not np.isfinite(peptide_bond_cutoff_nm) or peptide_bond_cutoff_nm <= 0.0:
+        raise ValueError("peptide_bond_cutoff_nm must be finite and positive")
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype("float32"), np.dtype("float64")):
+        raise ValueError("dtype must be float32 or float64")
+
+    dcd_list = _as_file_list(dcd_files)
+    if not dcd_list:
+        raise ValueError("no DCD files provided")
+    tmpl = PDBReader().read(pdb_file)
+    model = tmpl.model
+    atom_to_index = {id(atom): i for i, atom in enumerate(model.atoms)}
+
+    # Global residue rows are grouped by physical chain; no requirement for
+    # equal chain lengths or residue numbering across chains.
+    chain_ranges: dict[str, tuple[int, int]] = {}
+    residue_numbers: list[int] = []
+    residue_names: list[str] = []
+    atom_maps: list[dict[str, int]] = []
+
+    for key, chain in model.chain.items():
+        candidates: list[tuple[Any, dict[str, int]]] = []
+        for residue in chain.residues:
+            name = str(residue.resname).strip().upper()
+            amap: dict[str, int] = {}
+            for atom in residue.atoms:
+                atom_name = str(atom.name).strip().upper()
+                if atom_name in amap:
+                    # Do not silently pick an alternate location or duplicate.
+                    raise ValueError(
+                        f"duplicate atom {atom_name!r} in chain {key!r} "
+                        f"residue {residue.resnum}"
+                    )
+                amap[atom_name] = atom_to_index[id(atom)]
+            if name in _PEPTIDE_RESIDUE_NAMES or {"N", "CA", "C"} <= amap.keys():
+                if name == "ILE" and "CD1" not in amap and "CD" in amap:
+                    amap["CD1"] = amap["CD"]
+                candidates.append((residue, amap))
+
+        if not any({"N", "CA", "C"} <= amap.keys() for _, amap in candidates):
+            continue  # no atomistic backbone in this physical chain
+        start = len(atom_maps)
+        for residue, amap in candidates:
+            residue_numbers.append(int(residue.resnum))
+            residue_names.append(str(residue.resname).strip().upper())
+            atom_maps.append(amap)
+        chain_ranges[str(key)] = (start, len(atom_maps))
+
+    if not chain_ranges:
+        raise ValueError("no atomistic peptide/protein chains containing N, CA, C were found")
+
+    # Store each torsion as (kind, global residue row, atom quadruplet,
+    # peptide C--N indices or (-1,-1) for a side-chain torsion).
+    kind_ids: list[int] = []
+    residue_rows: list[int] = []
+    quartet_full: list[tuple[int, int, int, int]] = []
+    peptide_pairs_full: list[tuple[int, int]] = []
+
+    def add(
+        kind: int,
+        row: int,
+        items: tuple[Optional[int], Optional[int], Optional[int], Optional[int]],
+        peptide_pair: tuple[int, int] = (-1, -1),
+    ) -> None:
+        if any(a is None for a in items):
+            return
+        quartet_full.append(tuple(int(a) for a in items))
+        peptide_pairs_full.append(peptide_pair)
+        kind_ids.append(kind)
+        residue_rows.append(row)
+
+    for start, stop in chain_ranges.values():
+        for row in range(start, stop):
+            cur = atom_maps[row]
+            prev = atom_maps[row - 1] if row > start else {}
+            next_ = atom_maps[row + 1] if row + 1 < stop else {}
+            before = (prev.get("C", -1), cur.get("N", -1))
+            after = (cur.get("C", -1), next_.get("N", -1))
+            add(0, row, (prev.get("C"), cur.get("N"), cur.get("CA"), cur.get("C")), before)
+            add(1, row, (cur.get("N"), cur.get("CA"), cur.get("C"), next_.get("N")), after)
+            add(2, row, (cur.get("CA"), cur.get("C"), next_.get("N"), next_.get("CA")), after)
+
+            chi = _PEPTIDE_CHI_ATOMS.get(residue_names[row])
+            if chi is None:
+                # Unknown residue: recognize common unambiguous atom names.
+                # No ambiguous branch selection (e.g., CD1 vs CD2) is guessed.
+                chi = (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"))
+            for kind, names in ((3, chi[0]), (4, chi[1])):
+                if names:
+                    add(kind, row, tuple(cur.get(n) for n in names))
+
+    quartet_full_array = np.asarray(quartet_full, dtype=np.int64).reshape(-1, 4)
+    peptide_full_array = np.asarray(peptide_pairs_full, dtype=np.int64).reshape(-1, 2)
+    kind_index = np.asarray(kind_ids, dtype=np.intp)
+    residue_index = np.asarray(residue_rows, dtype=np.intp)
+
+    # Read only atoms actually needed for the torsions, not solvent or all
+    # protein atoms. Leave one atom to count frames if no torsions are possible.
+    used_atoms = set(map(int, quartet_full_array.ravel()))
+    if check_peptide_bonds:
+        used_atoms.update(int(i) for i in peptide_full_array.ravel() if int(i) >= 0)
+    atom_indices_full = sorted(used_atoms) if used_atoms else [0]
+    index_map = {
+        global_index: local_index for local_index, global_index in enumerate(atom_indices_full)
+    }
+    quadruplets = np.asarray(
+        [[index_map[int(i)] for i in row] for row in quartet_full_array],
+        dtype=np.intp,
+    ).reshape(-1, 4)
+    peptide_pairs = np.asarray(
+        [[index_map[int(i)] if i >= 0 else -1 for i in row] for row in peptide_full_array],
+        dtype=np.intp,
+    ).reshape(-1, 2)
+
+    fallback_box = _box_lengths_nm(box_nm) if (pbc and box_nm is not None) else None
+    frames: list[np.ndarray] = []
+    source_frames: list[int] = []
+    source_files: list[int] = []
+    n_residues = len(atom_maps)
+
+    for file_idx, dcd in enumerate(dcd_list):
+        for frame_idx, (xyz_sel_nm, frame_box_nm) in enumerate(
+            iter_dcd(
+                dcd,
+                model,
+                chunk=int(chunk),
+                stride=int(stride),
+                atom_indices=atom_indices_full,
+            )
+        ):
+            if frame_idx < int(frame_start):
+                continue
+            if frame_stop is not None and frame_idx >= int(frame_stop):
+                break
+
+            box = None
+            if pbc:
+                box = _box_lengths_nm(frame_box_nm) if frame_box_nm is not None else fallback_box
+                if box is None:
+                    raise ValueError("DCD has no box; use box_nm=(Lx,Ly,Lz) or pbc=False")
+
+            xyz = np.asarray(xyz_sel_nm, dtype=np.float64)
+            values = _peptide_dihedrals_nm(xyz, quadruplets, box)
+            if check_peptide_bonds and len(values):
+                has_bond = np.all(peptide_pairs >= 0, axis=1)
+                if np.any(has_bond):
+                    pair = peptide_pairs[has_bond]
+                    diff = xyz[pair[:, 1]] - xyz[pair[:, 0]]
+                    if box is not None:
+                        diff -= np.rint(diff / box.reshape(1, 3)) * box.reshape(1, 3)
+                    distances = np.linalg.norm(diff, axis=1)
+                    values[has_bond] = np.where(
+                        distances <= float(peptide_bond_cutoff_nm), values[has_bond], np.nan
+                    )
+            if degrees:
+                values = np.rad2deg(values)
+            frame_angles = np.full((5, n_residues), np.nan, dtype=dtype)
+            frame_angles[kind_index, residue_index] = values
+            frames.append(frame_angles)
+            source_frames.append(int(frame_idx))
+            source_files.append(int(file_idx))
+
+    if not frames:
+        raise ValueError("no trajectory frames selected")
+    all_angles = np.stack(frames, axis=2)  # (5, all_residues, n_frames)
+    chain_results: dict[str, PeptideTorsionChainResult] = {}
+    for chain_label, (start, stop) in chain_ranges.items():
+        chain_results[chain_label] = PeptideTorsionChainResult(
+            chain_label=chain_label,
+            residue_numbers=np.asarray(residue_numbers[start:stop], dtype=np.int64),
+            residue_names=tuple(residue_names[start:stop]),
+            phi=all_angles[0, start:stop],
+            psi=all_angles[1, start:stop],
+            omega=all_angles[2, start:stop],
+            chi1=all_angles[3, start:stop],
+            chi2=all_angles[4, start:stop],
+        )
+    return PeptideTorsionResult(
+        chains=chain_results,
+        n_frames=len(frames),
+        source_frame_indices=np.asarray(source_frames, dtype=np.int64),
+        source_file_indices=np.asarray(source_files, dtype=np.int64),
+        unit="degrees" if degrees else "radians",
+        stride=int(stride),
+        frame_start=int(frame_start),
+        frame_stop=None if frame_stop is None else int(frame_stop),
+    )
+
+
 # --- binding/contact probability analysis ------------------------------------
 
 
