@@ -5852,14 +5852,16 @@ def segment_internal_distances_from_dcd(
                     break
                 if len(source_frames) >= max_frames:
                     raise MemoryError(
-                        "distance trajectories exceed max_output_gib; select fewer chains, increase stride, or raise the limit"
+                        "distance trajectories exceed max_output_gib; select fewer chains, "
+                        + "increase stride, or raise the limit"
                     )
                 box = None
                 if pbc:
                     box = _box_lengths_nm(frame_box) if frame_box is not None else fallback_box
                     if box is None or not np.all(np.isfinite(box)):
                         raise ValueError(
-                            "PBC requires finite positive orthorhombic box lengths; provide box_nm or use pbc=False"
+                            "PBC requires finite positive orthorhombic box lengths; "
+                            + "provide box_nm or use pbc=False"
                         )
                 block[filled] = _segment_window_distances_nm(
                     xyz,
