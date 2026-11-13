@@ -4,6 +4,7 @@ import io
 import math
 import os
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -5545,6 +5546,371 @@ def peptide_torsions_from_dcd(
         stride=int(stride),
         frame_start=int(frame_start),
         frame_stop=None if frame_stop is None else int(frame_stop),
+    )
+
+
+# --- sliding-window internal-distance vectors ---------------------------------
+
+
+@dataclass(frozen=True)
+class SegmentDistanceChainResult:
+    """C-alpha distance vectors for complete, overlapping peptide windows.
+
+    residue_numbers contains the PDB number of each window's CENTRAL residue.
+    distance_vectors_nm has axes (window, distance component, input frame).
+    window_residue_numbers records the actual topology-ordered members; residue
+    labels need not be consecutive integers. Invalid geometry in a frame makes
+    every component of that window NaN, not zero.
+    """
+
+    chain_label: str
+    residue_numbers: np.ndarray
+    window_residue_numbers: np.ndarray
+    residue_names: tuple[str, ...]
+    distance_vectors_nm: np.ndarray
+
+    @property
+    def n_windows(self) -> int:
+        return int(self.residue_numbers.size)
+
+    @property
+    def n_residues(self) -> int:
+        """Number of window centers (not the full chain length)."""
+        return self.n_windows
+
+    @property
+    def n_frames(self) -> int:
+        return int(self.distance_vectors_nm.shape[-1])
+
+
+@dataclass(frozen=True)
+class SegmentDistanceResult:
+    """Cached internal-distance trajectories, without dynamical normalization.
+
+    pair_offsets uses ZERO-based positions within a window, not PDB numbers.
+    Source frame indices are on each DCD's already-strided frame grid, matching
+    PeptideTorsionResult. Independent DCD files are identifiable by source file.
+    """
+
+    chains: dict[str, SegmentDistanceChainResult]
+    n_frames: int
+    source_frame_indices: np.ndarray
+    source_file_indices: np.ndarray
+    window_size: int
+    min_sequence_separation: int
+    pair_offsets: np.ndarray
+    stride: int
+    frame_start: int
+    frame_stop: Optional[int]
+    pbc: bool
+    check_peptide_bonds: bool
+    peptide_bond_cutoff_nm: float
+    atom_name: str = "CA"
+    unit: str = "nm"
+    feature_type: str = "internal_distances"
+
+    @property
+    def chain_labels(self) -> tuple[str, ...]:
+        return tuple(self.chains)
+
+    @property
+    def n_chains(self) -> int:
+        return len(self.chains)
+
+    @property
+    def n_components(self) -> int:
+        return int(len(self.pair_offsets))
+
+
+def _segment_integer(value: Any, name: str, minimum: int) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be an integer")
+    number = float(value)
+    if not np.isfinite(number) or not number.is_integer() or number < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return int(number)
+
+
+def _segment_window_distances_nm(
+    xyz_nm: np.ndarray,
+    ca_indices: np.ndarray,
+    peptide_pairs: np.ndarray,
+    pair_offsets: np.ndarray,
+    *,
+    box_nm: Optional[np.ndarray] = None,
+    check_peptide_bonds: bool = True,
+    peptide_bond_cutoff_nm: float = 0.22,
+) -> np.ndarray:
+    """One frame; unwrap consecutive CA links before measuring longer spans.
+
+    Minimum-imaging the final, possibly long internal pair would choose the
+    nearest image instead of the connected peptide image. Reconstructing the
+    short consecutive CA steps avoids that error (orthorhombic boxes only).
+    """
+    xyz = np.asarray(xyz_nm, dtype=np.float64)
+    ca = xyz[ca_indices]
+    valid = np.all(np.isfinite(ca), axis=(1, 2))
+    with np.errstate(invalid="ignore", over="ignore"):
+        steps = np.diff(ca, axis=1)
+        if box_nm is not None:
+            box = np.asarray(box_nm, dtype=np.float64).reshape(1, 1, 3)
+            steps = steps - np.rint(steps / box) * box
+            local = np.concatenate((np.zeros_like(ca[:, :1]), np.cumsum(steps, axis=1)), axis=1)
+        else:
+            local = ca - ca[:, :1]
+        disp = local[:, pair_offsets[:, 1]] - local[:, pair_offsets[:, 0]]
+        distances = np.linalg.norm(disp, axis=-1)
+        if check_peptide_bonds:
+            bonds = xyz[peptide_pairs[:, :, 1]] - xyz[peptide_pairs[:, :, 0]]
+            if box_nm is not None:
+                bonds = bonds - np.rint(bonds / box) * box
+            bond_lengths = np.linalg.norm(bonds, axis=-1)
+            valid &= np.all(
+                np.isfinite(bond_lengths)
+                & (bond_lengths > 0.0)
+                & (bond_lengths <= peptide_bond_cutoff_nm),
+                axis=1,
+            )
+    valid &= np.all(np.isfinite(distances), axis=1)
+    distances[~valid] = np.nan
+    return distances
+
+
+def segment_internal_distances_from_dcd(
+    pdb_file: FileLike,
+    dcd_files: Union[FileLike, Sequence[FileLike]],
+    *,
+    selection: Union[str, Sequence[str], Sequence[Sequence[int]]] = "all",
+    window_size: int = 5,
+    min_sequence_separation: int = 2,
+    pbc: bool = False,
+    box_nm: Optional[Sequence[float]] = None,
+    check_peptide_bonds: bool = True,
+    peptide_bond_cutoff_nm: float = 0.22,
+    stride: int = 1,
+    chunk: int = 200,
+    frame_start: int = 0,
+    frame_stop: Optional[int] = None,
+    dtype: Any = np.float32,
+    max_output_gib: float = 4.0,
+) -> SegmentDistanceResult:
+    """Read and cache local segment-shape features for atomistic peptide chains.
+
+    Default: all six non-nearest-neighbor CA distances in each five-residue
+    window: (1,3), (1,4), (1,5), (2,4), (2,5), (3,5), in one-based window
+    notation. All odd window_size >=3 are supported; min_sequence_separation
+    is a TOPOLOGY-position separation, not a difference between PDB labels.
+    A larger separation keeps only longer-span pairs; separation=window_size-1
+    gives just the segment end-to-end distance.
+
+    selection identifies physical chains, retaining every complete window in
+    those chains. Each member must contain unique N, CA and C atoms. Solvent,
+    CA-only coarse-grained chains, termini without a full window, and windows
+    with missing backbone atoms are omitted. No window crosses a physical
+    chain boundary or a non-peptide residue: consecutive topology entries,
+    rather than a filtered list of peptide residues, define the windows.
+    Duplicate residue numbers within a retained chain are rejected.
+
+    Per-frame C--N checks invalidate windows crossing an apparent peptide
+    break (default maximum length 0.22 nm). This is geometric validation, not
+    a replacement for a topology with explicit bond connectivity. Turning it
+    off assumes all consecutive topology entries are connected. Numbering gaps
+    alone are not interpreted as breaks.
+
+    pbc=False assumes locally whole chains. With pbc=True, orthorhombic minimum
+    images reconstruct successive CA steps inside each window; the short CA
+    steps and C--N bonds must have unambiguous minimum images. The final long
+    pair displacement is NOT independently minimum-imaged. Box lengths come
+    from the DCD, with box_nm as a fallback.
+
+    Only required N/CA/C coordinates are requested from iter_dcd. Frame values
+    are staged in a temporary binary file, then copied into the final per-chain
+    arrays, avoiding a second full in-memory feature trajectory. max_output_gib
+    bounds the final distance arrays, not OS page cache/reader overhead or other
+    results already in memory. Temporary disk space of similar size is needed.
+    Frame limits apply separately to each DCD AFTER stride, as for torsions.
+    Arrays are (windows, components, frames), float32 by default, in nanometers.
+    """
+    window_size = _segment_integer(window_size, "window_size", 3)
+    if window_size % 2 != 1:
+        raise ValueError("window_size must be odd to define a central residue")
+    separation = _segment_integer(min_sequence_separation, "min_sequence_separation", 1)
+    if separation >= window_size:
+        raise ValueError("min_sequence_separation must be smaller than window_size")
+    stride = _segment_integer(stride, "stride", 1)
+    chunk = _segment_integer(chunk, "chunk", 1)
+    frame_start = _segment_integer(frame_start, "frame_start", 0)
+    if frame_stop is not None:
+        frame_stop = _segment_integer(frame_stop, "frame_stop", frame_start + 1)
+    for name, value in (("pbc", pbc), ("check_peptide_bonds", check_peptide_bonds)):
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a boolean")
+    if not np.isfinite(peptide_bond_cutoff_nm) or peptide_bond_cutoff_nm <= 0.0:
+        raise ValueError("peptide_bond_cutoff_nm must be finite and positive")
+    if not np.isfinite(max_output_gib) or max_output_gib <= 0:
+        raise ValueError("max_output_gib must be finite and positive")
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype("float32"), np.dtype("float64")):
+        raise ValueError("dtype must be float32 or float64")
+    files = _as_file_list(dcd_files)
+    if not files:
+        raise ValueError("no DCD files provided")
+    tmpl = PDBReader().read(pdb_file)
+    model = tmpl.model
+    atom_index = {id(atom): i for i, atom in enumerate(model.atoms)}
+    groups = _selection_to_groups(tmpl, selection)
+    selected_atoms = {int(i) for group in groups for i in group}
+    if not selected_atoms:
+        raise ValueError("selection produced no atoms")
+    if min(selected_atoms) < 0 or max(selected_atoms) >= len(model.atoms):
+        raise ValueError("selection contains an out-of-range atom index")
+    pair_offsets = np.column_stack(np.triu_indices(window_size, k=separation)).astype(np.int64)
+    centers, members, center_names, ca_full, bonds_full = [], [], [], [], []
+    ranges = {}
+    half = window_size // 2
+    for key, chain in model.chain.items():
+        residues = list(chain.residues)
+        if not any(
+            atom_index[id(atom)] in selected_atoms for res in residues for atom in res.atoms
+        ):
+            continue
+        atom_maps = []
+        for res in residues:
+            amap = {}
+            for atom in res.atoms:
+                name = str(atom.name).strip().upper()
+                if name not in {"N", "CA", "C"}:
+                    continue
+                if name in amap:
+                    raise ValueError(
+                        f"duplicate {name} atom in chain {key!r}, residue {res.resnum}"
+                    )
+                amap[name] = atom_index[id(atom)]
+            atom_maps.append(amap)
+        if not any({"N", "CA", "C"} <= amap.keys() for amap in atom_maps):
+            continue
+        numbers = [int(res.resnum) for res in residues]
+        if len(set(numbers)) != len(numbers):
+            raise ValueError(f"chain {key!r}: duplicate PDB residue numbers are ambiguous")
+        first = len(centers)
+        for left in range(len(residues) - window_size + 1):
+            maps = atom_maps[left : left + window_size]
+            if not all({"N", "CA", "C"} <= amap.keys() for amap in maps):
+                continue
+            center = left + half
+            centers.append(numbers[center])
+            members.append(numbers[left : left + window_size])
+            center_names.append(str(residues[center].resname))
+            ca_full.append([amap["CA"] for amap in maps])
+            bonds_full.append([(maps[i]["C"], maps[i + 1]["N"]) for i in range(window_size - 1)])
+        if len(centers) > first:
+            ranges[str(key)] = (first, len(centers))
+    if not ranges:
+        raise ValueError(
+            "no complete atomistic peptide windows found for this selection/window_size"
+        )
+    used = set(np.asarray(ca_full).ravel().tolist())
+    if check_peptide_bonds:
+        used.update(np.asarray(bonds_full).ravel().tolist())
+    atom_indices = sorted(used)
+    lookup = {old: new for new, old in enumerate(atom_indices)}
+    ca_indices = np.array([[lookup[i] for i in row] for row in ca_full], dtype=np.int64)
+    peptide_pairs = (
+        np.array([[[lookup[a], lookup[b]] for a, b in row] for row in bonds_full], dtype=np.int64)
+        if check_peptide_bonds
+        else np.empty((len(centers), 0, 2), dtype=np.int64)
+    )
+    fallback_box = _box_lengths_nm(box_nm) if pbc and box_nm is not None else None
+    if fallback_box is not None and not np.all(np.isfinite(fallback_box)):
+        raise ValueError("box_nm must contain finite positive lengths")
+    n_windows, n_pairs = len(centers), len(pair_offsets)
+    bytes_per_frame = n_windows * n_pairs * dtype.itemsize
+    max_frames = int(float(max_output_gib) * 1024**3 // bytes_per_frame)
+    if max_frames < 1:
+        raise MemoryError("one distance frame exceeds max_output_gib")
+    block_size = max(1, min(chunk, max_frames, int(64 * 1024**2 // bytes_per_frame)))
+    block = np.empty((block_size, n_windows, n_pairs), dtype=dtype)
+    source_frames, source_files = [], []
+    centers_array = np.asarray(centers, dtype=np.int64)
+    members_array = np.asarray(members, dtype=np.int64)
+    output = {}
+    with tempfile.TemporaryFile() as staging:
+        filled = 0
+        for fi, filename in enumerate(files):
+            for frame, (xyz, frame_box) in enumerate(
+                iter_dcd(
+                    filename,
+                    model,
+                    chunk=chunk,
+                    stride=stride,
+                    atom_indices=atom_indices,
+                )
+            ):
+                if frame < frame_start:
+                    continue
+                if frame_stop is not None and frame >= frame_stop:
+                    break
+                if len(source_frames) >= max_frames:
+                    raise MemoryError(
+                        "distance trajectories exceed max_output_gib; select fewer chains, increase stride, or raise the limit"
+                    )
+                box = None
+                if pbc:
+                    box = _box_lengths_nm(frame_box) if frame_box is not None else fallback_box
+                    if box is None or not np.all(np.isfinite(box)):
+                        raise ValueError(
+                            "PBC requires finite positive orthorhombic box lengths; provide box_nm or use pbc=False"
+                        )
+                block[filled] = _segment_window_distances_nm(
+                    xyz,
+                    ca_indices,
+                    peptide_pairs,
+                    pair_offsets,
+                    box_nm=box,
+                    check_peptide_bonds=check_peptide_bonds,
+                    peptide_bond_cutoff_nm=float(peptide_bond_cutoff_nm),
+                )
+                source_frames.append(frame)
+                source_files.append(fi)
+                filled += 1
+                if filled == block_size:
+                    block.tofile(staging)
+                    filled = 0
+        if not source_frames:
+            raise ValueError("no trajectory frames selected")
+        if filled:
+            block[:filled].tofile(staging)
+        staging.flush()
+        mapped = np.memmap(
+            staging, dtype=dtype, mode="r", shape=(len(source_frames), n_windows, n_pairs)
+        )
+        try:
+            for label, (left, right) in ranges.items():
+                # Own memory, not a view into a temporary file or other chains.
+                values = np.array(mapped[:, left:right, :].transpose(1, 2, 0), order="C", copy=True)
+                output[label] = SegmentDistanceChainResult(
+                    chain_label=label,
+                    residue_numbers=centers_array[left:right].copy(),
+                    window_residue_numbers=members_array[left:right].copy(),
+                    residue_names=tuple(center_names[left:right]),
+                    distance_vectors_nm=values,
+                )
+        finally:
+            del mapped
+    return SegmentDistanceResult(
+        chains=output,
+        n_frames=len(source_frames),
+        source_frame_indices=np.asarray(source_frames, dtype=np.int64),
+        source_file_indices=np.asarray(source_files, dtype=np.int64),
+        window_size=window_size,
+        min_sequence_separation=separation,
+        pair_offsets=pair_offsets,
+        stride=stride,
+        frame_start=frame_start,
+        frame_stop=frame_stop,
+        pbc=bool(pbc),
+        check_peptide_bonds=bool(check_peptide_bonds),
+        peptide_bond_cutoff_nm=float(peptide_bond_cutoff_nm),
     )
 
 
